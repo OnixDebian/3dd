@@ -35,10 +35,14 @@ well-understood Docker work comes only once the renderer is trustworthy.
   5. All color comes from a palette abstraction — no status/glow color is hardcoded
 **Research**: Likely (novel — the project's #1 risk)
 **Research topics**: framebuffer→braille coordinate mapping (Canvas math-coords bottom-left vs 2×4 grid top-left); empirical aspect-correction constant (font/terminal-dependent, ship as knob); painter's-sort vs z-buffer decision
-**Plans**: TBD
+**Plans**: 5 (4 waves)
 
 Plans:
-- [ ] 01-01: TBD
+- [x] 01-01: App skeleton (panic-safe async loop, FPS cap, clean restore, resize)
+- [x] 01-02: Palette abstraction (Status→Color, dim/fog helper, no inline RGB)
+- [x] 01-03: Aspect-correct projection pipeline (TDD, single cell_aspect knob, Y-flip pinned)
+- [x] 01-04: Framebuffer + painter's-sorted, depth-shaded, fogged cube rasterizer
+- [ ] 01-05: Orbit camera + braille blit + legibility human-verify
 
 ### Phase 2: Scene Pipeline & Layout
 **Goal**: Generalize the one cube into a full scene of synthetic entities — many boxes in a stable rack/datacenter layout, painter's-occluded, status-colored and load-sized, under an autopilot orbit camera.
@@ -112,7 +116,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Render Core & Legibility Spike | 0/TBD | Not started | - |
+| 1. Render Core & Legibility Spike | 4/5 | In progress | - |
 | 2. Scene Pipeline & Layout | 0/TBD | Not started | - |
 | 3. Docker Data Layer | 0/TBD | Not started | - |
 | 4. Animation, Interaction & Full Entity Set | 0/TBD | Not started | - |

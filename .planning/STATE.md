@@ -10,28 +10,28 @@ See: .planning/PROJECT.md (updated 2026-05-26)
 ## Current Position
 
 Phase: 1 of 5 (Render Core & Legibility Spike)
-Plan: 1 of 5 complete (01-01 app-skeleton)
+Plan: 4 of 5 complete (01-04 framebuffer-rasterizer)
 Status: In progress
-Last activity: 2026-05-26 — Completed 01-01-app-skeleton-PLAN.md
+Last activity: 2026-05-26 — Completed 01-04-framebuffer-rasterizer-PLAN.md
 
-Progress: ██░░░░░░░░ 20%
+Progress: ████████░░ 80%
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 1
-- Average duration: 2 min
+- Total plans completed: 4
+- Average duration: ~3 min
 - Total execution time: ~0 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 (Render Core) | 1/5 | 2 min | 2 min |
+| 1 (Render Core) | 4/5 | ~12 min | ~3 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (2 min)
-- Trend: —
+- Last 5 plans: 01-01 (2 min), 01-04 (4 min)
+- Trend: steady ~3 min/plan
 
 ## Accumulated Context
 
@@ -47,6 +47,11 @@ Recent decisions affecting current work:
 - 01-01: Added `futures` 0.3 for `StreamExt::next` on crossterm `EventStream`; crossterm uses `event-stream` feature
 - 01-01: Frame cadence defaults — render 30 FPS (`tui::RENDER_FPS`), logic tick 60Hz (`tui::TICK_HZ`)
 - 01-01: Terminal restore extracted to free `tui::restore()` reused by `Tui::exit`, `Drop`, and the panic hook
+- 01-04: `render3d::ViewParams { eye, target, up, fov }` is the SOLE camera input — render3d has no `Camera` type dependency (plan 05's Camera builds a ViewParams and feeds it in)
+- 01-04: `ViewParams.fov` overrides `RenderConfig.fov` (camera owns the lens; config keeps near/far/cell_aspect)
+- 01-04: Occlusion via painter's sort (farthest-first) + back-face cull — NO per-pixel z-buffer (sufficient for convex boxes, PITFALLS #4)
+- 01-04: Framebuffer `(w,h)` is braille SUB-PIXEL resolution (2*cells_w, 4*cells_h); `lit_pixels()` is the plan-05 blit feed
+- 01-04: Shading = Lambert orientation (theme::dim, floor 0.35) × distance fog (palette.fog toward background, floor 0.45); base color = palette.status_color(Running), zero inline RGB in render3d
 
 ### Pending Todos
 
@@ -62,5 +67,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-05-26
-Stopped at: Completed 01-01-app-skeleton-PLAN.md
+Stopped at: Completed 01-04-framebuffer-rasterizer-PLAN.md
 Resume file: None
