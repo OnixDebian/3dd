@@ -66,7 +66,7 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-05-26
-Stopped at: 01-05 auto tasks 1-2 committed (camera 9ec6369, scene 823bce1); PAUSED at human-verify checkpoint
+Last session: 2026-05-27
+Stopped at: 01-05 human-verify tuning round 1 applied (brightness 22dd223, pitch+radius+test 88e69bc); PAUSED at a fresh human-verify checkpoint
 Resume file: None
-Resume note: After human types "approved" (or reports issues to tune), finish 01-05 — create 01-05-SUMMARY.md, update Current Position/Progress to 5/5 + Phase 1 complete, mark ROADMAP phase 1 done, metadata commit. No-TTY in sandbox so cargo run / restore checks are the human's job.
+Resume note: Tuning round 1 from human feedback — (A) brighter: running/glow indigo #5B5BD6->#8A8AF0, MIN_LAMBERT 0.35->0.62, FOG_MIN 0.45->0.7; (B) top/bottom faces: added PITCH_BIAS ~15deg + widened bob to ~33deg amplitude; (C) clipping: radius 4.0->6.0 and rewrote orbit_keeps_all_vertices_in_frustum to sweep worst-case pitch with a 0.12 NDC margin; (D) shading "lag" diagnosed as designed view-fixed headlight Lambert (cull+shading share one frame's ViewParams — no stale-frame bug), left as-is. build/clippy/test all clean (34 tests). Awaiting human re-verify. After "approved", finish 01-05 — create 01-05-SUMMARY.md, update Current Position/Progress to 5/5 + Phase 1 complete, mark ROADMAP phase 1 done, metadata commit. No-TTY in sandbox so cargo run / restore checks are the human's job.
