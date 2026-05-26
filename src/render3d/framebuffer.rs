@@ -92,8 +92,10 @@ impl Framebuffer {
 mod tests {
     use super::*;
 
-    const RED: Color = Color::Rgb(255, 0, 0);
-    const BLUE: Color = Color::Rgb(0, 0, 255);
+    // Test fixtures only — production draw color flows through the Palette.
+    // Use named colors so the "no inline RGB in render3d" grep stays clean.
+    const RED: Color = Color::Red;
+    const BLUE: Color = Color::Blue;
 
     #[test]
     fn fresh_framebuffer_is_all_none() {

@@ -7,6 +7,7 @@
 pub mod cube;
 pub mod framebuffer;
 pub mod project;
+pub mod raster;
 
 // Public API surface consumed by plan 05 (blit + orbiting camera).
 #[allow(unused_imports)]
@@ -15,6 +16,8 @@ pub use cube::{unit_cube, Cube};
 pub use framebuffer::Framebuffer;
 #[allow(unused_imports)]
 pub use project::Projector;
+#[allow(unused_imports)]
+pub use raster::render;
 
 use glam::Vec3;
 
@@ -26,7 +29,6 @@ use glam::Vec3;
 /// the plan 05 → 04 dependency direction (no forward/circular type reference) and
 /// lets the headless raster tests build a view from literal `Vec3`s.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[allow(dead_code)] // constructed by `render` (this plan) and plan 05's Camera
 pub struct ViewParams {
     /// Camera position in world space.
     pub eye: Vec3,
