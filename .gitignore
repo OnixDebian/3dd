@@ -1,0 +1,14 @@
+# Development tooling
+.claude/
+.specify/
+gcp/
+
+# GSD planning artifacts
+.planning/
+
+# All markdown (planning/docs kept local)
+*.md
+
+# Rust
+/target/
+**/*.rs.bk
