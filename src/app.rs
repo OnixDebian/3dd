@@ -10,6 +10,8 @@ use std::time::Instant;
 use color_eyre::Result;
 
 use crate::action::Action;
+use crate::camera::Camera;
+use crate::config::RenderConfig;
 use crate::tui::{Event, Tui};
 use crate::ui;
 
@@ -27,6 +29,10 @@ pub struct App {
     pub fps: f32,
     /// Timestamp of the previous logic tick (for dt).
     last_tick: Instant,
+    /// Autopilot orbit camera driving the 3D scene.
+    pub camera: Camera,
+    /// Rendering knobs (cell_aspect, near/far). The camera owns the fov.
+    pub render_config: RenderConfig,
 }
 
 impl App {
@@ -40,6 +46,8 @@ impl App {
             last_render: now,
             fps: 0.0,
             last_tick: now,
+            camera: Camera::new(),
+            render_config: RenderConfig::default(),
         }
     }
 
@@ -57,9 +65,11 @@ impl App {
     }
 
     /// Advance animation by real elapsed time. `dt` is seconds since the last
-    /// tick so later animation stays framerate-independent (Gaffer decoupling).
-    pub fn on_tick(&mut self, _dt: f32) {
+    /// tick so the orbit stays framerate-independent (Gaffer decoupling): the
+    /// camera advances by REAL elapsed time, not per-frame.
+    pub fn on_tick(&mut self, dt: f32) {
         self.tick_count = self.tick_count.wrapping_add(1);
+        self.camera.step(dt);
     }
 
     /// Run the main event loop until `should_quit`.

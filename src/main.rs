@@ -1,5 +1,6 @@
 mod action;
 mod app;
+mod camera;
 mod config;
 mod render3d;
 mod theme;
