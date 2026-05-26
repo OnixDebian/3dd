@@ -1,5 +1,7 @@
 mod action;
 mod app;
+mod config;
+mod render3d;
 mod theme;
 mod tui;
 mod ui;
