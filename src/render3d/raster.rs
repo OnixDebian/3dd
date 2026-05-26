@@ -378,7 +378,7 @@ mod tests {
     fn painters_sort_orders_farthest_first() {
         // Unit-test the sort step in isolation: feed faces with known distances
         // and assert strictly farthest-first ordering after the sort.
-        let mut faces = vec![
+        let mut faces = [
             RenderFace { indices: [0, 1, 2, 3], normal: Vec3::Z, distance: 1.0 },
             RenderFace { indices: [0, 1, 2, 3], normal: Vec3::Z, distance: 5.0 },
             RenderFace { indices: [0, 1, 2, 3], normal: Vec3::Z, distance: 3.0 },
