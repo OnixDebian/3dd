@@ -67,5 +67,6 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-05-26
-Stopped at: Completed 01-04-framebuffer-rasterizer-PLAN.md
+Stopped at: 01-05 auto tasks 1-2 committed (camera 9ec6369, scene 823bce1); PAUSED at human-verify checkpoint
 Resume file: None
+Resume note: After human types "approved" (or reports issues to tune), finish 01-05 — create 01-05-SUMMARY.md, update Current Position/Progress to 5/5 + Phase 1 complete, mark ROADMAP phase 1 done, metadata commit. No-TTY in sandbox so cargo run / restore checks are the human's job.
