@@ -65,9 +65,9 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             background: Color::Rgb(0x1A, 0x1A, 0x22), // muted near-black with a faint indigo tint
-            edge: Color::Rgb(0x6B, 0x6B, 0x78),       // soft gray wireframe
-            glow: Color::Rgb(0x5B, 0x5B, 0xD6),       // indigo accent (#5B5BD6)
-            running: Color::Rgb(0x5B, 0x5B, 0xD6),    // indigo — alive
+            edge: Color::Rgb(0x9A, 0x9A, 0xA8),       // soft gray wireframe (brightened)
+            glow: Color::Rgb(0x8A, 0x8A, 0xF0),       // bright indigo accent
+            running: Color::Rgb(0x8A, 0x8A, 0xF0),    // bright indigo — alive (vivid faces)
             paused: Color::Rgb(0xE2, 0xB1, 0x4F),     // amber — held
             stopped: Color::Rgb(0x6B, 0x6B, 0x78),    // gray — dormant
             restarting: Color::Rgb(0x4F, 0xA6, 0xE2), // cyan-blue — in flux

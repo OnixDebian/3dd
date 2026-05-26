@@ -29,9 +29,10 @@ use crate::render3d::ViewParams;
 use crate::theme::{self, Palette, Status};
 
 /// Lowest brightness any visible face keeps after Lambert shading, so a face
-/// turned fully edge-on never collapses to pure background (keeps the silhouette
-/// readable).
-const MIN_LAMBERT: f32 = 0.35;
+/// turned fully edge-on stays clearly colored (never near-black). Raised so even
+/// the most oblique visible face reads as vividly colored, while the lit-vs-unlit
+/// gap (this floor → 1.0) still carries enough contrast to read as 3D.
+const MIN_LAMBERT: f32 = 0.62;
 
 /// Render `cube` into a fresh braille-resolution framebuffer.
 ///
@@ -149,7 +150,10 @@ fn distance_range(faces: &[RenderFace]) -> (f32, f32) {
 /// nearest face keeps `1.0`, the farthest dims to `FOG_MIN`. Degenerate ranges
 /// (all faces equidistant) return `1.0`.
 fn fog_factor(distance: f32, near: f32, far: f32) -> f32 {
-    const FOG_MIN: f32 = 0.45;
+    // Weaker fog: the farthest visible face only dims to 0.7 of full brightness
+    // (was 0.45) so far faces stay clearly colored. Enough near/far gap remains
+    // to keep depth readable without driving distant faces toward background.
+    const FOG_MIN: f32 = 0.7;
     let span = far - near;
     if span <= f32::EPSILON {
         return 1.0;
