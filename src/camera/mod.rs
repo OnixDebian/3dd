@@ -39,9 +39,12 @@ pub const DEFAULT_RADIUS: f32 = 6.0;
 /// overrides `RenderConfig::fov` when building [`ViewParams`].
 pub const DEFAULT_FOV: f32 = std::f32::consts::FRAC_PI_3;
 
-/// Autopilot yaw rate in radians/sec. ~20°/s — a slow, calm sweep (one full
-/// revolution every ~18s), NOT frantic (PITFALLS #13: slow, smooth motion).
-const YAW_RATE: f32 = 0.35;
+/// Autopilot yaw rate in radians/sec. ~30°/s — a calm but unmistakable sweep (one
+/// full revolution every ~12s), still smooth and NOT frantic (PITFALLS #13). Bumped
+/// 1.5x from the original ~20°/s after the human re-verify wanted slightly faster
+/// rotation; the orbit visits the same camera positions (same pitch range, same
+/// radius), so the frustum-safe guarantee is unchanged.
+const YAW_RATE: f32 = 0.525;
 
 /// Autopilot pitch bob: the camera eases up and down by [`PITCH_AMPLITUDE`]
 /// (about a steady [`PITCH_BIAS`] downward tilt) at [`PITCH_RATE`] rad/s, sweeping
