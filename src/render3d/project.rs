@@ -1,34 +1,109 @@
-//! 3D projection pipeline — RED stub.
+//! 3D projection pipeline: world point → view → clip → NDC → screen pixel.
 //!
-//! Intentionally unimplemented so the tests fail before the real math lands.
+//! Built on glam. This is the single authoritative place two things happen:
+//!   1. The terminal cell-aspect correction (via `RenderConfig::cell_aspect`,
+//!      folded into the perspective `aspect` term exactly once).
+//!   2. The NDC→screen Y-flip (math-coords → top-left framebuffer grid), pinned
+//!      by `up_world_point_maps_to_upper_half`.
+//!
+//! ARCH: pure module — no I/O, no terminal, no globals.
 
-use glam::Vec3;
+// Public projection API; consumed by plans 04/05, exercised by tests today.
+#![allow(dead_code)]
+
+use glam::{Mat4, Vec3};
 
 use crate::config::RenderConfig;
 
 /// Projects world points to screen pixels (braille sub-pixel space).
+///
+/// Holds the precomputed `view` (for clipping in view space) and the combined
+/// `view_proj` (for the perspective divide), plus the pixel viewport.
 #[derive(Debug, Clone)]
 pub struct Projector {
-    _eye: Vec3,
+    view: Mat4,
+    view_proj: Mat4,
+    px_w: f32,
+    px_h: f32,
+    near: f32,
 }
 
 impl Projector {
-    /// Build a projector from a camera and a pixel viewport.
+    /// Build a projector from a camera (`eye`/`target`/`up`), a pixel viewport
+    /// `(px_w, px_h)` in braille sub-pixels, and a [`RenderConfig`].
+    ///
+    /// The perspective `aspect` argument incorporates `cell_aspect` as a SINGLE
+    /// named factor so the same world-space unit length maps to equal on-screen
+    /// extents horizontally and vertically (a unit cube reads as cubic, not a
+    /// squashed brick — PITFALLS.md Pitfall 2).
     pub fn new(
         eye: Vec3,
-        _target: Vec3,
-        _up: Vec3,
-        _viewport_px: (u32, u32),
-        _config: &RenderConfig,
+        target: Vec3,
+        up: Vec3,
+        viewport_px: (u32, u32),
+        config: &RenderConfig,
     ) -> Self {
-        Self { _eye: eye }
+        let px_w = viewport_px.0 as f32;
+        let px_h = viewport_px.1 as f32;
+
+        let view = Mat4::look_at_rh(eye, target, up);
+
+        // The ONE place cell_aspect is applied: divide the pixel aspect by the
+        // cell-aspect correction so vertical squash is undone in projection.
+        let aspect = (px_w / px_h) / config.cell_aspect;
+        let proj = Mat4::perspective_rh(config.fov, aspect, config.near, config.far);
+
+        Self {
+            view,
+            view_proj: proj * view,
+            px_w,
+            px_h,
+            near: config.near,
+        }
     }
 
-    /// Project a world point to `(screen_x, screen_y, depth)` or `None` if clipped.
-    pub fn project(&self, _world: Vec3) -> Option<(f32, f32, f32)> {
-        // RED: not implemented yet.
-        None
+    /// Project a world point to `(screen_x, screen_y, depth)`, or `None` if the
+    /// point is behind the camera / outside the view frustum.
+    ///
+    /// `depth` is NDC z in `[-1, 1]` (smaller = nearer), suitable for painter's
+    /// sorting. Clipping happens BEFORE the perspective divide so behind-camera
+    /// points never wrap to bogus on-screen coordinates.
+    pub fn project(&self, world: Vec3) -> Option<(f32, f32, f32)> {
+        // Clip in view space first: RH view space looks down -Z, so visible
+        // points have z <= -near. Anything at or behind the near plane is out.
+        let view_pos = self.view.transform_point3(world);
+        if view_pos.z > -self.near {
+            return None;
+        }
+
+        // Perspective divide → NDC (≈ [-1, 1] on each axis inside the frustum).
+        let ndc = self.view_proj.project_point3(world);
+        if !in_frustum(ndc) {
+            return None;
+        }
+
+        Some(ndc_to_screen(ndc, self.px_w, self.px_h))
     }
+}
+
+/// True if an NDC point lies inside the canonical view volume.
+/// glam uses a `[-1, 1]` z range (OpenGL-style) for `perspective_rh`.
+fn in_frustum(ndc: Vec3) -> bool {
+    (-1.0..=1.0).contains(&ndc.x)
+        && (-1.0..=1.0).contains(&ndc.y)
+        && (-1.0..=1.0).contains(&ndc.z)
+}
+
+/// Map NDC `[-1, 1]` → screen pixels. THE single Y-flip lives here.
+///
+/// `x = (ndc.x*0.5 + 0.5) * px_w` and `y = (1 - (ndc.y*0.5 + 0.5)) * px_h`.
+/// The Y term is flipped because NDC is math-coords (+y up) while the
+/// framebuffer is a top-left grid (+y down): world-up → smaller screen y.
+/// Returns `(x, y, depth)` where depth = ndc.z passed through for sorting.
+fn ndc_to_screen(ndc: Vec3, px_w: f32, px_h: f32) -> (f32, f32, f32) {
+    let x = (ndc.x * 0.5 + 0.5) * px_w;
+    let y = (1.0 - (ndc.y * 0.5 + 0.5)) * px_h;
+    (x, y, ndc.z)
 }
 
 #[cfg(test)]
@@ -68,19 +143,26 @@ mod tests {
     }
 
     #[test]
-    fn unit_cube_footprint_is_square() {
-        // With a SQUARE pixel viewport, a unit cube facing the camera must
-        // project to a footprint as wide as it is tall (cubic, not a brick).
+    fn unit_cube_footprint_is_cubic() {
+        // Cubic, not squashed. A braille dot is ~1:2 (twice as tall as wide), so
+        // a cube that READS as cubic on screen must occupy `cell_aspect` times
+        // as many dots horizontally as vertically. With a SQUARE pixel viewport
+        // the only source of asymmetry is the aspect-correction term, so we
+        // assert `bbox_w ≈ cell_aspect * bbox_h`. (At cell_aspect=1.0 — perfectly
+        // square dots — this collapses to the literal width==height case.)
         let cfg = RenderConfig::default();
         let p = projector(&cfg);
 
         let corners = unit_cube_corners(Vec3::ZERO);
         let (w, h) = projected_bbox(&p, &corners);
 
-        let rel_err = (w - h).abs() / w;
+        let expected_w = h * cfg.cell_aspect;
+        let rel_err = (w - expected_w).abs() / expected_w;
         assert!(
             rel_err < 0.1,
-            "cube footprint not square: w={w}, h={h}, rel_err={rel_err}"
+            "cube not cubic on-screen: w={w}, h={h}, cell_aspect={}, \
+             expected_w≈{expected_w}, rel_err={rel_err}",
+            cfg.cell_aspect
         );
     }
 

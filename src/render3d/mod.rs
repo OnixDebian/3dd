@@ -6,4 +6,6 @@
 
 pub mod project;
 
+// Convenience re-export of the public projection API; first consumed in plan 04.
+#[allow(unused_imports)]
 pub use project::Projector;

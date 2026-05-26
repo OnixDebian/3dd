@@ -4,6 +4,9 @@
 //! perceptually load-bearing value here is [`RenderConfig::cell_aspect`] — the
 //! single, named terminal cell-aspect correction factor (PITFALLS.md Pitfall 2).
 
+// Consumed by render3d and wired to TOML in Phase 5; defaulted for now.
+#![allow(dead_code)]
+
 /// Rendering configuration: the projection knobs.
 ///
 /// `cell_aspect` is the *only* place the terminal-cell squash is corrected. A
