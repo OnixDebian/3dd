@@ -7,6 +7,7 @@ mod render3d;
 mod theme;
 mod tui;
 mod ui;
+mod world;
 
 use color_eyre::Result;
 
