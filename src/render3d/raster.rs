@@ -22,11 +22,12 @@ use glam::Vec3;
 use ratatui::style::Color;
 
 use crate::config::RenderConfig;
-use crate::render3d::cube::Cube;
+use crate::render3d::cube::{unit_cube, Cube};
 use crate::render3d::framebuffer::Framebuffer;
 use crate::render3d::project::Projector;
 use crate::render3d::ViewParams;
 use crate::theme::{self, Palette, Status};
+use crate::world::entity::Entity;
 
 /// Lowest brightness any visible face keeps after Lambert shading, so a face
 /// turned fully edge-on stays clearly colored (never near-black). Raised so even
@@ -80,21 +81,34 @@ pub fn render(
         &proj_config,
     );
 
-    // World-space centroid + distance for cull, sort, and fog.
+    // Synthetic cube: base color is the "running/alive" status color (a palette
+    // lookup, never an inline RGB).
+    let base = palette.status_color(Status::Running);
+
+    // World-space verts + centroid + distance for cull, sort, and fog. Each face
+    // carries its OWN 4 world-space vertices (here, the un-transformed cube verts)
+    // so the shared `fill_face` path is identical to the multi-box `render_scene`.
     let mut visible: Vec<RenderFace> = cube
         .faces
         .iter()
         .filter_map(|face| {
-            let centroid = face_centroid(cube, &face.indices);
+            let verts = [
+                cube.vertices[face.indices[0]],
+                cube.vertices[face.indices[1]],
+                cube.vertices[face.indices[2]],
+                cube.vertices[face.indices[3]],
+            ];
+            let centroid = verts.iter().copied().sum::<Vec3>() / 4.0;
             let to_eye = view.eye - centroid;
             // Back-face cull: keep only faces whose outward normal faces the eye.
             if face.normal.dot(to_eye) <= 0.0 {
                 return None;
             }
             Some(RenderFace {
-                indices: face.indices,
+                verts,
                 normal: face.normal,
                 distance: to_eye.length(),
+                base,
             })
         })
         .collect();
@@ -115,13 +129,126 @@ pub fn render(
     // gets the brightest fog factor and the farthest the dimmest.
     let (near_d, far_d) = distance_range(&visible);
 
-    // Synthetic cube: base color is the "running/alive" status color (a palette
-    // lookup, never an inline RGB).
-    let base = palette.status_color(Status::Running);
+    let to_eye_dir = (view.eye - view.target).normalize_or_zero();
+
+    shade_and_fill(&mut hi, &projector, &visible, to_eye_dir, near_d, far_d, palette);
+
+    resolve_supersampled(&hi, w, h)
+}
+
+/// Render an arbitrary [`World`](crate::world::World) of boxes into a fresh
+/// braille-resolution framebuffer (the multi-box generalization of [`render`]).
+///
+/// Each [`Entity`] is the unit cube scaled by `2 * half_extents` (the unit cube
+/// spans ±0.5, so a side of `2 * half_extent`) and translated to its world
+/// `position`. Every visible face of EVERY box is gathered into ONE list,
+/// painter's-sorted farthest-first as a SINGLE pool (so a near box correctly
+/// occludes a far one — inter-box ordering, not per-box-then-concatenated), then
+/// fog is applied across the scene-wide distance range so far boxes dim and the
+/// rack reads at depth. No per-pixel z-buffer — painter's sort over convex
+/// axis-aligned boxes is sufficient (PITFALLS #4).
+///
+/// `viewport`, `view`, and `config` behave exactly as in [`render`]. Per-box
+/// color is `palette.status_color(entity.status)` (CONT-01) — no inline RGB.
+pub fn render_scene(
+    entities: &[Entity],
+    view: ViewParams,
+    viewport: (usize, usize),
+    palette: &Palette,
+    config: &RenderConfig,
+) -> Framebuffer {
+    let (w, h) = viewport;
+    let (hw, hh) = (w * SS, h * SS);
+    let mut hi = Framebuffer::new(hw, hh);
+
+    let proj_config = RenderConfig {
+        fov: view.fov,
+        ..*config
+    };
+    let projector = Projector::new(
+        view.eye,
+        view.target,
+        view.up,
+        (hw as u32, hh as u32),
+        &proj_config,
+    );
+
+    // The shared unit-cube topology (indices + outward normals); each entity
+    // materializes its OWN 8 world verts from these.
+    let cube = unit_cube();
+
+    // ONE combined face list spanning EVERY box (cross-box painter's pool).
+    let mut visible: Vec<RenderFace> = Vec::new();
+    for entity in entities {
+        let base = palette.status_color(entity.status);
+        // Transform the unit cube into world space ONCE per box: scale by the
+        // side length (2 * half_extents) then translate to the world position.
+        let scale = entity.half_extents * 2.0;
+        let mut world_verts = [Vec3::ZERO; 8];
+        for (slot, &v) in world_verts.iter_mut().zip(cube.vertices.iter()) {
+            *slot = entity.position + v * scale;
+        }
+
+        for face in &cube.faces {
+            let verts = [
+                world_verts[face.indices[0]],
+                world_verts[face.indices[1]],
+                world_verts[face.indices[2]],
+                world_verts[face.indices[3]],
+            ];
+            let centroid = verts.iter().copied().sum::<Vec3>() / 4.0;
+            let to_eye = view.eye - centroid;
+            // Axis-aligned boxes (no rotation), so the unit-cube face normal IS
+            // the world normal. Back-face cull per face.
+            if face.normal.dot(to_eye) <= 0.0 {
+                continue;
+            }
+            visible.push(RenderFace {
+                verts,
+                normal: face.normal,
+                distance: to_eye.length(),
+                base,
+            });
+        }
+    }
+
+    if visible.is_empty() {
+        return Framebuffer::new(w, h);
+    }
+
+    // CROSS-BOX PAINTER'S SORT (the critical correctness step): sort the SINGLE
+    // combined face pool farthest-first, so a near box's faces are drawn LAST and
+    // overwrite the far ones. Do NOT sort per-box then concatenate.
+    visible.sort_unstable_by(|a, b| {
+        b.distance
+            .partial_cmp(&a.distance)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Scene-wide fog range: near/far across ALL visible faces of ALL boxes, so
+    // far boxes dim and near boxes stay bright (depth reads at scale).
+    let (near_d, far_d) = distance_range(&visible);
 
     let to_eye_dir = (view.eye - view.target).normalize_or_zero();
 
-    for rf in &visible {
+    shade_and_fill(&mut hi, &projector, &visible, to_eye_dir, near_d, far_d, palette);
+
+    resolve_supersampled(&hi, w, h)
+}
+
+/// Shade each visible face (orientation Lambert × distance fog, per-face `base`
+/// color) and fill it into the supersampled buffer. Shared by [`render`] and
+/// [`render_scene`] so both paths shade identically.
+fn shade_and_fill(
+    hi: &mut Framebuffer,
+    projector: &Projector,
+    visible: &[RenderFace],
+    to_eye_dir: Vec3,
+    near_d: f32,
+    far_d: f32,
+    palette: &Palette,
+) {
+    for rf in visible {
         // SHADING (REND-03):
         //   (a) orientation — brighter when the normal faces the camera.
         //   (b) distance fog — farther faces blended toward the background.
@@ -129,13 +256,11 @@ pub fn render(
         let orient = MIN_LAMBERT + (1.0 - MIN_LAMBERT) * lambert;
         let fog = fog_factor(rf.distance, near_d, far_d);
         // Orientation dims toward black (shading); fog blends toward background.
-        let shaded = theme::dim(base, orient);
+        let shaded = theme::dim(rf.base, orient);
         let color = palette.fog(shaded, fog);
 
-        fill_face(&mut hi, &projector, cube, &rf.indices, color);
+        fill_face(hi, projector, &rf.verts, color);
     }
-
-    resolve_supersampled(&hi, w, h)
 }
 
 /// Downsample the `SS`×-supersampled buffer `hi` into the final braille-res
@@ -187,15 +312,16 @@ fn resolve_supersampled(hi: &Framebuffer, w: usize, h: usize) -> Framebuffer {
 }
 
 /// A culled face carrying the precomputed data the fill loop needs.
+///
+/// Carries the face's OWN 4 WORLD-SPACE vertices (not indices into a shared
+/// cube): with many boxes there is no single shared cube to index, and the
+/// cross-box painter's sort must carry each face's own world geometry. `base` is
+/// the per-box status color resolved by the palette.
 struct RenderFace {
-    indices: [usize; 4],
+    verts: [Vec3; 4],
     normal: Vec3,
     distance: f32,
-}
-
-/// World-space centroid of a quad face.
-fn face_centroid(cube: &Cube, indices: &[usize; 4]) -> Vec3 {
-    indices.iter().map(|&i| cube.vertices[i]).sum::<Vec3>() / 4.0
+    base: Color,
 }
 
 /// Min/max camera distance across the visible faces (the fog range).
@@ -225,19 +351,15 @@ fn fog_factor(distance: f32, near: f32, far: f32) -> f32 {
     1.0 - t * (1.0 - FOG_MIN)
 }
 
-/// Project a quad's 4 corners and fill it (as two triangles) into the
-/// framebuffer with `color`. If any corner clips off-screen the face is skipped
-/// (acceptable for a single centered cube — PLAN Task 2 step 4).
-fn fill_face(
-    fb: &mut Framebuffer,
-    projector: &Projector,
-    cube: &Cube,
-    indices: &[usize; 4],
-    color: Color,
-) {
+/// Project a quad's 4 WORLD-SPACE corners and fill it (as two triangles) into the
+/// framebuffer with `color`. Takes the world verts directly (not a shared cube +
+/// indices) so per-box geometry reaches the fill in the multi-box path. If any
+/// corner clips off-screen the face is skipped (the scene-framing camera keeps
+/// boxes in-frustum, so this is rare).
+fn fill_face(fb: &mut Framebuffer, projector: &Projector, verts: &[Vec3; 4], color: Color) {
     let mut pts = [(0.0f32, 0.0f32); 4];
-    for (slot, &i) in pts.iter_mut().zip(indices.iter()) {
-        match projector.project(cube.vertices[i]) {
+    for (slot, &v) in pts.iter_mut().zip(verts.iter()) {
+        match projector.project(v) {
             Some((x, y, _depth)) => *slot = (x, y),
             None => return, // any vertex clips -> skip face
         }
@@ -441,10 +563,12 @@ mod tests {
     fn painters_sort_orders_farthest_first() {
         // Unit-test the sort step in isolation: feed faces with known distances
         // and assert strictly farthest-first ordering after the sort.
+        let v = [Vec3::ZERO; 4];
+        let base = Palette::default().status_color(Status::Running);
         let mut faces = [
-            RenderFace { indices: [0, 1, 2, 3], normal: Vec3::Z, distance: 1.0 },
-            RenderFace { indices: [0, 1, 2, 3], normal: Vec3::Z, distance: 5.0 },
-            RenderFace { indices: [0, 1, 2, 3], normal: Vec3::Z, distance: 3.0 },
+            RenderFace { verts: v, normal: Vec3::Z, distance: 1.0, base },
+            RenderFace { verts: v, normal: Vec3::Z, distance: 5.0, base },
+            RenderFace { verts: v, normal: Vec3::Z, distance: 3.0, base },
         ];
         faces.sort_unstable_by(|a, b| {
             b.distance
@@ -524,5 +648,148 @@ mod tests {
             fov: std::f32::consts::FRAC_PI_3,
         };
         let _fb = render(&cube, view, VIEWPORT, &pal, &cfg);
+    }
+
+    // ---- render_scene (multi-box) tests ----------------------------------
+
+    /// Build one entity with a given status at `position`, sized by `half`.
+    fn entity_at(id: u32, position: Vec3, half: f32, status: Status) -> Entity {
+        Entity {
+            id,
+            position,
+            half_extents: Vec3::splat(half),
+            status,
+            group: 0,
+        }
+    }
+
+    /// A head-on view down +Z at the origin, so the front (+Z) face of a box at
+    /// the origin fills the viewport center.
+    fn head_on_view() -> ViewParams {
+        ViewParams {
+            eye: Vec3::new(0.0, 0.0, 12.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov: std::f32::consts::FRAC_PI_3,
+        }
+    }
+
+    #[test]
+    fn render_scene_two_box_occlusion_near_hides_far() {
+        // Box A (near, in front along +Z) must occlude box B (far, behind) at the
+        // overlapping center — proving the cross-box sort draws the near box last.
+        // Give them DIFFERENT statuses so the resolved color identifies which box
+        // won the center pixel.
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+        // A near the camera (+Z), B further back (-Z), both centered on the view
+        // axis so their footprints overlap at the viewport center.
+        let near = entity_at(0, Vec3::new(0.0, 0.0, 2.0), 0.6, Status::Running);
+        let far = entity_at(1, Vec3::new(0.0, 0.0, -2.0), 0.6, Status::Crashed);
+        let entities = [near, far];
+
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg);
+
+        let center = fb
+            .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
+            .expect("center pixel must be lit by the near box front face");
+        // Near box's front face is head-on (lambert ~1) and nearest (fog ~1), so
+        // the center resolves to the running base color, NOT the crashed color.
+        let near_base = pal.status_color(Status::Running);
+        let far_base = pal.status_color(Status::Crashed);
+        assert_eq!(center, near_base, "center should be the NEAR box color");
+        assert_ne!(center, far_base, "far box must not bleed through the near box");
+    }
+
+    #[test]
+    fn render_scene_at_scale_grid_near_hides_far() {
+        // AT-SCALE ordering guard: a hand-built grid where MANY faces from MANY
+        // boxes compete, with a KNOWN near box overlapping a KNOWN far box at the
+        // viewport center along the view axis. The center pixel must resolve to
+        // the NEAR box's color — proving the SINGLE combined cross-box sort orders
+        // correctly when the pool is large, not just in the trivial 2-box case.
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+
+        // A 3x3 grid in the X/Y plane at z = -3 (far), plus one near box at the
+        // center on the view axis at z = +2. The grid gives a crowded face pool;
+        // the near box must win the center despite all those competing faces.
+        let mut entities = Vec::new();
+        let mut id = 0u32;
+        for gy in -1..=1 {
+            for gx in -1..=1 {
+                entities.push(entity_at(
+                    id,
+                    Vec3::new(gx as f32 * 2.5, gy as f32 * 2.5, -3.0),
+                    0.6,
+                    Status::Crashed, // far grid = crashed (red)
+                ));
+                id += 1;
+            }
+        }
+        // The known near box on the view axis, a distinct status.
+        let near = entity_at(id, Vec3::new(0.0, 0.0, 2.0), 0.6, Status::Running);
+        entities.push(near);
+
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg);
+
+        let center = fb
+            .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
+            .expect("center pixel must be lit by the near box");
+        let near_base = pal.status_color(Status::Running);
+        assert_eq!(
+            center, near_base,
+            "near box must occlude the far grid box at center (got {center:?})"
+        );
+    }
+
+    #[test]
+    fn render_scene_applies_per_box_status_color() {
+        // Two boxes with different statuses, placed side by side (no overlap), must
+        // yield >= 2 distinct colors — proving per-box status color is applied.
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+        let a = entity_at(0, Vec3::new(-2.0, 0.0, 0.0), 0.6, Status::Running);
+        let b = entity_at(1, Vec3::new(2.0, 0.0, 0.0), 0.6, Status::Crashed);
+        let entities = [a, b];
+
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg);
+
+        let distinct: std::collections::HashSet<_> =
+            fb.lit_pixels().map(|(_, _, c)| c).collect();
+        assert!(
+            distinct.len() >= 2,
+            "expected >= 2 distinct per-box status colors, got {}",
+            distinct.len()
+        );
+    }
+
+    #[test]
+    fn render_scene_empty_is_all_unlit_and_does_not_panic() {
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg);
+        assert_eq!(fb.lit_pixels().count(), 0, "empty scene must be all unlit");
+    }
+
+    #[test]
+    fn render_scene_off_center_box_lands_in_framebuffer() {
+        // A box well off the scene center still lands inside the framebuffer when
+        // framed by a scene-radius view (built from a literal pulled-back eye).
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+        let off = entity_at(0, Vec3::new(4.0, 0.0, 0.0), 0.6, Status::Running);
+        let view = ViewParams {
+            eye: Vec3::new(4.0, 2.5, 6.0),
+            target: Vec3::new(4.0, 0.0, 0.0),
+            up: Vec3::Y,
+            fov: std::f32::consts::FRAC_PI_3,
+        };
+        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg);
+        assert!(
+            fb.lit_pixels().count() > 50,
+            "off-center box should rasterize a solid footprint when framed, got {}",
+            fb.lit_pixels().count()
+        );
     }
 }

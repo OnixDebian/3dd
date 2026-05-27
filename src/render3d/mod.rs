@@ -17,7 +17,7 @@ pub use framebuffer::Framebuffer;
 #[allow(unused_imports)]
 pub use project::Projector;
 #[allow(unused_imports)]
-pub use raster::render;
+pub use raster::{render, render_scene};
 
 use glam::Vec3;
 
