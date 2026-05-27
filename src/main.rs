@@ -2,6 +2,7 @@ mod action;
 mod app;
 mod camera;
 mod config;
+mod kitty;
 mod render3d;
 mod theme;
 mod tui;
@@ -36,6 +37,16 @@ fn install_hooks() -> Result<()> {
 #[tokio::main]
 async fn main() -> Result<()> {
     install_hooks()?;
+
+    // PROTOTYPE side paths (real-pixel kitty renderer), not the braille app.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--kitty") {
+        return kitty::run_kitty();
+    }
+    if let Some(pos) = args.iter().position(|a| a == "--dump-rgba") {
+        let path = args.get(pos + 1).map(String::as_str).unwrap_or("/tmp/dd3_kitty.rgba");
+        return kitty::dump_rgba(path, 720, 560);
+    }
 
     let mut tui = Tui::new()?;
     tui.enter()?;
