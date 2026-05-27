@@ -298,6 +298,7 @@ dependencies = [
  "crossterm",
  "futures",
  "glam",
+ "miniz_oxide",
  "ratatui",
  "tokio",
 ]

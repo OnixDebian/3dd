@@ -237,7 +237,11 @@ fn base64(data: &[u8]) -> String {
 /// chunked into ≤4096-byte base64 payloads. `q=2` suppresses terminal replies so
 /// they don't pollute our input stream.
 fn emit_kitty(out: &mut impl Write, rgba: &[u8], w: usize, h: usize) -> io::Result<()> {
-    let payload = base64(rgba);
+    // zlib-compress the pixels (o=z): a flat-shaded cube on a solid background
+    // compresses ~20-50×, cutting the per-frame payload from MBs to tens of KB —
+    // the dominant cost of animating real pixels over the terminal.
+    let compressed = miniz_oxide::deflate::compress_to_vec_zlib(rgba, 3);
+    let payload = base64(&compressed);
     let bytes = payload.as_bytes();
     let mut chunks = bytes.chunks(4096).peekable();
     let mut first = true;
@@ -246,7 +250,7 @@ fn emit_kitty(out: &mut impl Write, rgba: &[u8], w: usize, h: usize) -> io::Resu
         if first {
             write!(
                 out,
-                "\x1b_Gf=32,s={w},v={h},a=T,t=d,q=2,m={more};"
+                "\x1b_Gf=32,s={w},v={h},a=T,t=d,o=z,q=2,m={more};"
             )?;
             first = false;
         } else {
