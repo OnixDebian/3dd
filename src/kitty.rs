@@ -273,6 +273,23 @@ fn delete_all(out: &mut impl Write) -> io::Result<()> {
     write!(out, "\x1b_Ga=d,q=2\x1b\\")
 }
 
+/// Best-effort detection of kitty graphics protocol support from the environment.
+///
+/// Real-pixel rendering only works in terminals that implement the protocol
+/// (kitty, ghostty, WezTerm). Alacritty and most SSH/dumb terminals support NO
+/// inline graphics at all, so the app must fall back to the braille renderer there.
+/// This uses env hints (reliable for the common cases); a runtime query handshake
+/// would be the fully robust upgrade.
+pub fn supports_kitty_graphics() -> bool {
+    if std::env::var_os("KITTY_WINDOW_ID").is_some()
+        || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
+        || std::env::var_os("WEZTERM_PANE").is_some()
+    {
+        return true;
+    }
+    matches!(std::env::var("TERM"), Ok(t) if t.contains("kitty") || t.contains("ghostty"))
+}
+
 /// Live orbit loop rendering real pixels via kitty graphics. Quits on q/Esc/Ctrl-C.
 pub fn run_kitty() -> Result<()> {
     enable_raw_mode()?;

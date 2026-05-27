@@ -38,14 +38,21 @@ fn install_hooks() -> Result<()> {
 async fn main() -> Result<()> {
     install_hooks()?;
 
-    // PROTOTYPE side paths (real-pixel kitty renderer), not the braille app.
     let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--kitty") {
-        return kitty::run_kitty();
-    }
+
+    // One-frame RGBA dump for offline inspection (no terminal needed).
     if let Some(pos) = args.iter().position(|a| a == "--dump-rgba") {
         let path = args.get(pos + 1).map(String::as_str).unwrap_or("/tmp/dd3_kitty.rgba");
         return kitty::dump_rgba(path, 720, 560);
+    }
+
+    // Backend selection: explicit --kitty / --braille override; otherwise
+    // auto-detect — real pixels where the graphics protocol exists (kitty/ghostty/
+    // wezterm), braille everywhere else (Alacritty, SSH, dumb terminals).
+    let force_kitty = args.iter().any(|a| a == "--kitty");
+    let force_braille = args.iter().any(|a| a == "--braille");
+    if force_kitty || (!force_braille && kitty::supports_kitty_graphics()) {
+        return kitty::run_kitty();
     }
 
     let mut tui = Tui::new()?;
