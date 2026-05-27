@@ -303,6 +303,7 @@ pub fn run_kitty() -> Result<()> {
     let mut camera = Camera::new();
     camera.radius = 3.2; // closer than the braille default (6.0) — fills the image
     let mut last = Instant::now();
+    let mut fps = 0.0f32;
 
     let result = (|| -> Result<()> {
         loop {
@@ -320,26 +321,40 @@ pub fn run_kitty() -> Result<()> {
                 }
             }
 
-            // Size the image to the window pixel size (kitty reports it), leaving a
-            // small margin; fall back to a square if unavailable.
-            let (w, h) = match crossterm::terminal::window_size() {
-                Ok(ws) if ws.width > 0 && ws.height > 0 => {
-                    ((ws.width as usize).min(1000), (ws.height as usize).min(800))
+            // Terminal geometry: cells (cols/rows) for the status line + pixels for
+            // the image. Reserve the BOTTOM cell row for the status bar so the image
+            // never covers it. Fall back to sane defaults if the terminal doesn't
+            // report a pixel size.
+            let (cols, rows, px_w, px_h) = match crossterm::terminal::window_size() {
+                Ok(ws) if ws.width > 0 && ws.height > 0 && ws.rows > 0 => {
+                    (ws.columns, ws.rows, ws.width as usize, ws.height as usize)
                 }
-                _ => (720, 560),
+                _ => (90, 30, 720, 560),
             };
+            let cell_h = (px_h / rows as usize).max(1);
+            let w = px_w.min(1400);
+            let h = px_h.saturating_sub(cell_h).clamp(1, 1080); // leave the last row
 
             let now = Instant::now();
             let dt = now.duration_since(last).as_secs_f32();
             last = now;
+            if dt > 0.0 {
+                let inst = 1.0 / dt;
+                fps = if fps == 0.0 { inst } else { fps * 0.9 + inst * 0.1 };
+            }
             camera.step(dt);
             let view = camera.view_params(DEFAULT_FOV);
 
             let rgba = render_rgba(&cube, view, &palette, w, h);
 
             delete_all(&mut stdout)?;
-            write!(stdout, "\x1b[H")?; // cursor home
+            write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
             emit_kitty(&mut stdout, &rgba, w, h)?;
+            // Status bar on the reserved bottom row (mirrors the braille HUD).
+            write!(
+                stdout,
+                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | kitty | q to quit"
+            )?;
             stdout.flush()?;
 
             std::thread::sleep(Duration::from_millis(33));
