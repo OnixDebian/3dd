@@ -36,9 +36,8 @@ const MIN_LAMBERT: f32 = 0.62;
 
 /// Anti-aliasing supersample factor per braille dot, per axis. The cube is
 /// rasterized into a framebuffer `SS`× larger on each axis, then box-downsampled
-/// back to the braille resolution: each dot averages its `SS*SS` sub-samples,
-/// counting uncovered samples as background. This softens the silhouette and the
-/// flat-shaded seams between faces (near-horizontal edges otherwise stairstep
+/// back to the braille resolution (see [`resolve_supersampled`]). This smooths
+/// the flat-shaded seams between faces (near-horizontal edges otherwise stairstep
 /// into long "wavy wall" runs at the 2×4-dot braille resolution). Cost is ~SS²
 /// more fill work; the frame is small so it stays well under the FPS budget.
 const SS: usize = 3;
@@ -135,18 +134,23 @@ pub fn render(
         fill_face(&mut hi, &projector, cube, &rf.indices, color);
     }
 
-    resolve_supersampled(&hi, w, h, palette.background)
+    resolve_supersampled(&hi, w, h)
 }
 
 /// Box-downsample the `SS`×-supersampled buffer `hi` into the final braille-res
-/// framebuffer. Each output dot averages its `SS*SS` sub-samples; uncovered
-/// sub-samples contribute the `background` color, so coverage at silhouette edges
-/// blends the dot toward the background (anti-aliasing) while interior seams
-/// between two faces average the two face colors. A dot with zero covered
-/// sub-samples stays unlit.
-fn resolve_supersampled(hi: &Framebuffer, w: usize, h: usize, background: Color) -> Framebuffer {
+/// framebuffer.
+///
+/// A dot is lit only when the shape covers the MAJORITY of its area
+/// (`2 * covered >= SS*SS`). This drops faint, low-coverage edge sub-samples that
+/// would otherwise render as detached dim "dribble" specks below/right of the
+/// body, while keeping a sub-dot-accurate, stable silhouette.
+///
+/// The lit dot's color is the average of the COVERED sub-samples only (the
+/// background is never mixed in), so partially-covered edge dots stay full
+/// brightness — no dim halo — while interior dots that straddle two faces blend
+/// between the two face colors, smoothing the flat-shaded seam.
+fn resolve_supersampled(hi: &Framebuffer, w: usize, h: usize) -> Framebuffer {
     let mut fb = Framebuffer::new(w, h);
-    let (bg_r, bg_g, bg_b) = theme::to_rgb(background);
     let n = (SS * SS) as u32;
 
     for y in 0..h {
@@ -155,27 +159,25 @@ fn resolve_supersampled(hi: &Framebuffer, w: usize, h: usize, background: Color)
             let mut covered = 0u32;
             for sy in 0..SS {
                 for sx in 0..SS {
-                    match hi.get(x * SS + sx, y * SS + sy) {
-                        Some(c) => {
-                            let (r, g, b) = theme::to_rgb(c);
-                            sum_r += r as u32;
-                            sum_g += g as u32;
-                            sum_b += b as u32;
-                            covered += 1;
-                        }
-                        None => {
-                            sum_r += bg_r as u32;
-                            sum_g += bg_g as u32;
-                            sum_b += bg_b as u32;
-                        }
+                    if let Some(c) = hi.get(x * SS + sx, y * SS + sy) {
+                        let (r, g, b) = theme::to_rgb(c);
+                        sum_r += r as u32;
+                        sum_g += g as u32;
+                        sum_b += b as u32;
+                        covered += 1;
                     }
                 }
             }
-            if covered > 0 {
+            // Majority-coverage threshold: skip dots the shape barely touches.
+            if 2 * covered >= n {
                 fb.set(
                     x,
                     y,
-                    theme::rgb((sum_r / n) as u8, (sum_g / n) as u8, (sum_b / n) as u8),
+                    theme::rgb(
+                        (sum_r / covered) as u8,
+                        (sum_g / covered) as u8,
+                        (sum_b / covered) as u8,
+                    ),
                 );
             }
         }
