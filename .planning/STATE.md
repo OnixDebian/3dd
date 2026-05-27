@@ -5,16 +5,16 @@
 See: .planning/PROJECT.md (updated 2026-05-26)
 
 **Core value:** A beautiful, legible 3D scene that lets you grasp the state of your Docker environment at a glance — what's alive, what's hot, what's connected to what.
-**Current focus:** Phase 1 — Render Core & Legibility Spike
+**Current focus:** Phase 2 — Scene Pipeline (one cube -> a rack of boxes)
 
 ## Current Position
 
-Phase: 1 of 5 (Render Core & Legibility Spike)
-Plan: 5 of 5 complete (01-05 scene-orbit-verify)
-Status: Phase 1 COMPLETE — legibility spike APPROVED by human in a real terminal
-Last activity: 2026-05-27 — Completed 01-05-scene-orbit-verify-PLAN.md (human-verify APPROVED)
+Phase: 2 of 5 (Scene Pipeline)
+Plan: 1 of 4 complete (02-01 world scene data layer)
+Status: In progress — world data layer + frame_scene done; rasterizers (02-02 braille, 02-03 kitty) next
+Last activity: 2026-05-27 — Completed 02-01-PLAN.md (TDD, autonomous; build/clippy/test clean, 52 tests)
 
-Progress: ██████████ 100%
+Progress: ██████░░░░ ~60% (Phase 1: 5/5, Phase 2: 1/4)
 
 ## Performance Metrics
 
@@ -58,6 +58,14 @@ Recent decisions affecting current work:
 - 01-05: Final yaw rate ~30°/s (YAW_RATE 0.525, ~12s/revolution) — bumped 1.5x from ~20°/s on human request
 - 01-05: y-flip lives once in NDC→screen projection (01-03); SceneShape blit does NOT re-invert — cube confirmed right-side-up
 
+**Phase 2 (Scene Pipeline):**
+- 02-01: LAYOUT RESOLVED (rack-grid vs network-floors) → network-grouped rack grid. Groups = contiguous Z-bands (Phase 4 ENT-01 floor-planes drop in as the band's plane); within a group boxes fill columns/X and shelves/Y. Network grouping is the first-class placement axis.
+- 02-01: `src/world` is pure deterministic data — layout()/sizing are closed-form functions of stable id/group (NO clock, NO rand, NO global mutable state). synthetic_scene() = 50 boxes / 5 groups, deterministic per-id load (Knuth hash) + status variety (id%10).
+- 02-01: Sizing constants — MIN_HALF 0.3, MAX_HALF 1.2; load_to_half_extent is sqrt-compressive, clamped, NaN-safe (CONT-02). Layout consts — SLOT_SPACING 3.0 (>2*MAX_HALF, no-overlap), GROUP_DEPTH 18.0 (>intra-group spread, clustering), GRID_COLS 4.
+- 02-01: Entity.status REUSES theme::Status (CONT-01); world carries ZERO inline RGB (THEME-01 holds) — color resolved downstream by Palette.
+- 02-01: Camera::frame_scene targets bounds.center, radius = scene_r*(1 + 1/tan(theta)) — NEAR-CORNER tangent bound against the cell-aspect-narrowed HORIZONTAL half-FOV (FRAME_HALF_FOV 0.367, FRAME_SAFETY_MARGIN 0.15), NOT the vertical sphere bound. Pinned frustum-safe across full yaw orbit by frame_scene_keeps_whole_scene_in_frustum.
+- 02-01: RenderConfig.far 100->500 (blocking fix) — the deep rack + pulled-back framing radius put far corners beyond the old far plane; single-cube fog is absolute so unaffected.
+
 **Post-verification rendering evolution (2026-05-27, human-driven, all under 01-05):**
 - ARCHITECTURE PIVOT → DUAL RENDER BACKEND, auto-selected by terminal capability (`src/kitty.rs::supports_kitty_graphics`, dispatched in `main.rs`):
   - **kitty graphics protocol (real RGB pixels)** in kitty/ghostty/wezterm — smooth, anti-aliased, no braille staircase ("ratty-quality"). PREFERRED high-quality path.
@@ -71,18 +79,20 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- (none open from Phase 1) — next: Phase 2 planning (layout algorithm: rack-grid vs network-floors)
+- Phase 2 next: 02-02 (braille rasterizer) + 02-03 (kitty rasterizer) — both consume world::synthetic_scene() + Camera::frame_scene
+- Render verify when a rasterizer lands: confirm the rack reads legibly; GROUP_DEPTH 18 makes a deep scene (far raised to 500) — tighten if too sparse/deep
 
 ### Blockers/Concerns
 
 - ~~Legibility (will it look good?)~~ RESOLVED — Phase 1 legibility spike APPROVED by human in a real terminal; cube reads as a solid 3D form
 - ~~01-01 interactive verification UNVERIFIED~~ RESOLVED — q/Esc restore, resize-no-garbage, panic restore all confirmed working in a real terminal during the 01-05 verify
-- Layout algorithm (rack-grid vs network-floors) unresolved — decide in Phase 2 planning
+- ~~Layout algorithm (rack-grid vs network-floors) unresolved~~ RESOLVED in 02-01 — network-grouped rack grid (groups as Z-bands)
+- Inter-box draw ordering: braille path uses painter's sort (fine for convex boxes, watch overlapping boxes across groups); kitty path's per-pixel z-buffer already handles arbitrary overlap
 - Volume size not exposed by Docker API — decide proxy metric in Phase 4 planning
 
 ## Session Continuity
 
 Last session: 2026-05-27
-Stopped at: 01-05 COMPLETE + post-verify rendering evolution. Dual render backend shipped (kitty real-pixels + braille fallback, auto-detected), quit-responsiveness bug fixed, flat-shading/fog/flicker fixes. All committed; build/clippy/test clean (36 tests, release builds offline).
+Stopped at: 02-01 COMPLETE (TDD, autonomous). Built `src/world` (entity/layout/scene/mod) + Camera::frame_scene; resolved the layout decision (network-grouped rack grid); raised far 100->500. All committed; build/clippy/test clean (52 tests).
 Resume file: None
-Resume note: Phase 1 COMPLETE & APPROVED. Terminal-3D legibility de-risked. KEY ARCHITECTURE: dual render backend auto-selected by terminal — kitty graphics protocol (real RGB pixels, smooth, `src/kitty.rs`) where supported, braille fallback (`src/render3d` + `src/ui/scene.rs`) elsewhere; Alacritty/SSH get braille (no graphics protocol). Run with `--release` for the kitty path. NEXT: Phase 2 — generalize one cube into MANY boxes. The kitty per-pixel z-buffer already handles arbitrary box overlap (braille path uses painter's sort, fine for convex boxes but watch inter-box ordering). Resolve the layout algorithm (rack-grid vs network-floors), designed network-aware up front. NOTE: roadmap deviation — the kitty backend front-runs part of Phase 5's ROB-02 capability/degrade path; reconcile during Phase 5 planning.
+Resume note: Phase 2 in progress (1/4). The world DATA layer is done and pure: `world::synthetic_scene() -> World { entities: Vec<Entity>, bounds: SceneBounds }`, `world::layout::layout(group,index)`, `world::load_to_half_extent`, `Camera::frame_scene(&SceneBounds)`. NOTHING renders the scene yet — that's 02-02 (braille) and 02-03 (kitty), which both consume the same World + frame_scene without touching each other's files. KEY ARCHITECTURE (carried from Phase 1): dual render backend auto-selected by terminal — kitty graphics protocol (real RGB pixels, `src/kitty.rs`) where supported, braille fallback (`src/render3d` + `src/ui/scene.rs`) elsewhere; run `--release` for the kitty path. Rasterizers must scale the unit cube by Entity.half_extents at Entity.position, color via Palette::status_color(Entity.status). Braille path: add inter-box painter's sort (per-box, back-to-front); kitty z-buffer already handles overlap. After a rasterizer lands, capture a frame and verify the rack reads legibly (MEMORY: screenshot & verify). Roadmap note still open: kitty backend front-runs Phase 5 ROB-02; reconcile in Phase 5 planning.
