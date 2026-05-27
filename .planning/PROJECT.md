@@ -75,6 +75,7 @@ clearly.
 | Both camera modes, autopilot default | Works as a passive screensaver and as an explorable scene | — Pending |
 | Themeable palettes via config | User wants flexibility over a single fixed look | — Pending |
 | Bundle full entity set in MVP (containers/stats/networks/volumes/images/ports) | User wants the complete picture, not an incremental rollout | — Pending |
+| Dual render backend: kitty graphics (real RGB pixels) where supported, braille fallback elsewhere | Braille's one-color-per-2×4-cell limit looks chunky/staircased; kitty graphics gives smooth "ratty-quality" real pixels. Auto-detected per terminal so it still runs over SSH/Alacritty | ✅ Phase 1 (01-05) — kitty + braille both ship, auto-selected |
 
 ---
-*Last updated: 2026-05-26 after initialization*
+*Last updated: 2026-05-27 — added dual render backend decision (Phase 1)*

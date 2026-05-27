@@ -58,6 +58,17 @@ Recent decisions affecting current work:
 - 01-05: Final yaw rate ~30°/s (YAW_RATE 0.525, ~12s/revolution) — bumped 1.5x from ~20°/s on human request
 - 01-05: y-flip lives once in NDC→screen projection (01-03); SceneShape blit does NOT re-invert — cube confirmed right-side-up
 
+**Post-verification rendering evolution (2026-05-27, human-driven, all under 01-05):**
+- ARCHITECTURE PIVOT → DUAL RENDER BACKEND, auto-selected by terminal capability (`src/kitty.rs::supports_kitty_graphics`, dispatched in `main.rs`):
+  - **kitty graphics protocol (real RGB pixels)** in kitty/ghostty/wezterm — smooth, anti-aliased, no braille staircase ("ratty-quality"). PREFERRED high-quality path.
+  - **braille** fallback everywhere else (Alacritty, SSH, dumb terminals — Alacritty has NO graphics protocol at all, unfixable there).
+  - Override flags `--kitty` / `--braille`; `--dump-rgba <path>` writes one RGBA frame for offline inspection (how the kitty render is verified without a capturable display).
+- kitty renderer (`src/kitty.rs`): per-pixel z-buffer (exact occlusion — well-suited to Phase 2's many overlapping boxes), 2× supersampled AA, square pixels (cell_aspect 1.0), flat per-face shading, zlib-compressed frames (`o=z`, ~148× smaller payload via `miniz_oxide`), status bar on reserved bottom row, radius 3.2. MUST build `--release` (debug raster ~79ms/frame ≈12fps; release ~11ms).
+- braille shading refined: faces stay FLAT — resolve picks the DOMINANT face color per dot (mode), never a cross-face blend (blend darkened wall-tops); majority-coverage threshold drops faint AA "dribble" specks. Edge-outline experiment was tried and REVERTED (faces looked uneven / flickered).
+- fog made ABSOLUTE (camera-distance ± cube bound), not per-frame visible-face min/max — fixed top-face brightness flicker.
+- INPUT RESPONSIVENESS FIX (real bug): unbounded event channel + heavy render → Render/Tick backlog buried quit keys → app sometimes wouldn't quit on q/Esc/Ctrl-C. Fixed via `MissedTickBehavior::Skip` + main loop drains the queue and COALESCES Render to one draw (`tui::try_next`, `app::run`).
+- Tests now 36 (added kitty `top_face_shade_is_yaw_invariant`).
+
 ### Pending Todos
 
 - (none open from Phase 1) — next: Phase 2 planning (layout algorithm: rack-grid vs network-floors)
@@ -72,6 +83,6 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-05-27
-Stopped at: 01-05 COMPLETE — human APPROVED the cube in a real terminal; final orbit-speed bump applied (fecf62e); SUMMARY + STATE finalized. Phase 1 done (5/5).
+Stopped at: 01-05 COMPLETE + post-verify rendering evolution. Dual render backend shipped (kitty real-pixels + braille fallback, auto-detected), quit-responsiveness bug fixed, flat-shading/fog/flicker fixes. All committed; build/clippy/test clean (36 tests, release builds offline).
 Resume file: None
-Resume note: Phase 1 (Render Core & Legibility Spike) is COMPLETE and APPROVED. The terminal-3D legibility risk is de-risked — cube reads as a solid, smooth, cubic 3D form at low CPU; q/Esc/resize/panic-restore confirmed in a real terminal. Final knobs: radius 6.0, fov 60°, yaw ~30°/s (0.525), pitch bias ~15° + amplitude ~33°, MIN_LAMBERT 0.62, FOG_MIN 0.7, cell_aspect 2.0, running/glow #8A8AF0. build/clippy/test clean (34 tests). NEXT: Phase 2 planning — generalize one cube into many boxes against this proven render path; resolve the layout algorithm (rack-grid vs network-floors), designed network-aware up front.
+Resume note: Phase 1 COMPLETE & APPROVED. Terminal-3D legibility de-risked. KEY ARCHITECTURE: dual render backend auto-selected by terminal — kitty graphics protocol (real RGB pixels, smooth, `src/kitty.rs`) where supported, braille fallback (`src/render3d` + `src/ui/scene.rs`) elsewhere; Alacritty/SSH get braille (no graphics protocol). Run with `--release` for the kitty path. NEXT: Phase 2 — generalize one cube into MANY boxes. The kitty per-pixel z-buffer already handles arbitrary box overlap (braille path uses painter's sort, fine for convex boxes but watch inter-box ordering). Resolve the layout algorithm (rack-grid vs network-floors), designed network-aware up front. NOTE: roadmap deviation — the kitty backend front-runs part of Phase 5's ROB-02 capability/degrade path; reconcile during Phase 5 planning.
