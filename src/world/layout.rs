@@ -15,8 +15,6 @@
 
 use glam::Vec3;
 
-use crate::world::entity::MAX_HALF;
-
 /// Center-to-center spacing between adjacent slots within a group's rack grid.
 /// Strictly greater than `2 * MAX_HALF` (= 2.4) so even two maxed-out boxes in
 /// neighbouring slots keep a clear gap (the no-overlap guarantee).
@@ -38,14 +36,30 @@ pub const GRID_COLS: u32 = 4;
 /// origin so the existing frustum-safe camera math stays sane: X is centered on
 /// the grid columns, Z is centered on the group bands. Y starts at the floor
 /// (row 0 at y=0) and stacks upward.
-pub fn layout(_group: u16, _index_in_group: u32) -> Vec3 {
-    // RED stub — every entity collapses to the origin (slot collision).
-    Vec3::ZERO
+pub fn layout(group: u16, index_in_group: u32) -> Vec3 {
+    let col = index_in_group % GRID_COLS;
+    let row = index_in_group / GRID_COLS;
+
+    // Center the columns about X=0 so the rack straddles the origin.
+    let x_center = (GRID_COLS as f32 - 1.0) * SLOT_SPACING * 0.5;
+    let x = col as f32 * SLOT_SPACING - x_center;
+
+    // Shelves stack upward from the floor.
+    let y = row as f32 * SLOT_SPACING;
+
+    // Each group is a Z-band; bands are not centered here (the scene generator
+    // knows the group count and centers the whole World via SceneBounds.center,
+    // which the camera targets). Using group directly keeps layout a pure
+    // function of its two args alone.
+    let z = group as f32 * GROUP_DEPTH;
+
+    Vec3::new(x, y, z)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::entity::MAX_HALF;
 
     #[test]
     fn is_deterministic() {

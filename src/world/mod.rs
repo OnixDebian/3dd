@@ -9,6 +9,12 @@
 //!
 //! ARCH: pure module — no I/O, no rasterizer deps, no inline RGB. Color is
 //! resolved downstream by the palette via [`crate::theme::Status`].
+//!
+//! NOTE: forward-facing API — the rasterizer plans (02-02 braille, 02-03 kitty)
+//! are the first consumers of `World`/`Entity`/`SceneBounds`, so until then they
+//! report as dead code. The module-level `allow` keeps the surface in place
+//! without masking dead code elsewhere (mirrors `theme`/`render3d`).
+#![allow(dead_code)]
 
 pub mod entity;
 pub mod layout;
