@@ -15,7 +15,7 @@ well-understood Docker work comes only once the renderer is trustworthy.
 - Integer phases (1, 2, 3): Planned milestone work
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
-- [ ] **Phase 1: Render Core & Legibility Spike** - App skeleton + one aspect-correct, depth-shaded cube that orbits smoothly at low CPU
+- [x] **Phase 1: Render Core & Legibility Spike** - App skeleton + one aspect-correct, depth-shaded cube that orbits smoothly at low CPU
 - [ ] **Phase 2: Scene Pipeline & Layout** - Many synthetic boxes in a stable rack layout, occluded, status-colored, load-sized, autopilot orbit
 - [ ] **Phase 3: Docker Data Layer** - Real containers + correct live stats + events feed the proven renderer
 - [ ] **Phase 4: Animation, Interaction & Full Entity Set** - Breathing boxes, manual explore + detail panel, networks/volumes/images/ports
@@ -42,7 +42,7 @@ Plans:
 - [x] 01-02: Palette abstraction (Status→Color, dim/fog helper, no inline RGB)
 - [x] 01-03: Aspect-correct projection pipeline (TDD, single cell_aspect knob, Y-flip pinned)
 - [x] 01-04: Framebuffer + painter's-sorted, depth-shaded, fogged cube rasterizer
-- [ ] 01-05: Orbit camera + braille blit + legibility human-verify
+- [x] 01-05: Orbit camera + braille blit + legibility human-verify
 
 ### Phase 2: Scene Pipeline & Layout
 **Goal**: Generalize the one cube into a full scene of synthetic entities — many boxes in a stable rack/datacenter layout, painter's-occluded, status-colored and load-sized, under an autopilot orbit camera.
@@ -116,7 +116,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Render Core & Legibility Spike | 4/5 | In progress | - |
+| 1. Render Core & Legibility Spike | 5/5 | Complete | 2026-05-27 |
 | 2. Scene Pipeline & Layout | 0/TBD | Not started | - |
 | 3. Docker Data Layer | 0/TBD | Not started | - |
 | 4. Animation, Interaction & Full Entity Set | 0/TBD | Not started | - |

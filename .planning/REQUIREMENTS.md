@@ -9,13 +9,13 @@ Full entity set bundled per PROJECT.md, but build order sequences render-correct
 
 ### Render Core
 
-- [ ] **REND-01**: Scene renders as 3D in the terminal via a braille/ASCII rasterizer (projection + rasterize pipeline)
-- [ ] **REND-02**: Faces/boxes are painter's-sorted back-to-front so nearer objects occlude farther ones (reads as 3D, not flat noise)
-- [ ] **REND-03**: Boxes are depth-shaded (per-face brightness + distance dimming/fog) so they read as solid forms
-- [ ] **REND-04**: Aspect-ratio correction makes a cube look cubic, via a single config-exposed correction factor (not scattered constants)
-- [ ] **REND-05**: Terminal restores cleanly on exit and on panic (raw mode never left enabled)
-- [ ] **REND-06**: Scene re-layouts correctly on terminal resize
-- [ ] **REND-07**: Render loop stays smooth at a steady tick without pegging a CPU core (FPS cap / render-on-change, no spin loop)
+- [x] **REND-01**: Scene renders as 3D in the terminal via a braille/ASCII rasterizer (projection + rasterize pipeline)
+- [x] **REND-02**: Faces/boxes are painter's-sorted back-to-front so nearer objects occlude farther ones (reads as 3D, not flat noise)
+- [x] **REND-03**: Boxes are depth-shaded (per-face brightness + distance dimming/fog) so they read as solid forms
+- [x] **REND-04**: Aspect-ratio correction makes a cube look cubic, via a single config-exposed correction factor (not scattered constants)
+- [x] **REND-05**: Terminal restores cleanly on exit and on panic (raw mode never left enabled)
+- [x] **REND-06**: Scene re-layouts correctly on terminal resize
+- [x] **REND-07**: Render loop stays smooth at a steady tick without pegging a CPU core (FPS cap / render-on-change, no spin loop)
 
 ### Docker Data
 
@@ -49,7 +49,7 @@ Full entity set bundled per PROJECT.md, but build order sequences render-correct
 
 ### Theming & Robustness
 
-- [ ] **THEME-01**: Color comes from a palette abstraction (status colors + bg + glow); no status color is hardcoded
+- [x] **THEME-01**: Color comes from a palette abstraction (status colors + bg + glow); no status color is hardcoded
 - [ ] **THEME-02**: Three built-in palette presets ship: cyberpunk neon, terminal-green, Notion-soft
 - [ ] **THEME-03**: A palette is derived from the current Omarchy/config theme (parsed from ~/.config)
 - [ ] **THEME-04**: Palettes are switchable at runtime (hot re-map, no scene rebuild)
@@ -100,13 +100,13 @@ Which phases cover which requirements. Updated by create-roadmap.
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| REND-01 | Phase 1 | Pending |
-| REND-02 | Phase 1 | Pending |
-| REND-03 | Phase 1 | Pending |
-| REND-04 | Phase 1 | Pending |
-| REND-05 | Phase 1 | Pending |
-| REND-06 | Phase 1 | Pending |
-| REND-07 | Phase 1 | Pending |
+| REND-01 | Phase 1 | Complete |
+| REND-02 | Phase 1 | Complete |
+| REND-03 | Phase 1 | Complete |
+| REND-04 | Phase 1 | Complete |
+| REND-05 | Phase 1 | Complete |
+| REND-06 | Phase 1 | Complete |
+| REND-07 | Phase 1 | Complete |
 | DOCK-01 | Phase 3 | Pending |
 | DOCK-02 | Phase 3 | Pending |
 | DOCK-03 | Phase 3 | Pending |
@@ -125,7 +125,7 @@ Which phases cover which requirements. Updated by create-roadmap.
 | ENT-02 | Phase 4 | Pending |
 | ENT-03 | Phase 4 | Pending |
 | ENT-04 | Phase 4 | Pending |
-| THEME-01 | Phase 1 | Pending |
+| THEME-01 | Phase 1 | Complete |
 | THEME-02 | Phase 5 | Pending |
 | THEME-03 | Phase 5 | Pending |
 | THEME-04 | Phase 5 | Pending |
