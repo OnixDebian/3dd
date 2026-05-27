@@ -10,11 +10,11 @@ See: .planning/PROJECT.md (updated 2026-05-26)
 ## Current Position
 
 Phase: 1 of 5 (Render Core & Legibility Spike)
-Plan: 4 of 5 complete (01-04 framebuffer-rasterizer)
-Status: In progress
-Last activity: 2026-05-26 — Completed 01-04-framebuffer-rasterizer-PLAN.md
+Plan: 5 of 5 complete (01-05 scene-orbit-verify)
+Status: Phase 1 COMPLETE — legibility spike APPROVED by human in a real terminal
+Last activity: 2026-05-27 — Completed 01-05-scene-orbit-verify-PLAN.md (human-verify APPROVED)
 
-Progress: ████████░░ 80%
+Progress: ██████████ 100%
 
 ## Performance Metrics
 
@@ -27,11 +27,11 @@ Progress: ████████░░ 80%
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
-| 1 (Render Core) | 4/5 | ~12 min | ~3 min |
+| 1 (Render Core) | 5/5 ✅ | ~27 min | ~5 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (2 min), 01-04 (4 min)
-- Trend: steady ~3 min/plan
+- Last 5 plans: 01-01 (2 min), 01-04 (4 min), 01-05 (~15 min incl. human-verify + tuning)
+- Trend: steady, with 01-05 longer due to the legibility human-verify loop
 
 ## Accumulated Context
 
@@ -52,21 +52,26 @@ Recent decisions affecting current work:
 - 01-04: Occlusion via painter's sort (farthest-first) + back-face cull — NO per-pixel z-buffer (sufficient for convex boxes, PITFALLS #4)
 - 01-04: Framebuffer `(w,h)` is braille SUB-PIXEL resolution (2*cells_w, 4*cells_h); `lit_pixels()` is the plan-05 blit feed
 - 01-04: Shading = Lambert orientation (theme::dim, floor 0.35) × distance fog (palette.fog toward background, floor 0.45); base color = palette.status_color(Running), zero inline RGB in render3d
+- 01-05: Camera→ViewParams producer side closes the 05→04 decoupling (render3d never imports Camera, no cycle); autopilot step(dt) on the logic tick (framerate-independent)
+- 01-05: Frustum-safe orbit — DEFAULT_RADIUS 6.0, DEFAULT_FOV 60° keep all 8 cube vertices in-frustum across the full yaw×pitch orbit (~21.7° margin); pinned by orbit_keeps_all_vertices_in_frustum with 0.12 NDC margin
+- 01-05 (human-verify tuning, APPROVED): brightened running/glow indigo #5B5BD6→#8A8AF0; raised MIN_LAMBERT 0.35→0.62 and FOG_MIN 0.45→0.7; PITCH_BIAS ~15° + PITCH_AMPLITUDE ~33° to reveal top/bottom faces; cell_aspect 2.0 (cube reads cubic)
+- 01-05: Final yaw rate ~30°/s (YAW_RATE 0.525, ~12s/revolution) — bumped 1.5x from ~20°/s on human request
+- 01-05: y-flip lives once in NDC→screen projection (01-03); SceneShape blit does NOT re-invert — cube confirmed right-side-up
 
 ### Pending Todos
 
-- Verify 01-01 interactive behaviors in a REAL terminal (no TTY in exec sandbox): alt-screen render, q/Esc/Ctrl-C restore, deliberate-panic restore, resize-no-garbage, idle single-digit CPU. See 01-01-SUMMARY "User Verification Required".
+- (none open from Phase 1) — next: Phase 2 planning (layout algorithm: rack-grid vs network-floors)
 
 ### Blockers/Concerns
 
-- Legibility (will it look good?) is MEDIUM confidence — Phase 1 is a deliberate spike to de-risk it
-- 01-01 interactive verification UNVERIFIED (sandbox lacks a TTY); code follows canonical ratatui-async pattern but needs a one-time manual terminal check before Phase 2 relies on it
+- ~~Legibility (will it look good?)~~ RESOLVED — Phase 1 legibility spike APPROVED by human in a real terminal; cube reads as a solid 3D form
+- ~~01-01 interactive verification UNVERIFIED~~ RESOLVED — q/Esc restore, resize-no-garbage, panic restore all confirmed working in a real terminal during the 01-05 verify
 - Layout algorithm (rack-grid vs network-floors) unresolved — decide in Phase 2 planning
 - Volume size not exposed by Docker API — decide proxy metric in Phase 4 planning
 
 ## Session Continuity
 
 Last session: 2026-05-27
-Stopped at: 01-05 human-verify tuning round 1 applied (brightness 22dd223, pitch+radius+test 88e69bc); PAUSED at a fresh human-verify checkpoint
+Stopped at: 01-05 COMPLETE — human APPROVED the cube in a real terminal; final orbit-speed bump applied (fecf62e); SUMMARY + STATE finalized. Phase 1 done (5/5).
 Resume file: None
-Resume note: Tuning round 1 from human feedback — (A) brighter: running/glow indigo #5B5BD6->#8A8AF0, MIN_LAMBERT 0.35->0.62, FOG_MIN 0.45->0.7; (B) top/bottom faces: added PITCH_BIAS ~15deg + widened bob to ~33deg amplitude; (C) clipping: radius 4.0->6.0 and rewrote orbit_keeps_all_vertices_in_frustum to sweep worst-case pitch with a 0.12 NDC margin; (D) shading "lag" diagnosed as designed view-fixed headlight Lambert (cull+shading share one frame's ViewParams — no stale-frame bug), left as-is. build/clippy/test all clean (34 tests). Awaiting human re-verify. After "approved", finish 01-05 — create 01-05-SUMMARY.md, update Current Position/Progress to 5/5 + Phase 1 complete, mark ROADMAP phase 1 done, metadata commit. No-TTY in sandbox so cargo run / restore checks are the human's job.
+Resume note: Phase 1 (Render Core & Legibility Spike) is COMPLETE and APPROVED. The terminal-3D legibility risk is de-risked — cube reads as a solid, smooth, cubic 3D form at low CPU; q/Esc/resize/panic-restore confirmed in a real terminal. Final knobs: radius 6.0, fov 60°, yaw ~30°/s (0.525), pitch bias ~15° + amplitude ~33°, MIN_LAMBERT 0.62, FOG_MIN 0.7, cell_aspect 2.0, running/glow #8A8AF0. build/clippy/test clean (34 tests). NEXT: Phase 2 planning — generalize one cube into many boxes against this proven render path; resolve the layout algorithm (rack-grid vs network-floors), designed network-aware up front.
