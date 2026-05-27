@@ -35,7 +35,13 @@ impl Default for RenderConfig {
             cell_aspect: 2.0,
             fov: std::f32::consts::FRAC_PI_3, // 60 degrees
             near: 0.1,
-            far: 100.0,
+            // Far enough to enclose a whole multi-group rack: the Phase 2 scene
+            // spans dozens of units deep (groups are separated Z-bands), and
+            // `Camera::frame_scene` pulls the eye back several scene-radii to fit
+            // the cone, so the farthest box corner can sit a few hundred units
+            // out. The single-cube path is unaffected (its fog is absolute,
+            // camera-distance based, not derived from `far`).
+            far: 500.0,
         }
     }
 }

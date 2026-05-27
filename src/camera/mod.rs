@@ -65,6 +65,29 @@ const PITCH_AMPLITUDE: f32 = 0.0;
 /// The widened sweep peaks at `bias + amplitude ≈ 60.8°`, comfortably under this.
 const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.15;
 
+/// Effective half-FOV [`Camera::frame_scene`] solves the orbit radius against,
+/// in radians (~21°). This is NOT the vertical half-FOV (30° for a 60° lens):
+/// the projector folds `cell_aspect` (≈2.0) into the perspective aspect, which
+/// narrows the HORIZONTAL field below the vertical one. On a typical terminal
+/// the horizontal half-angle is the binding constraint
+/// (`atan(tan(30°) · (w/h)/cell_aspect) ≈ 21°` for a ~4:3 viewport), so the fit
+/// must respect the tighter axis or a box clips off the left/right edge even
+/// though the bounding sphere "fits" the vertical cone.
+///
+// Consumed by `frame_scene`, which the rasterizer plans (02-02/03) wire in.
+#[allow(dead_code)]
+const FRAME_HALF_FOV: f32 = 0.367;
+
+/// Angular safety margin (radians, ~8.6°) subtracted from [`FRAME_HALF_FOV`]
+/// when [`Camera::frame_scene`] solves for the orbit radius. This is the
+/// multi-box generalization of the Phase 1 single-cube headroom (~21.7° at
+/// radius 6): it leaves a comfortable NDC margin so no box corner grazes the
+/// frustum edge across the full yaw orbit, AND lets the pitch bias swing
+/// vertices toward the edge without clipping. Pinned by
+/// `frame_scene_keeps_whole_scene_in_frustum`.
+#[allow(dead_code)]
+const FRAME_SAFETY_MARGIN: f32 = 0.15;
+
 /// An autopilot orbit camera circling a fixed `target`.
 ///
 /// State is spherical: `yaw` (azimuth around the world Y axis), `pitch`
@@ -142,6 +165,48 @@ impl Camera {
         }
     }
 
+    /// Frame the WHOLE scene instead of a unit cube (CAM-01 generalization).
+    ///
+    /// Sets the orbit `target` to `bounds.center` and solves for a `radius` that
+    /// keeps the scene's bounding sphere inside the frustum with margin. This is
+    /// the same constraint the Phase 1 single-cube derivation used —
+    /// `asin(scene_radius / camera_radius) <= half_fov - margin` — rearranged for
+    /// `radius`:
+    ///
+    /// ```text
+    /// θ      = FRAME_HALF_FOV - FRAME_SAFETY_MARGIN
+    /// radius = scene_radius · (1 + 1 / tan(θ))
+    /// ```
+    ///
+    /// This is the *near-corner* tangent bound, not the simple
+    /// `scene_r / sin(θ)` sphere bound: the box corner nearest the eye sits at
+    /// distance `radius - scene_radius` yet can be offset by up to
+    /// `scene_radius` perpendicular to the view axis, so it subtends
+    /// `atan(scene_radius / (radius - scene_radius))` — LARGER than the sphere
+    /// bound suggests. Solving that against the tighter HORIZONTAL half-angle
+    /// ([`FRAME_HALF_FOV`], the cell-aspect-narrowed axis) keeps even the nearest
+    /// box inside the left/right edge. Because the eye stays exactly `radius`
+    /// from `center` for EVERY yaw/pitch, the margin holds at every orbit angle
+    /// (the invariant `orbit_keeps_all_vertices_in_frustum` relies on), so no box
+    /// corner pops mid-orbit. Pitch bias/clamp are untouched.
+    ///
+    /// Uses [`DEFAULT_FOV`] for the lens (the camera owns the lens); a degenerate
+    /// (zero/non-finite) `bounds.radius` falls back to [`DEFAULT_RADIUS`].
+    // First consumed by the rasterizer plans (02-02 braille, 02-03 kitty); the
+    // test exercises it now, but no non-test caller exists yet.
+    #[allow(dead_code)]
+    pub fn frame_scene(&mut self, bounds: &crate::world::scene::SceneBounds) {
+        self.target = bounds.center;
+
+        let theta = FRAME_HALF_FOV - FRAME_SAFETY_MARGIN;
+        let radius = bounds.radius * (1.0 + 1.0 / theta.tan());
+
+        self.radius = if radius.is_finite() && radius > DEFAULT_RADIUS {
+            radius
+        } else {
+            DEFAULT_RADIUS
+        };
+    }
 }
 
 impl Default for Camera {
@@ -255,6 +320,87 @@ mod tests {
                         "vertex {i} too close to frustum edge at yaw={yaw}, \
                          pitch={pitch}: nx={nx}, ny={ny}",
                     );
+                }
+            }
+        }
+    }
+
+    /// MULTI-BOX FRUSTUM PIN — the scene analogue of
+    /// `orbit_keeps_all_vertices_in_frustum`. Build the synthetic scene, frame it
+    /// with `frame_scene`, then sweep the FULL yaw turn (crossed with the pitch
+    /// range the autopilot reaches) and assert EVERY entity's 8 AABB corners
+    /// project to `Some(..)` with an NDC margin. Guards against a box popping at
+    /// the scene edge mid-orbit once the radius is solved from `SceneBounds`.
+    #[test]
+    fn frame_scene_keeps_whole_scene_in_frustum() {
+        use std::f32::consts::TAU;
+
+        let world = crate::world::scene::synthetic_scene();
+
+        let mut framing = Camera::new();
+        framing.frame_scene(&world.bounds);
+        // frame_scene must orbit the scene center, not the origin.
+        assert!(
+            (framing.target - world.bounds.center).length() < 1e-4,
+            "frame_scene did not target the scene center"
+        );
+        let framed_radius = framing.radius;
+
+        let cfg = RenderConfig::default();
+        let viewport = (160u32, 120u32);
+        let proj_cfg = RenderConfig { fov: DEFAULT_FOV, ..cfg };
+
+        // The autopilot holds PITCH_BIAS (amplitude 0); sweep a band around it to
+        // be robust if the bob is ever re-enabled, staying inside the clamp.
+        let pitch_lo = (PITCH_BIAS - 0.2).max(-PITCH_LIMIT);
+        let pitch_hi = (PITCH_BIAS + 0.2).min(PITCH_LIMIT);
+
+        const MARGIN: f32 = 0.12;
+        let yaw_steps = 72;
+        let pitch_steps = 8;
+        for yi in 0..yaw_steps {
+            let yaw = TAU * yi as f32 / yaw_steps as f32;
+            for pi in 0..=pitch_steps {
+                let pitch = pitch_lo + (pitch_hi - pitch_lo) * pi as f32 / pitch_steps as f32;
+                let cam = Camera {
+                    yaw,
+                    pitch,
+                    radius: framed_radius,
+                    target: world.bounds.center,
+                    elapsed: 0.0,
+                };
+                let vp = cam.view_params(DEFAULT_FOV);
+                let proj = Projector::new(vp.eye, vp.target, vp.up, viewport, &proj_cfg);
+
+                for e in &world.entities {
+                    // The 8 corners of this entity's AABB.
+                    for &sx in &[-1.0f32, 1.0] {
+                        for &sy in &[-1.0f32, 1.0] {
+                            for &sz in &[-1.0f32, 1.0] {
+                                let corner = e.position
+                                    + glam::Vec3::new(
+                                        sx * e.half_extents.x,
+                                        sy * e.half_extents.y,
+                                        sz * e.half_extents.z,
+                                    );
+                                let p = proj.project(corner);
+                                assert!(
+                                    p.is_some(),
+                                    "entity {} corner {corner:?} clipped at yaw={yaw}, pitch={pitch}",
+                                    e.id
+                                );
+                                let (scx, scy, _z) = p.unwrap();
+                                let nx = (scx / viewport.0 as f32) * 2.0 - 1.0;
+                                let ny = (scy / viewport.1 as f32) * 2.0 - 1.0;
+                                assert!(
+                                    nx.abs() <= 1.0 - MARGIN && ny.abs() <= 1.0 - MARGIN,
+                                    "entity {} corner too close to frustum edge at \
+                                     yaw={yaw}, pitch={pitch}: nx={nx}, ny={ny}",
+                                    e.id
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
