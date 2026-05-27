@@ -21,22 +21,36 @@ use ratatui::style::Color;
 
 use crate::camera::{Camera, DEFAULT_FOV};
 use crate::config::RenderConfig;
-use crate::render3d::cube::{unit_cube, Cube};
+use crate::render3d::cube::unit_cube;
 use crate::render3d::project::Projector;
 use crate::render3d::ViewParams;
 use crate::theme::Palette;
+use crate::world::entity::Entity;
+use crate::world::scene::{synthetic_scene, SceneBounds};
 
 /// Internal supersampling factor per axis for anti-aliasing. Real pixels, so this
 /// is plain box-filtered MSAA (no braille constraints).
 const SS: usize = 2;
 
-/// Render one frame of the orbiting cube to a raw RGBA buffer (`w*h*4` bytes).
+/// Render one frame of the whole World to a raw RGBA buffer (`w*h*4` bytes).
+///
+/// Every `entity` is drawn as the unit cube translated to `entity.position` and
+/// scaled by `entity.half_extents * 2`, colored by `palette.status_color`. All
+/// boxes share ONE `color`/`depth` buffer, so the per-pixel z-buffer in
+/// [`fill_tri`] resolves inter-box occlusion for free (near hides far) — the
+/// kitty path's built-in advantage over the painter-sorted braille path.
+///
+/// Fog uses the passed `bounds` for a SCENE-WIDE ABSOLUTE range
+/// (camera-to-center distance ± `bounds.radius`), so a face's brightness depends
+/// only on the static scene + camera, never on which faces happen to be visible
+/// this frame — that is the flicker-safe property carried over from Phase 1.
 ///
 /// Square pixels, so the projector's `cell_aspect` is 1.0 (the braille 2.0 value
 /// corrects for tall braille dots, which do not apply here).
 pub fn render_rgba(
-    cube: &Cube,
+    entities: &[Entity],
     view: ViewParams,
+    bounds: &SceneBounds,
     palette: &Palette,
     w: usize,
     h: usize,
@@ -54,32 +68,57 @@ pub fn render_rgba(
     };
     let projector = Projector::new(view.eye, view.target, view.up, (sw as u32, sh as u32), &config);
 
-    let base = palette.status_color(crate::theme::Status::Running);
+    // Scene-wide ABSOLUTE fog range: camera-to-scene-center distance ± the scene
+    // bounding-sphere radius. A function of the static scene + camera only (never
+    // per-frame visible faces), which is what keeps the shade flicker-free.
+    let cam_to_center = (view.eye - bounds.center).length();
+    let near = cam_to_center - bounds.radius;
+    let far = cam_to_center + bounds.radius;
 
-    for face in &cube.faces {
-        let centroid = face.indices.iter().map(|&i| cube.vertices[i]).sum::<Vec3>() / 4.0;
-        if face.normal.dot(view.eye - centroid) <= 0.0 {
-            continue; // back-face cull
-        }
-        let shaded = face_shade(face.normal, centroid, &view, base, bg);
+    // The unit cube is the per-box geometry template; faces/normals are reused for
+    // every entity (transformed below), so build it once.
+    let cube = unit_cube();
 
-        // Project the 4 corners; skip face if any clips.
-        let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
-        let mut clipped = false;
-        for (slot, &i) in pts.iter_mut().zip(face.indices.iter()) {
-            match projector.project(cube.vertices[i]) {
-                Some((x, y, z)) => *slot = (x, y, z),
-                None => {
-                    clipped = true;
-                    break;
+    for entity in entities {
+        let base = palette.status_color(entity.status);
+        // Per-axis scale = full extent (half_extents * 2); translate to position.
+        let scale = entity.half_extents * 2.0;
+        let world = |v: Vec3| entity.position + v * scale;
+
+        for face in &cube.faces {
+            // World-space corners + centroid for this entity's face.
+            let corners: [Vec3; 4] = [
+                world(cube.vertices[face.indices[0]]),
+                world(cube.vertices[face.indices[1]]),
+                world(cube.vertices[face.indices[2]]),
+                world(cube.vertices[face.indices[3]]),
+            ];
+            let centroid = corners.iter().copied().sum::<Vec3>() / 4.0;
+            // Normals are axis-aligned and the scale is non-negative & uniform per
+            // axis sign, so the unit-cube outward normal still points outward.
+            if face.normal.dot(view.eye - centroid) <= 0.0 {
+                continue; // back-face cull against the eye, in world space
+            }
+            let shaded = face_shade(face.normal, centroid, &view, near, far, base, bg);
+
+            // Project the 4 corners; skip face if any clips.
+            let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
+            let mut clipped = false;
+            for (slot, corner) in pts.iter_mut().zip(corners.iter()) {
+                match projector.project(*corner) {
+                    Some((x, y, z)) => *slot = (x, y, z),
+                    None => {
+                        clipped = true;
+                        break;
+                    }
                 }
             }
+            if clipped {
+                continue;
+            }
+            fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[1], pts[2], shaded);
+            fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[2], pts[3], shaded);
         }
-        if clipped {
-            continue;
-        }
-        fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[1], pts[2], shaded);
-        fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[2], pts[3], shaded);
     }
 
     // Box-downsample SS×SS -> final RGBA.
@@ -107,22 +146,22 @@ pub fn render_rgba(
 }
 
 /// Flat-shade one face: orientation (Lambert toward the eye) plus ABSOLUTE
-/// distance fog. The fog bounds are the camera-to-center distance ± the cube's
-/// bounding radius, NOT a per-frame min/max of visible faces — that relative range
-/// made a face's brightness depend on which OTHER faces were visible, so the top
-/// face flickered as the sides rotated through. With fixed bounds each face's shade
-/// depends only on its own (here constant) geometry, so it is stable frame-to-frame.
+/// distance fog. The fog `near`/`far` bounds are the SCENE-WIDE absolute range
+/// (camera-to-scene-center distance ± the scene bounding radius, computed once
+/// per frame by the caller from the passed `SceneBounds`), NOT a per-frame
+/// min/max of visible faces — that relative range made a face's brightness
+/// depend on which OTHER faces were visible, so the top face flickered as the
+/// sides rotated through. With fixed scene bounds each face's shade depends only
+/// on the static scene + camera, so it is stable frame-to-frame.
 fn face_shade(
     normal: Vec3,
     centroid: Vec3,
     view: &ViewParams,
+    near: f32,
+    far: f32,
     base: Color,
     bg: (u8, u8, u8),
 ) -> (u8, u8, u8) {
-    const CUBE_BOUND: f32 = 0.8660254; // unit-cube bounding sphere radius = sqrt(3)/2
-    let cam_dist = (view.eye - view.target).length();
-    let near = cam_dist - CUBE_BOUND;
-    let far = cam_dist + CUBE_BOUND;
     let to_eye_dir = (view.eye - view.target).normalize_or_zero();
     let lambert = normal.dot(to_eye_dir).max(0.0);
     let orient = 0.62 + (1.0 - 0.62) * lambert;
@@ -298,10 +337,10 @@ pub fn run_kitty() -> Result<()> {
     write!(stdout, "\x1b[2J")?; // clear screen
     stdout.flush()?;
 
-    let cube = unit_cube();
+    let world = synthetic_scene();
     let palette = Palette::default();
     let mut camera = Camera::new();
-    camera.radius = 3.2; // closer than the braille default (6.0) — fills the image
+    camera.frame_scene(&world.bounds); // frame the whole rack (frustum-safe radius)
     let mut last = Instant::now();
     let mut fps = 0.0f32;
 
@@ -345,7 +384,7 @@ pub fn run_kitty() -> Result<()> {
             camera.step(dt);
             let view = camera.view_params(DEFAULT_FOV);
 
-            let rgba = render_rgba(&cube, view, &palette, w, h);
+            let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h);
 
             delete_all(&mut stdout)?;
             write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
@@ -374,13 +413,13 @@ pub fn run_kitty() -> Result<()> {
 /// Render a single frame to a raw RGBA file (`w h` printed to stdout) for offline
 /// inspection without a kitty terminal.
 pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
-    let cube = unit_cube();
+    let world = synthetic_scene();
     let palette = Palette::default();
     let mut camera = Camera::new();
-    camera.radius = 3.2;
-    camera.step(2.0); // advance to a 3/4 pose
+    camera.frame_scene(&world.bounds); // frame the whole rack
+    camera.step(2.0); // advance to an informative 3/4 pose
     let view = camera.view_params(DEFAULT_FOV);
-    let rgba = render_rgba(&cube, view, &palette, w, h);
+    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h);
     std::fs::write(path, &rgba)?;
     println!("{w} {h} {}", rgba.len());
     Ok(())
@@ -392,28 +431,168 @@ mod tests {
 
     /// The top face's shade must NOT change as the camera orbits in yaw (fixed
     /// pitch/radius). This pins the fix for the "top flickers brighter/darker"
-    /// bug — absolute fog bounds make a face's brightness independent of which
-    /// other faces are currently visible.
+    /// bug — absolute SCENE-WIDE fog bounds make a face's brightness independent
+    /// of which other faces are currently visible. The bounds are now derived
+    /// from the framed synthetic scene (Task 1's scene-fog), so the property is
+    /// exercised under the real multi-box fog range, not a single-cube one.
     #[test]
     fn top_face_shade_is_yaw_invariant() {
         let palette = Palette::default();
         let base = palette.status_color(crate::theme::Status::Running);
         let bg = to_rgb(palette.background);
+        let world = synthetic_scene();
         let top_normal = Vec3::Y;
-        let top_centroid = Vec3::new(0.0, 0.5, 0.0);
+        // Place the probe face AT the scene center: the eye stays exactly `radius`
+        // from the center for every yaw (orbit invariant), so the absolute
+        // scene-fog distance is constant and ONLY a flicker bug (a fog range that
+        // depended on the visible-face set) could vary the shade. Off-center
+        // points legitimately change distance under orbit, which is correct fog,
+        // not flicker — so the center is the right place to pin the property.
+        let top_centroid = world.bounds.center;
 
         let mut camera = Camera::new();
-        camera.radius = 3.2;
+        camera.frame_scene(&world.bounds);
         let mut shades = Vec::new();
         for _ in 0..12 {
             camera.step(0.5); // advance yaw, pitch stays fixed
             let view = camera.view_params(DEFAULT_FOV);
-            shades.push(face_shade(top_normal, top_centroid, &view, base, bg));
+            // Scene-wide absolute fog range, exactly as render_rgba computes it.
+            let cam_to_center = (view.eye - world.bounds.center).length();
+            let near = cam_to_center - world.bounds.radius;
+            let far = cam_to_center + world.bounds.radius;
+            shades.push(face_shade(top_normal, top_centroid, &view, near, far, base, bg));
         }
         // Every sampled yaw must yield the identical top-face color.
         assert!(
             shades.windows(2).all(|w| w[0] == w[1]),
             "top face shade varied across yaw (flicker): {shades:?}"
         );
+    }
+
+    /// A camera looking straight down -Z at two same-status boxes stacked along
+    /// the view axis (A near the eye, B far). Because all boxes share one
+    /// z-buffer, the overlapping output pixels must carry box A's color — the
+    /// nearer box — proving inter-box occlusion (near hides far, no blend).
+    #[test]
+    fn z_buffer_occludes_far_box_behind_near_box() {
+        use crate::theme::Status;
+        let palette = Palette::default();
+        let (w, h) = (40usize, 40usize);
+
+        // A in front (z = +2), B behind (z = -2); both centered on the view axis.
+        let near_box = Entity {
+            id: 0,
+            position: Vec3::new(0.0, 0.0, 2.0),
+            half_extents: Vec3::splat(0.6),
+            status: Status::Crashed, // red — distinct from the running color
+            group: 0,
+        };
+        let far_box = Entity {
+            id: 1,
+            position: Vec3::new(0.0, 0.0, -2.0),
+            half_extents: Vec3::splat(0.6),
+            status: Status::Crashed,
+            group: 0,
+        };
+        let entities = [near_box, far_box];
+        let bounds = SceneBounds::from_entities(&entities);
+
+        // Eye on +Z looking toward -Z so A is strictly nearer than B.
+        let view = ViewParams {
+            eye: Vec3::new(0.0, 0.0, 10.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov: DEFAULT_FOV,
+        };
+
+        // Color A alone (drop B) to learn its exact rendered center pixel.
+        let only_a = render_rgba(&[near_box], view, &bounds, &palette, w, h);
+        let both = render_rgba(&entities, view, &bounds, &palette, w, h);
+
+        let center = ((h / 2) * w + (w / 2)) * 4;
+        let a_px = &only_a[center..center + 3];
+        let both_px = &both[center..center + 3];
+        let bg = to_rgb(palette.background);
+        // The overlap must show A's front-face color (non-background) and be
+        // identical to the A-only render — B did not bleed through, no blend.
+        assert_ne!(
+            (both_px[0], both_px[1], both_px[2]),
+            bg,
+            "center pixel was background — boxes did not render"
+        );
+        assert_eq!(
+            both_px, a_px,
+            "near box A did not fully occlude far box B (z-buffer/blend bug)"
+        );
+    }
+
+    /// Two boxes of DIFFERENT status side by side must produce at least two
+    /// distinct non-background colors — per-box status coloring is in effect.
+    #[test]
+    fn distinct_status_boxes_yield_distinct_colors() {
+        use std::collections::HashSet;
+
+        use crate::theme::Status;
+        let palette = Palette::default();
+        let (w, h) = (60usize, 40usize);
+        let bg = to_rgb(palette.background);
+
+        let entities = [
+            Entity {
+                id: 0,
+                position: Vec3::new(-1.5, 0.0, 0.0),
+                half_extents: Vec3::splat(0.5),
+                status: Status::Running,
+                group: 0,
+            },
+            Entity {
+                id: 1,
+                position: Vec3::new(1.5, 0.0, 0.0),
+                half_extents: Vec3::splat(0.5),
+                status: Status::Crashed,
+                group: 0,
+            },
+        ];
+        let bounds = SceneBounds::from_entities(&entities);
+        let view = ViewParams {
+            eye: Vec3::new(0.0, 0.0, 10.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov: DEFAULT_FOV,
+        };
+        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h);
+
+        let mut colors: HashSet<(u8, u8, u8)> = HashSet::new();
+        for px in rgba.chunks_exact(4) {
+            let c = (px[0], px[1], px[2]);
+            if c != bg {
+                colors.insert(c);
+            }
+        }
+        assert!(
+            colors.len() >= 2,
+            "expected >= 2 distinct non-background colors, got {}",
+            colors.len()
+        );
+    }
+
+    /// An empty scene renders all-background, no panic (degenerate bounds safe).
+    #[test]
+    fn empty_scene_is_all_background() {
+        let palette = Palette::default();
+        let (w, h) = (16usize, 16usize);
+        let bounds = SceneBounds::from_entities(&[]);
+        let view = ViewParams {
+            eye: Vec3::new(0.0, 0.0, 10.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov: DEFAULT_FOV,
+        };
+        let rgba = render_rgba(&[], view, &bounds, &palette, w, h);
+        let bg = to_rgb(palette.background);
+        assert_eq!(rgba.len(), w * h * 4);
+        for px in rgba.chunks_exact(4) {
+            assert_eq!((px[0], px[1], px[2]), bg, "non-background pixel in empty scene");
+        }
     }
 }
