@@ -135,77 +135,7 @@ pub fn render(
         fill_face(&mut hi, &projector, cube, &rf.indices, color);
     }
 
-    let mut fb = resolve_supersampled(&hi, w, h);
-
-    // EDGE OVERLAY: outline each visible face with a crisp line in the palette's
-    // edge color. A near-horizontal face boundary otherwise reads as a chunky
-    // "staircase" of the flat fill at braille resolution; a deliberate edge line
-    // masks the step as intentional geometry. Project at the FINAL (non-super-
-    // sampled) resolution so the line lands on real dots. Only visible faces are
-    // outlined, so hidden edges never leak through.
-    let edge_proj = Projector::new(
-        view.eye,
-        view.target,
-        view.up,
-        (w as u32, h as u32),
-        &proj_config,
-    );
-    for rf in &visible {
-        draw_face_outline(&mut fb, &edge_proj, cube, &rf.indices, palette.edge);
-    }
-
-    fb
-}
-
-/// Project a quad face's 4 corners at the framebuffer resolution and stroke its
-/// outline (4 edges) in `color`. Skips the face if any corner clips off-screen,
-/// matching [`fill_face`].
-fn draw_face_outline(
-    fb: &mut Framebuffer,
-    projector: &Projector,
-    cube: &Cube,
-    indices: &[usize; 4],
-    color: Color,
-) {
-    let mut pts = [(0.0f32, 0.0f32); 4];
-    for (slot, &i) in pts.iter_mut().zip(indices.iter()) {
-        match projector.project(cube.vertices[i]) {
-            Some((x, y, _depth)) => *slot = (x, y),
-            None => return,
-        }
-    }
-    for k in 0..4 {
-        draw_line(fb, pts[k], pts[(k + 1) % 4], color);
-    }
-}
-
-/// Stroke a 1-dot-thick line between two screen points (Bresenham). Out-of-range
-/// dots are dropped by the bounds-checked [`Framebuffer::set`].
-fn draw_line(fb: &mut Framebuffer, a: (f32, f32), b: (f32, f32), color: Color) {
-    let (mut x0, mut y0) = (a.0.round() as i32, a.1.round() as i32);
-    let (x1, y1) = (b.0.round() as i32, b.1.round() as i32);
-    let dx = (x1 - x0).abs();
-    let dy = -(y1 - y0).abs();
-    let sx = if x0 < x1 { 1 } else { -1 };
-    let sy = if y0 < y1 { 1 } else { -1 };
-    let mut err = dx + dy;
-    loop {
-        if x0 >= 0 && y0 >= 0 {
-            fb.set(x0 as usize, y0 as usize, color);
-        }
-        if x0 == x1 && y0 == y1 {
-            break;
-        }
-        let e2 = 2 * err;
-        if e2 >= dy {
-            err += dy;
-            x0 += sx;
-        }
-        if e2 <= dx {
-            err += dx;
-            y0 += sy;
-        }
-    }
+    resolve_supersampled(&hi, w, h)
 }
 
 /// Downsample the `SS`×-supersampled buffer `hi` into the final braille-res
@@ -561,13 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn faces_stay_flat_with_edge_outline() {
+    fn faces_stay_flat_no_seam_blend() {
         // Each wall must be ONE uniform color — no darker band along a face's
-        // leading edge (the AA resolve picks the DOMINANT face color per dot, never
-        // a blend). The 3/4 `corner_view` shows exactly three faces, so the FILL
-        // colors are at most 3; the edge overlay adds the palette edge color on
-        // top. We therefore assert: (a) the edge color is present (outline drawn),
-        // and (b) excluding the edge color, the fill stays flat at ≤3 colors.
+        // leading edge where it meets a darker neighbour. The AA resolve picks the
+        // DOMINANT face color per dot (mode), never a blend, so the 3/4
+        // `corner_view`, which shows exactly three faces, must yield at most 3
+        // distinct colors. (≥2 confirms the faces are still differently shaded.)
         let cube = unit_cube();
         let pal = Palette::default();
         let cfg = RenderConfig::default();
@@ -576,15 +505,9 @@ mod tests {
         let distinct: std::collections::HashSet<_> =
             fb.lit_pixels().map(|(_, _, c)| c).collect();
         assert!(
-            distinct.contains(&pal.edge),
-            "expected the edge outline color in the framebuffer"
-        );
-        let fill_colors: std::collections::HashSet<_> =
-            distinct.iter().filter(|&&c| c != pal.edge).collect();
-        assert!(
-            (2..=3).contains(&fill_colors.len()),
+            (2..=3).contains(&distinct.len()),
             "faces must stay flat (one color each, 3 visible faces), got {}",
-            fill_colors.len()
+            distinct.len()
         );
     }
 
