@@ -55,11 +55,11 @@ const PITCH_RATE: f32 = 0.17;
 /// equator as a baseline so, combined with the bob, the camera spends time
 /// clearly looking DOWN onto the top face.
 const PITCH_BIAS: f32 = std::f32::consts::FRAC_PI_8 * 1.2;
-/// Peak amplitude (radians) of the vertical bob about [`PITCH_BIAS`]. ~33° — wide
-/// enough that `bias + amplitude` looks well down on the top and `bias -
-/// amplitude` dips below the equator to show the bottom, while staying clear of
-/// the ±90° gimbal poles.
-const PITCH_AMPLITUDE: f32 = std::f32::consts::FRAC_PI_8 * 1.5;
+/// Peak amplitude (radians) of the vertical bob about [`PITCH_BIAS`]. Set to 0 —
+/// the human asked the camera to hold a fixed elevation and only spin (no
+/// time-varying vertical drift), so the pitch stays pinned at [`PITCH_BIAS`] and
+/// only `yaw` advances. Left as a named knob so the bob can be re-enabled later.
+const PITCH_AMPLITUDE: f32 = 0.0;
 
 /// Hard clamp on pitch so the camera can never reach the poles (gimbal flip).
 /// The widened sweep peaks at `bias + amplitude ≈ 60.8°`, comfortably under this.
@@ -99,9 +99,10 @@ impl Camera {
     /// Advance the autopilot by real elapsed time `dt` (seconds).
     ///
     /// Yaw advances at a constant slow rate (wrapped to keep it bounded); pitch
-    /// eases through a gentle sine bob and is hard-clamped so it can never reach
-    /// the gimbal poles. Using real `dt` keeps the motion framerate-independent
-    /// (Gaffer decoupling).
+    /// holds the fixed [`PITCH_BIAS`] elevation ([`PITCH_AMPLITUDE`] is 0, so the
+    /// optional bob contributes nothing) and is hard-clamped away from the gimbal
+    /// poles. Using real `dt` keeps the motion framerate-independent (Gaffer
+    /// decoupling).
     pub fn step(&mut self, dt: f32) {
         // Ignore non-finite / negative dt defensively (e.g. a clock hiccup).
         let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
@@ -109,10 +110,9 @@ impl Camera {
         self.elapsed += dt;
         // Continuous slow azimuth sweep, wrapped to stay in [0, TAU).
         self.yaw = (self.yaw + YAW_RATE * dt).rem_euclid(std::f32::consts::TAU);
-        // Eased vertical bob (sine) about a steady downward tilt, then
-        // hard-clamped away from the poles. The bias keeps the camera mostly
-        // looking down onto the top while the wide bob dips below to reveal the
-        // bottom face.
+        // Fixed downward tilt (the bob amplitude is 0), hard-clamped away from the
+        // poles. The constant bias keeps the camera looking slightly down onto the
+        // top face while only the yaw spins.
         self.pitch = (PITCH_BIAS + PITCH_AMPLITUDE * (self.elapsed * PITCH_RATE).sin())
             .clamp(-PITCH_LIMIT, PITCH_LIMIT);
     }
