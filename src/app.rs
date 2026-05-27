@@ -79,34 +79,44 @@ impl App {
         self.size = (area.width, area.height);
 
         while let Some(event) = tui.next().await {
-            match event {
-                Event::Key(key) => self.update(Action::from_key(key)),
-                Event::Resize(w, h) => self.on_resize(w, h),
-                Event::Tick => {
-                    let now = Instant::now();
-                    let dt = now.duration_since(self.last_tick).as_secs_f32();
-                    self.last_tick = now;
-                    self.on_tick(dt);
-                }
-                Event::Render => {
-                    let now = Instant::now();
-                    let dt = now.duration_since(self.last_render).as_secs_f32();
-                    self.last_render = now;
-                    if dt > 0.0 {
-                        // Smooth the fps reading a little to avoid jitter.
-                        let instant_fps = 1.0 / dt;
-                        self.fps = if self.fps == 0.0 {
-                            instant_fps
-                        } else {
-                            self.fps * 0.9 + instant_fps * 0.1
-                        };
+            // Drain everything already queued in one pass. Input/resize/tick are
+            // applied immediately; Render is COALESCED to a single draw at the end.
+            // This keeps the loop responsive to quit keys even if a heavy frame let
+            // a backlog build up — we never render the backlog frame-by-frame.
+            let mut render_requested = false;
+            let mut next = Some(event);
+            while let Some(ev) = next {
+                match ev {
+                    Event::Key(key) => self.update(Action::from_key(key)),
+                    Event::Resize(w, h) => self.on_resize(w, h),
+                    Event::Tick => {
+                        let now = Instant::now();
+                        let dt = now.duration_since(self.last_tick).as_secs_f32();
+                        self.last_tick = now;
+                        self.on_tick(dt);
                     }
-                    tui.terminal.draw(|frame| ui::view(frame, self))?;
+                    Event::Render => render_requested = true,
                 }
+                if self.should_quit {
+                    return Ok(());
+                }
+                next = tui.try_next();
             }
 
-            if self.should_quit {
-                break;
+            if render_requested {
+                let now = Instant::now();
+                let dt = now.duration_since(self.last_render).as_secs_f32();
+                self.last_render = now;
+                if dt > 0.0 {
+                    // Smooth the fps reading a little to avoid jitter.
+                    let instant_fps = 1.0 / dt;
+                    self.fps = if self.fps == 0.0 {
+                        instant_fps
+                    } else {
+                        self.fps * 0.9 + instant_fps * 0.1
+                    };
+                }
+                tui.terminal.draw(|frame| ui::view(frame, self))?;
             }
         }
 

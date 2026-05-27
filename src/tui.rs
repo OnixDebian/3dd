@@ -89,6 +89,13 @@ impl Tui {
             let mut reader = EventStream::new();
             let mut render_interval = tokio::time::interval(render_period);
             let mut tick_interval = tokio::time::interval(tick_period);
+            // If the consumer falls behind (a heavy frame), DROP the missed ticks
+            // instead of bursting catch-up ticks. Without this, a slow render lets
+            // Render/Tick events flood the unbounded channel and key events (incl.
+            // quit) get stuck behind a growing backlog — the app stops responding
+            // to q/Esc/Ctrl-C.
+            render_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 let crossterm_event = reader.next();
@@ -134,6 +141,14 @@ impl Tui {
     /// Await the next event from the channel.
     pub async fn next(&mut self) -> Option<Event> {
         self.event_rx.recv().await
+    }
+
+    /// Non-blocking poll for an already-queued event. The main loop drains the
+    /// channel with this so a backlog of Render/Tick events is collapsed in one
+    /// pass (and a pending quit key is reached immediately) instead of rendering
+    /// every queued frame.
+    pub fn try_next(&mut self) -> Option<Event> {
+        self.event_rx.try_recv().ok()
     }
 
     /// Enter raw mode + alternate screen and hide the cursor.
