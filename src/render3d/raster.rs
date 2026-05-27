@@ -34,6 +34,15 @@ use crate::theme::{self, Palette, Status};
 /// gap (this floor → 1.0) still carries enough contrast to read as 3D.
 const MIN_LAMBERT: f32 = 0.62;
 
+/// Anti-aliasing supersample factor per braille dot, per axis. The cube is
+/// rasterized into a framebuffer `SS`× larger on each axis, then box-downsampled
+/// back to the braille resolution: each dot averages its `SS*SS` sub-samples,
+/// counting uncovered samples as background. This softens the silhouette and the
+/// flat-shaded seams between faces (near-horizontal edges otherwise stairstep
+/// into long "wavy wall" runs at the 2×4-dot braille resolution). Cost is ~SS²
+/// more fill work; the frame is small so it stays well under the FPS budget.
+const SS: usize = 3;
+
 /// Render `cube` into a fresh braille-resolution framebuffer.
 ///
 /// `viewport` is the braille SUB-PIXEL size `(w, h)` (`2*cells_w`, `4*cells_h`).
@@ -41,7 +50,9 @@ const MIN_LAMBERT: f32 = 0.62;
 /// decoupled (plan 05's `Camera` builds a `ViewParams` and calls this).
 ///
 /// `view.fov` overrides `config.fov` (the camera owns its lens); near/far and the
-/// load-bearing `cell_aspect` come from `config`.
+/// load-bearing `cell_aspect` come from `config`. Faces are drawn into an
+/// `SS`×-supersampled buffer and resolved with coverage blending (see [`SS`]) for
+/// anti-aliased edges.
 pub fn render(
     cube: &Cube,
     view: ViewParams,
@@ -50,7 +61,11 @@ pub fn render(
     config: &RenderConfig,
 ) -> Framebuffer {
     let (w, h) = viewport;
-    let mut fb = Framebuffer::new(w, h);
+    // Supersampled buffer: SS× the braille resolution on each axis. Scaling both
+    // axes by the same factor preserves the px_w/px_h ratio the projector uses for
+    // cell-aspect correction, so projection is identical — just higher-res.
+    let (hw, hh) = (w * SS, h * SS);
+    let mut hi = Framebuffer::new(hw, hh);
 
     // Camera owns the lens: fold view.fov into the projector's config.
     let proj_config = RenderConfig {
@@ -61,7 +76,7 @@ pub fn render(
         view.eye,
         view.target,
         view.up,
-        (w as u32, h as u32),
+        (hw as u32, hh as u32),
         &proj_config,
     );
 
@@ -85,7 +100,7 @@ pub fn render(
         .collect();
 
     if visible.is_empty() {
-        return fb;
+        return Framebuffer::new(w, h);
     }
 
     // PAINTER'S SORT (REND-02): farthest first, so nearer faces are drawn last
@@ -117,9 +132,54 @@ pub fn render(
         let shaded = theme::dim(base, orient);
         let color = palette.fog(shaded, fog);
 
-        fill_face(&mut fb, &projector, cube, &rf.indices, color);
+        fill_face(&mut hi, &projector, cube, &rf.indices, color);
     }
 
+    resolve_supersampled(&hi, w, h, palette.background)
+}
+
+/// Box-downsample the `SS`×-supersampled buffer `hi` into the final braille-res
+/// framebuffer. Each output dot averages its `SS*SS` sub-samples; uncovered
+/// sub-samples contribute the `background` color, so coverage at silhouette edges
+/// blends the dot toward the background (anti-aliasing) while interior seams
+/// between two faces average the two face colors. A dot with zero covered
+/// sub-samples stays unlit.
+fn resolve_supersampled(hi: &Framebuffer, w: usize, h: usize, background: Color) -> Framebuffer {
+    let mut fb = Framebuffer::new(w, h);
+    let (bg_r, bg_g, bg_b) = theme::to_rgb(background);
+    let n = (SS * SS) as u32;
+
+    for y in 0..h {
+        for x in 0..w {
+            let (mut sum_r, mut sum_g, mut sum_b) = (0u32, 0u32, 0u32);
+            let mut covered = 0u32;
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    match hi.get(x * SS + sx, y * SS + sy) {
+                        Some(c) => {
+                            let (r, g, b) = theme::to_rgb(c);
+                            sum_r += r as u32;
+                            sum_g += g as u32;
+                            sum_b += b as u32;
+                            covered += 1;
+                        }
+                        None => {
+                            sum_r += bg_r as u32;
+                            sum_g += bg_g as u32;
+                            sum_b += bg_b as u32;
+                        }
+                    }
+                }
+            }
+            if covered > 0 {
+                fb.set(
+                    x,
+                    y,
+                    theme::rgb((sum_r / n) as u8, (sum_g / n) as u8, (sum_b / n) as u8),
+                );
+            }
+        }
+    }
     fb
 }
 
@@ -424,6 +484,28 @@ mod tests {
         assert!(
             fill_ratio > 0.9,
             "single front face should fill its bbox densely; ratio={fill_ratio}"
+        );
+    }
+
+    #[test]
+    fn antialiasing_blends_edges() {
+        // The 3/4 `corner_view` shows three flat-shaded faces, so WITHOUT
+        // anti-aliasing the framebuffer would hold at most 3 distinct colors (one
+        // per face). Supersample coverage blending introduces many intermediate
+        // colors along the sloped silhouette edges and the face-to-face seams, so
+        // we expect well more than 3 — proving the AA resolve actually blends.
+        let cube = unit_cube();
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+        let fb = render(&cube, corner_view(), VIEWPORT, &pal, &cfg);
+
+        let distinct: std::collections::HashSet<_> =
+            fb.lit_pixels().map(|(_, _, c)| c).collect();
+        assert!(
+            distinct.len() > 3,
+            "AA should blend edges into >3 distinct colors (3 flat faces + \
+             blended edges), got {}",
+            distinct.len()
         );
     }
 
