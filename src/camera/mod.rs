@@ -83,35 +83,32 @@ const PITCH_AMPLITUDE: f32 = 0.0;
 /// The widened sweep peaks at `bias + amplitude ≈ 60.8°`, comfortably under this.
 const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.15;
 
-/// Effective half-FOV [`Camera::frame_scene`] solves the orbit radius against,
-/// in radians (~21°). This is NOT the vertical half-FOV (30° for a 60° lens):
-/// the projector folds `cell_aspect` (≈2.0) into the perspective aspect, which
-/// narrows the HORIZONTAL field below the vertical one. On a typical terminal
-/// the horizontal half-angle is the binding constraint
-/// (`atan(tan(30°) · (w/h)/cell_aspect) ≈ 21°` for a ~4:3 viewport), so the fit
-/// must respect the tighter axis or a box clips off the left/right edge even
-/// though the bounding sphere "fits" the vertical cone.
-///
-// Consumed by `frame_scene`, which the rasterizer plans (02-02/03) wire in.
-//
-// This is the braille path's BINDING horizontal half-angle at the 60° lens
-// (`atan(tan(30°) · (w/h)/cell_aspect) ≈ 0.367` for a ~4:3 braille viewport with
-// cell_aspect 2.0) — the tightest axis a box can clip against. Kept at the true
-// binding angle; the verify-tuning zoom comes from the much smaller safety margin
-// (the orbit headroom is gone — the camera is static now, so it never has to
-// survive a yaw sweep) and the denser/shallower rack, not from over-widening this.
-#[allow(dead_code)]
-const FRAME_HALF_FOV: f32 = 0.367;
+/// Reference braille viewport [`Camera::frame_scene`] solves the framing distance
+/// against. The live braille/kitty viewports vary with terminal size, but the
+/// camera is framed ONCE (at app construction, before any viewport is known), so
+/// the fit must be backend-independent. We frame against this canonical ~4:3
+/// braille grid at [`DEFAULT_FOV`] with `cell_aspect` 2.0 — the BINDING case: the
+/// cell-aspect-2 horizontal axis is narrower than every other backend/aspect the
+/// rack is shown in, so framing tight here is automatically frustum-safe on the
+/// wider kitty path (square pixels, cell_aspect 1.0) and on taller terminals.
+const FRAME_REF_VIEWPORT: (u32, u32) = (160, 120);
 
-/// Angular safety margin (radians, ~8.6°) subtracted from [`FRAME_HALF_FOV`]
-/// when [`Camera::frame_scene`] solves for the orbit radius. This is the
-/// multi-box generalization of the Phase 1 single-cube headroom (~21.7° at
-/// radius 6): it leaves a comfortable NDC margin so no box corner grazes the
-/// frustum edge across the full yaw orbit, AND lets the pitch bias swing
-/// vertices toward the edge without clipping. Pinned by
-/// `frame_scene_keeps_whole_scene_in_frustum`.
-#[allow(dead_code)]
-const FRAME_SAFETY_MARGIN: f32 = 0.02;
+/// Cell-aspect of the reference braille framing viewport (the braille default).
+/// The projector folds this into the perspective aspect, narrowing the HORIZONTAL
+/// field below the vertical one — which is exactly why the horizontal NDC extent
+/// is the binding axis the [`Camera::frame_scene`] fit drives to [`FRAME_TARGET_FILL`].
+const FRAME_REF_CELL_ASPECT: f32 = 2.0;
+
+/// Target fraction of the binding (horizontal) NDC half-axis the scene's projected
+/// bounding box should fill (~0.92 → the rack spans ~92% of the half-width, i.e.
+/// most of the frame, leaving a thin safety gutter to the edge). This replaces the
+/// old bounding-SPHERE fit: that fit the circumscribing sphere of a diagonal-ribbon
+/// rack, which left the rack under-filling its own sphere (~40-50% of frame). We
+/// now solve the framing distance so the rack's ACTUAL projected AABB reaches this
+/// fill on the binding axis — roughly 2x larger on screen (the human's "в два раза
+/// крупнее"). The remaining 8% gutter is the safety margin so no spun corner grazes
+/// the edge; pinned by `frame_scene_keeps_spinning_scene_in_frustum`.
+const FRAME_TARGET_FILL: f32 = 0.92;
 
 /// An autopilot orbit camera circling a fixed `target`.
 ///
@@ -190,47 +187,110 @@ impl Camera {
         }
     }
 
-    /// Frame the WHOLE scene instead of a unit cube (CAM-01 generalization).
+    /// Frame the WHOLE scene by fitting its PROJECTED bounding box (CAM-01,
+    /// verify-tuning rev).
     ///
-    /// Sets the orbit `target` to `bounds.center` and solves for a `radius` that
-    /// keeps the scene's bounding sphere inside the frustum with margin. This is
-    /// the same constraint the Phase 1 single-cube derivation used —
-    /// `asin(scene_radius / camera_radius) <= half_fov - margin` — rearranged for
-    /// `radius`:
+    /// Sets the orbit `target` to `bounds.center` and solves for the framing
+    /// `radius` so the rack's ACTUAL screen-space projected extent fills
+    /// [`FRAME_TARGET_FILL`] of the binding NDC half-axis — NOT the old
+    /// circumscribing-SPHERE fit. The rack is a diagonal ribbon that under-fills
+    /// its bounding sphere, so the sphere fit left it at ~40-50% of the frame; the
+    /// human asked for ~2x larger ("в два раза крупнее"). Fitting the real
+    /// projected AABB instead lets the rack fill most of the frame.
     ///
-    /// ```text
-    /// θ      = FRAME_HALF_FOV - FRAME_SAFETY_MARGIN
-    /// radius = scene_radius · (1 + 1 / tan(θ))
-    /// ```
+    /// ## Why a binary search, and why it stays frustum-safe on BOTH backends
     ///
-    /// This is the *near-corner* tangent bound, not the simple
-    /// `scene_r / sin(θ)` sphere bound: the box corner nearest the eye sits at
-    /// distance `radius - scene_radius` yet can be offset by up to
-    /// `scene_radius` perpendicular to the view axis, so it subtends
-    /// `atan(scene_radius / (radius - scene_radius))` — LARGER than the sphere
-    /// bound suggests. Solving that against the tighter HORIZONTAL half-angle
-    /// ([`FRAME_HALF_FOV`], the cell-aspect-narrowed axis) keeps even the nearest
-    /// box inside the left/right edge. Because the eye stays exactly `radius`
-    /// from `center` for EVERY yaw/pitch, the margin holds at every orbit angle
-    /// (the invariant `orbit_keeps_all_vertices_in_frustum` relies on), so no box
-    /// corner pops mid-orbit. Pitch bias/clamp are untouched.
+    /// The view direction is fixed (`FRAME_YAW`/`PITCH_BIAS`); only `radius`
+    /// moves the eye along it, and the projected NDC extent shrinks monotonically
+    /// as `radius` grows. So we binary-search `radius`: at each candidate we build
+    /// a reference projector ([`FRAME_REF_VIEWPORT`] / [`FRAME_REF_CELL_ASPECT`] /
+    /// [`DEFAULT_FOV`] — the canonical BINDING braille frustum), project EVERY
+    /// entity's 8 AABB corners SWEPT through a turn of per-box Y-spin (the corners
+    /// poke widest mid-rotation, exactly as the renderers spin them), and measure
+    /// the max horizontal NDC half-extent. We tighten `radius` until that extent
+    /// reaches [`FRAME_TARGET_FILL`]. The horizontal axis is the binding one
+    /// (cell_aspect 2 narrows it below vertical), so driving X to <1 keeps Y
+    /// comfortably inside too; and the kitty path (square pixels, wider horizontal
+    /// field) is automatically safer than this reference braille fit. The eye
+    /// stays exactly `radius` from `center`, so the framing holds for the single
+    /// static pose the human sees (the orbit is disabled).
     ///
-    /// Uses [`DEFAULT_FOV`] for the lens (the camera owns the lens); a degenerate
-    /// (zero/non-finite) `bounds.radius` falls back to [`DEFAULT_RADIUS`].
-    // First consumed by the rasterizer plans (02-02 braille, 02-03 kitty); the
-    // test exercises it now, but no non-test caller exists yet.
-    #[allow(dead_code)]
-    pub fn frame_scene(&mut self, bounds: &crate::world::scene::SceneBounds) {
-        self.target = bounds.center;
+    /// Uses [`DEFAULT_FOV`] for the lens (the camera owns the lens); an empty
+    /// scene or a degenerate projected extent falls back to [`DEFAULT_RADIUS`].
+    pub fn frame_scene(&mut self, world: &crate::world::World) {
+        use crate::config::RenderConfig;
+        use crate::render3d::project::Projector;
+        use crate::render3d::rotate_y_about;
 
-        let theta = FRAME_HALF_FOV - FRAME_SAFETY_MARGIN;
-        let radius = bounds.radius * (1.0 + 1.0 / theta.tan());
+        self.target = world.bounds.center;
 
-        self.radius = if radius.is_finite() && radius > DEFAULT_RADIUS {
-            radius
-        } else {
-            DEFAULT_RADIUS
+        if world.entities.is_empty() {
+            self.radius = DEFAULT_RADIUS;
+            return;
+        }
+
+        let proj_cfg = RenderConfig { fov: DEFAULT_FOV, cell_aspect: FRAME_REF_CELL_ASPECT, ..RenderConfig::default() };
+
+        // Max horizontal NDC half-extent of the whole rack at a candidate radius,
+        // swept across per-box spin so a mid-rotation corner can't be missed.
+        // Returns None if any corner clips (radius too small — box off-screen).
+        let max_ndc_x = |radius: f32| -> Option<f32> {
+            let (sy, cy) = self.yaw.sin_cos();
+            let (sp, cp) = self.pitch.sin_cos();
+            let dir = Vec3::new(cp * sy, sp, cp * cy);
+            let eye = self.target + dir * radius;
+            let proj = Projector::new(eye, self.target, Vec3::Y, FRAME_REF_VIEWPORT, &proj_cfg);
+
+            const SPIN_STEPS: u32 = 24;
+            let mut worst: f32 = 0.0;
+            for si in 0..SPIN_STEPS {
+                let spin = std::f32::consts::TAU * si as f32 / SPIN_STEPS as f32;
+                for e in &world.entities {
+                    for &sx in &[-1.0f32, 1.0] {
+                        for &sgy in &[-1.0f32, 1.0] {
+                            for &sz in &[-1.0f32, 1.0] {
+                                let corner = e.position
+                                    + Vec3::new(
+                                        sx * e.half_extents.x,
+                                        sgy * e.half_extents.y,
+                                        sz * e.half_extents.z,
+                                    );
+                                let spun = rotate_y_about(corner, e.position, spin);
+                                match proj.ndc(spun) {
+                                    Some(ndc) => worst = worst.max(ndc.x.abs()),
+                                    None => return None, // clips — radius too tight
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Some(worst)
         };
+
+        // Binary-search radius in [lo, hi]: lo too tight (clips or over-fills),
+        // hi safely loose (extent < target). Invariant: at hi the rack fits.
+        let mut hi = DEFAULT_RADIUS.max(4.0 * world.bounds.radius + 4.0);
+        // Grow hi until the rack provably fits (extent below target) — defensive.
+        for _ in 0..40 {
+            match max_ndc_x(hi) {
+                Some(x) if x <= FRAME_TARGET_FILL => break,
+                _ => hi *= 1.5,
+            }
+        }
+        let mut lo = 0.0_f32;
+        // 40 iterations → sub-millimetre precision on the radius.
+        for _ in 0..40 {
+            let mid = 0.5 * (lo + hi);
+            match max_ndc_x(mid) {
+                // Fits and still under target → can pull closer (smaller radius).
+                Some(x) if x <= FRAME_TARGET_FILL => hi = mid,
+                // Over target or clipping → must back off (larger radius).
+                _ => lo = mid,
+            }
+        }
+
+        self.radius = if hi.is_finite() && hi > 0.0 { hi } else { DEFAULT_RADIUS };
     }
 }
 
@@ -335,19 +395,21 @@ mod tests {
         let world = crate::world::scene::synthetic_scene();
 
         let mut cam = Camera::new();
-        cam.frame_scene(&world.bounds);
+        cam.frame_scene(&world);
         // frame_scene must target the scene center, not the origin.
         assert!(
             (cam.target - world.bounds.center).length() < 1e-4,
             "frame_scene did not target the scene center"
         );
 
-        let cfg = RenderConfig::default();
-        let viewport = (160u32, 120u32);
-        let proj_cfg = RenderConfig { fov: DEFAULT_FOV, ..cfg };
+        // Project against the SAME binding reference frustum frame_scene fits to
+        // (the cell_aspect-2 braille viewport — the tightest axis). If no corner
+        // clips here, none clips on the wider kitty path / taller terminals.
+        let proj_cfg =
+            RenderConfig { fov: DEFAULT_FOV, cell_aspect: FRAME_REF_CELL_ASPECT, ..RenderConfig::default() };
 
         let vp = cam.view_params(DEFAULT_FOV);
-        let proj = Projector::new(vp.eye, vp.target, vp.up, viewport, &proj_cfg);
+        let proj = Projector::new(vp.eye, vp.target, vp.up, FRAME_REF_VIEWPORT, &proj_cfg);
 
         // Sweep the per-box spin so a box mid-rotation can't push a corner off.
         let spin_steps = 24;
@@ -376,5 +438,61 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// PROJECTED-AABB FILL pin: `frame_scene` must pull the eye in close enough
+    /// that the rack's projected bounding box FILLS the frame — the binding
+    /// (horizontal) NDC half-extent must reach `FRAME_TARGET_FILL` (within a small
+    /// tolerance) WITHOUT exceeding 1.0 on any axis at any spin. This guards the
+    /// "~2x larger" tuning: it would fail (extent far below target) if the fit
+    /// regressed to the old under-filling bounding-sphere model.
+    #[test]
+    fn frame_scene_fills_frame_on_binding_axis() {
+        use std::f32::consts::TAU;
+
+        use crate::render3d::rotate_y_about;
+
+        let world = crate::world::scene::synthetic_scene();
+        let mut cam = Camera::new();
+        cam.frame_scene(&world);
+
+        let proj_cfg =
+            RenderConfig { fov: DEFAULT_FOV, cell_aspect: FRAME_REF_CELL_ASPECT, ..RenderConfig::default() };
+        let vp = cam.view_params(DEFAULT_FOV);
+        let proj = Projector::new(vp.eye, vp.target, vp.up, FRAME_REF_VIEWPORT, &proj_cfg);
+
+        let mut max_x: f32 = 0.0;
+        let mut max_y: f32 = 0.0;
+        let spin_steps = 24;
+        for si in 0..spin_steps {
+            let spin = TAU * si as f32 / spin_steps as f32;
+            for e in &world.entities {
+                for &sx in &[-1.0f32, 1.0] {
+                    for &sy in &[-1.0f32, 1.0] {
+                        for &sz in &[-1.0f32, 1.0] {
+                            let corner = e.position
+                                + glam::Vec3::new(
+                                    sx * e.half_extents.x,
+                                    sy * e.half_extents.y,
+                                    sz * e.half_extents.z,
+                                );
+                            let spun = rotate_y_about(corner, e.position, spin);
+                            let ndc = proj.ndc(spun).expect("corner behind near plane");
+                            max_x = max_x.max(ndc.x.abs());
+                            max_y = max_y.max(ndc.y.abs());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Binding axis reaches the target fill (the rack is "zoomed in"), and
+        // nothing clips on EITHER axis.
+        assert!(
+            (max_x - FRAME_TARGET_FILL).abs() < 0.02,
+            "binding-axis fill {max_x} should be ~{FRAME_TARGET_FILL} (rack not framed ~2x larger)"
+        );
+        assert!(max_x <= 1.0, "binding axis clips: max |ndc.x| = {max_x}");
+        assert!(max_y <= 1.0, "vertical axis clips: max |ndc.y| = {max_y}");
     }
 }

@@ -55,7 +55,7 @@ impl App {
         // target, so this single framing stays correct as the scene is static.
         let world = world::synthetic_scene();
         let mut camera = Camera::new();
-        camera.frame_scene(&world.bounds);
+        camera.frame_scene(&world);
         Self {
             should_quit: false,
             size: (0, 0),

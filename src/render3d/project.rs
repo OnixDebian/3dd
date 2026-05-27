@@ -69,20 +69,32 @@ impl Projector {
     /// sorting. Clipping happens BEFORE the perspective divide so behind-camera
     /// points never wrap to bogus on-screen coordinates.
     pub fn project(&self, world: Vec3) -> Option<(f32, f32, f32)> {
+        // In-frustum NDC, then map to screen. `ndc` already rejects behind-near
+        // points; here we additionally require the point be inside the canonical
+        // view volume on every axis (the rasterizer's drop-on-clip rule).
+        let ndc = self.ndc(world)?;
+        if !in_frustum(ndc) {
+            return None;
+        }
+        Some(ndc_to_screen(ndc, self.px_w, self.px_h))
+    }
+
+    /// Project a world point to raw NDC (`Vec3`, ≈ `[-1, 1]` per axis inside the
+    /// frustum), or `None` if it is at/behind the near plane.
+    ///
+    /// Unlike [`Projector::project`] this does NOT reject points outside the
+    /// `[-1, 1]` box — it returns the NDC even when a coordinate exceeds 1, so
+    /// callers (the camera's projected-AABB framing) can MEASURE how far past the
+    /// edge a corner reaches and solve a fit. Clipping in view space still happens
+    /// first so behind-camera points never wrap to bogus coordinates.
+    pub fn ndc(&self, world: Vec3) -> Option<Vec3> {
         // Clip in view space first: RH view space looks down -Z, so visible
         // points have z <= -near. Anything at or behind the near plane is out.
         let view_pos = self.view.transform_point3(world);
         if view_pos.z > -self.near {
             return None;
         }
-
-        // Perspective divide → NDC (≈ [-1, 1] on each axis inside the frustum).
-        let ndc = self.view_proj.project_point3(world);
-        if !in_frustum(ndc) {
-            return None;
-        }
-
-        Some(ndc_to_screen(ndc, self.px_w, self.px_h))
+        Some(self.view_proj.project_point3(world))
     }
 }
 

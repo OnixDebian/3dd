@@ -351,7 +351,7 @@ pub fn run_kitty() -> Result<()> {
     let world = synthetic_scene();
     let palette = Palette::default();
     let mut camera = Camera::new();
-    camera.frame_scene(&world.bounds); // frame the whole rack (frustum-safe radius)
+    camera.frame_scene(&world); // frame the whole rack (frustum-safe radius)
     let mut last = Instant::now();
     let mut fps = 0.0f32;
     // Per-box self-spin angle, advanced by REAL dt (framerate-independent), since
@@ -431,7 +431,7 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
     let world = synthetic_scene();
     let palette = Palette::default();
     let mut camera = Camera::new();
-    camera.frame_scene(&world.bounds); // frame the whole rack
+    camera.frame_scene(&world); // frame the whole rack
     // Static camera now; advance the per-box spin to an informative 3/4 pose so
     // the dump shows boxes mid-rotation (not all axis-aligned/edge-on).
     let spin = SPIN_RATE * 2.0;
@@ -468,7 +468,7 @@ mod tests {
         let top_centroid = world.bounds.center;
 
         let mut camera = Camera::new();
-        camera.frame_scene(&world.bounds);
+        camera.frame_scene(&world);
         let mut shades = Vec::new();
         for _ in 0..12 {
             camera.step(0.5); // advance yaw, pitch stays fixed
