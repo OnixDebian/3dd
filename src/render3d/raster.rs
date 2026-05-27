@@ -35,11 +35,12 @@ use crate::theme::{self, Palette, Status};
 const MIN_LAMBERT: f32 = 0.62;
 
 /// Anti-aliasing supersample factor per braille dot, per axis. The cube is
-/// rasterized into a framebuffer `SS`× larger on each axis, then box-downsampled
-/// back to the braille resolution (see [`resolve_supersampled`]). This smooths
-/// the flat-shaded seams between faces (near-horizontal edges otherwise stairstep
-/// into long "wavy wall" runs at the 2×4-dot braille resolution). Cost is ~SS²
-/// more fill work; the frame is small so it stays well under the FPS budget.
+/// rasterized into a framebuffer `SS`× larger on each axis, then downsampled back
+/// to the braille resolution (see [`resolve_supersampled`]). Supersampling
+/// positions silhouette and face-boundary edges to sub-dot accuracy, removing the
+/// long "wavy wall" stairsteps that near-horizontal edges otherwise produce at the
+/// 2×4-dot braille resolution. Cost is ~SS² more fill work; the frame is small so
+/// it stays well under the FPS budget.
 const SS: usize = 3;
 
 /// Render `cube` into a fresh braille-resolution framebuffer.
@@ -137,48 +138,48 @@ pub fn render(
     resolve_supersampled(&hi, w, h)
 }
 
-/// Box-downsample the `SS`×-supersampled buffer `hi` into the final braille-res
+/// Downsample the `SS`×-supersampled buffer `hi` into the final braille-res
 /// framebuffer.
 ///
 /// A dot is lit only when the shape covers the MAJORITY of its area
 /// (`2 * covered >= SS*SS`). This drops faint, low-coverage edge sub-samples that
 /// would otherwise render as detached dim "dribble" specks below/right of the
-/// body, while keeping a sub-dot-accurate, stable silhouette.
+/// body, and keeps a sub-dot-accurate, stable silhouette.
 ///
-/// The lit dot's color is the average of the COVERED sub-samples only (the
-/// background is never mixed in), so partially-covered edge dots stay full
-/// brightness — no dim halo — while interior dots that straddle two faces blend
-/// between the two face colors, smoothing the flat-shaded seam.
+/// The lit dot takes the color of the DOMINANT face among its covered sub-samples
+/// (the most frequent color — each face is one flat color), NOT a blend. This
+/// keeps every wall a single uniform color with a crisp 1-dot boundary against the
+/// next face — no darker band along a face's leading edge where it meets a darker
+/// neighbour.
 fn resolve_supersampled(hi: &Framebuffer, w: usize, h: usize) -> Framebuffer {
     let mut fb = Framebuffer::new(w, h);
     let n = (SS * SS) as u32;
 
     for y in 0..h {
         for x in 0..w {
-            let (mut sum_r, mut sum_g, mut sum_b) = (0u32, 0u32, 0u32);
+            // Tally covered sub-sample colors (at most SS*SS distinct).
+            let mut tally: Vec<(Color, u32)> = Vec::new();
             let mut covered = 0u32;
             for sy in 0..SS {
                 for sx in 0..SS {
                     if let Some(c) = hi.get(x * SS + sx, y * SS + sy) {
-                        let (r, g, b) = theme::to_rgb(c);
-                        sum_r += r as u32;
-                        sum_g += g as u32;
-                        sum_b += b as u32;
                         covered += 1;
+                        match tally.iter_mut().find(|(col, _)| *col == c) {
+                            Some(entry) => entry.1 += 1,
+                            None => tally.push((c, 1)),
+                        }
                     }
                 }
             }
             // Majority-coverage threshold: skip dots the shape barely touches.
             if 2 * covered >= n {
-                fb.set(
-                    x,
-                    y,
-                    theme::rgb(
-                        (sum_r / covered) as u8,
-                        (sum_g / covered) as u8,
-                        (sum_b / covered) as u8,
-                    ),
-                );
+                // Dominant face color (mode) — flat walls, crisp face boundaries.
+                let color = tally
+                    .iter()
+                    .max_by_key(|(_, count)| *count)
+                    .map(|(c, _)| *c)
+                    .expect("covered > 0 implies a tallied color");
+                fb.set(x, y, color);
             }
         }
     }
@@ -490,12 +491,12 @@ mod tests {
     }
 
     #[test]
-    fn antialiasing_blends_edges() {
-        // The 3/4 `corner_view` shows three flat-shaded faces, so WITHOUT
-        // anti-aliasing the framebuffer would hold at most 3 distinct colors (one
-        // per face). Supersample coverage blending introduces many intermediate
-        // colors along the sloped silhouette edges and the face-to-face seams, so
-        // we expect well more than 3 — proving the AA resolve actually blends.
+    fn faces_stay_flat_no_seam_blend() {
+        // Each wall must be ONE uniform color — no darker band along a face's
+        // leading edge where it meets a darker neighbour. The AA resolve picks the
+        // DOMINANT face color per dot (mode), never a blend, so the 3/4
+        // `corner_view`, which shows exactly three faces, must yield at most 3
+        // distinct colors. (≥2 confirms the faces are still differently shaded.)
         let cube = unit_cube();
         let pal = Palette::default();
         let cfg = RenderConfig::default();
@@ -504,9 +505,8 @@ mod tests {
         let distinct: std::collections::HashSet<_> =
             fb.lit_pixels().map(|(_, _, c)| c).collect();
         assert!(
-            distinct.len() > 3,
-            "AA should blend edges into >3 distinct colors (3 flat faces + \
-             blended edges), got {}",
+            (2..=3).contains(&distinct.len()),
+            "faces must stay flat (one color each, 3 visible faces), got {}",
             distinct.len()
         );
     }

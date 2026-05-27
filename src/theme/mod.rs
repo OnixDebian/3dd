@@ -98,23 +98,6 @@ impl Palette {
     }
 }
 
-/// Extract the RGB channels of a truecolor [`Color`]. Non-RGB colors report
-/// black (the renderer only feeds truecolor here; Phase 5 adds quantization).
-/// Lets draw sites read channels for blending without naming RGB inline.
-pub fn to_rgb(color: Color) -> (u8, u8, u8) {
-    match color {
-        Color::Rgb(r, g, b) => (r, g, b),
-        _ => (0, 0, 0),
-    }
-}
-
-/// Build a truecolor [`Color`] from raw channels. Draw sites compose blended
-/// samples as integers and call this, so RGB construction stays inside the
-/// theme (the "no inline RGB elsewhere" invariant).
-pub fn rgb(r: u8, g: u8, b: u8) -> Color {
-    Color::Rgb(r, g, b)
-}
-
 /// Linearly interpolate between two RGB colors. `t` is clamped to `[0, 1]`:
 /// `t == 0.0` returns `a`, `t == 1.0` returns `b`.
 ///
