@@ -25,10 +25,21 @@ pub fn view(frame: &mut Frame, app: &App) {
     let scene_area = chunks[0];
     let status_area = chunks[1];
 
-    // The orbiting cube renders into the braille Canvas in the scene area.
-    // Palette is the single color source; the camera feeds render() a ViewParams.
+    // The orbiting World of boxes renders into the braille Canvas in the scene
+    // area. Palette is the single color source; the camera feeds render_scene a
+    // ViewParams. 02-04 SEAM: the app does not own a World yet, so we thread a
+    // temporary synthetic_scene() here; plan 02-04 replaces it with app-owned
+    // World state.
     let palette = crate::theme::Palette::default();
-    scene::render_scene(frame, scene_area, &app.camera, &palette, &app.render_config);
+    let world = crate::world::synthetic_scene();
+    scene::render_scene(
+        frame,
+        scene_area,
+        &app.camera,
+        &world.entities,
+        &palette,
+        &app.render_config,
+    );
 
     status_bar::render(frame, status_area, app);
 }
