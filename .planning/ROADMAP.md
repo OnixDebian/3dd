@@ -16,7 +16,7 @@ well-understood Docker work comes only once the renderer is trustworthy.
 - Decimal phases (2.1, 2.2): Urgent insertions (marked with INSERTED)
 
 - [x] **Phase 1: Render Core & Legibility Spike** - App skeleton + one aspect-correct, depth-shaded cube that orbits smoothly at low CPU
-- [ ] **Phase 2: Scene Pipeline & Layout** - Many synthetic boxes in a stable rack layout, occluded, status-colored, load-sized, autopilot orbit
+- [x] **Phase 2: Scene Pipeline & Layout** - Many synthetic boxes in a stable rack layout, occluded, status-colored, load-sized, per-box self-spin (orbit overridden)
 - [ ] **Phase 3: Docker Data Layer** - Real containers + correct live stats + events feed the proven renderer
 - [ ] **Phase 4: Animation, Interaction & Full Entity Set** - Breathing boxes, manual explore + detail panel, networks/volumes/images/ports
 - [ ] **Phase 5: Theming, Config & Robustness** - TOML config, runtime palette switching, legend HUD, SSH/degrade path
@@ -53,12 +53,15 @@ Plans:
   2. Each box is colored by status and sized by a (synthetic) CPU/RAM proxy, clamped so idle isn't invisible and a hog doesn't fill the screen
   3. Boxes hold a stable layout slot frame-to-frame (no jitter/teleport)
   4. The autopilot orbit camera runs by default with smooth motion parallax
-**Research**: Likely (load-bearing, unresolved)
+**Research**: Likely (load-bearing, unresolved) — RESOLVED: network-grouped rack grid (groups as Z-bands)
 **Research topics**: rack-grid vs network-grouped-floor layout algorithm — design network-aware from the start even though networks land in Phase 4
-**Plans**: TBD
+**Plans**: 4 (3 waves)
 
 Plans:
-- [ ] 02-01: TBD
+- [x] 02-01: World/entity data layer + deterministic network-aware layout + SceneBounds + Camera::frame_scene
+- [x] 02-02: Multi-box braille rasterizer (cross-box painter's sort, status color, scene fog)
+- [x] 02-03: Multi-box kitty renderer (per-pixel z-buffer, scene-wide absolute fog, scene-framed)
+- [x] 02-04: App owns World + per-box self-spin + projected-AABB framing + human-verify (both backends)
 
 ### Phase 3: Docker Data Layer
 **Goal**: Feed real Docker data into the proven renderer — list/inspect containers, stream correct live stats, and react to create/destroy events, with graceful failure states.
@@ -117,7 +120,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Render Core & Legibility Spike | 5/5 | Complete | 2026-05-27 |
-| 2. Scene Pipeline & Layout | 0/TBD | Not started | - |
+| 2. Scene Pipeline & Layout | 4/4 | Complete | 2026-05-27 |
 | 3. Docker Data Layer | 0/TBD | Not started | - |
 | 4. Animation, Interaction & Full Entity Set | 0/TBD | Not started | - |
 | 5. Theming, Config & Robustness | 0/TBD | Not started | - |

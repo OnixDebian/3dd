@@ -5,14 +5,21 @@
 See: .planning/PROJECT.md (updated 2026-05-26)
 
 **Core value:** A beautiful, legible 3D scene that lets you grasp the state of your Docker environment at a glance — what's alive, what's hot, what's connected to what.
-**Current focus:** Phase 2 — Scene Pipeline (one cube -> a rack of boxes)
+**Current focus:** Phase 2 COMPLETE — next: Phase 3 (Docker Data Layer)
 
 ## Current Position
 
-Phase: 2 of 5 (Scene Pipeline)
-Plan: 1 of 4 complete (02-01 world scene data layer)
-Status: In progress — world data layer + frame_scene done; rasterizers (02-02 braille, 02-03 kitty) next
-Last activity: 2026-05-27 — Completed 02-01-PLAN.md (TDD, autonomous; build/clippy/test clean, 52 tests)
+Phase: 2 of 5 (Scene Pipeline) — COMPLETE
+Plan: 4 of 4 complete (02-04 app integration + scene verify)
+Status: Phase 2 COMPLETE — multi-box scene verified by human in a real terminal across both backends; VERIFICATION passed 4/4
+Last activity: 2026-05-27 — Completed 02-04 (human-verify APPROVED); per-box self-spin + projected-AABB framing accepted
+
+## Phase 2 Notes (for Phase 3 planning)
+
+- **Architecture:** App owns a single `World` (src/world/: entity/layout/scene/mod). `synthetic_scene()` → 30 boxes / 3 network-groups, deterministic. Both renderers consume `&[Entity]` + `SceneBounds`; `Camera::frame_scene(&world)` binary-searches distance to projected-AABB fill (FRAME_TARGET_FILL=0.92, binding = horizontal axis at cell_aspect 2). When real Docker data lands (Phase 3), it replaces synthetic_scene() output — keep the same World/Entity shape.
+- **Occlusion:** braille = single cross-box painter's sort (face-centroid); kitty = per-pixel z-buffer. Boxes never physically intersect (SLOT_SPACING 2.6), so painter's sort is safe for convex boxes.
+- **DEVIATION / RECONCILE (CAM-01):** roadmap criterion #4 was "autopilot ORBIT camera". Human overrode it live → shipped PER-BOX self-spin (each box rotates about its own Y at SPIN_RATE 0.525) + STATIC scene-framed camera (YAW_RATE=0). Motion is framerate-independent (on logic tick). REVISIT in Phase 4 when manual explore (CAM-02/03) lands — decide whether orbit returns or per-box-spin stays.
+- **Roadmap deviation carried from Phase 1:** kitty backend front-runs part of Phase 5 ROB-02 (capability/degrade). Still open.
 
 Progress: ██████░░░░ ~60% (Phase 1: 5/5, Phase 2: 1/4)
 
@@ -93,6 +100,6 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-05-27
-Stopped at: 02-01 COMPLETE (TDD, autonomous). Built `src/world` (entity/layout/scene/mod) + Camera::frame_scene; resolved the layout decision (network-grouped rack grid); raised far 100->500. All committed; build/clippy/test clean (52 tests).
+Stopped at: Phase 2 COMPLETE (all 4 plans + human-verify APPROVED + VERIFICATION passed 4/4). Multi-box scene shipped on both backends; per-box self-spin + projected-AABB framing accepted by human. build/clippy/test clean (64 tests).
 Resume file: None
-Resume note: Phase 2 in progress (1/4). The world DATA layer is done and pure: `world::synthetic_scene() -> World { entities: Vec<Entity>, bounds: SceneBounds }`, `world::layout::layout(group,index)`, `world::load_to_half_extent`, `Camera::frame_scene(&SceneBounds)`. NOTHING renders the scene yet — that's 02-02 (braille) and 02-03 (kitty), which both consume the same World + frame_scene without touching each other's files. KEY ARCHITECTURE (carried from Phase 1): dual render backend auto-selected by terminal — kitty graphics protocol (real RGB pixels, `src/kitty.rs`) where supported, braille fallback (`src/render3d` + `src/ui/scene.rs`) elsewhere; run `--release` for the kitty path. Rasterizers must scale the unit cube by Entity.half_extents at Entity.position, color via Palette::status_color(Entity.status). Braille path: add inter-box painter's sort (per-box, back-to-front); kitty z-buffer already handles overlap. After a rasterizer lands, capture a frame and verify the rack reads legibly (MEMORY: screenshot & verify). Roadmap note still open: kitty backend front-runs Phase 5 ROB-02; reconcile in Phase 5 planning.
+Resume note: Phase 2 DONE. The synthetic multi-box scene reads legibly at scale on both backends and is human-approved. ARCHITECTURE: App owns one `World` (`src/world/`: entity/layout/scene/mod) — `synthetic_scene()` builds 30 boxes / 3 network-groups, deterministic from id (stable slots). Both renderers take `&[Entity]` + `SceneBounds`: braille `render3d::render_scene` (cross-box painter's sort) and kitty `render_rgba` (per-pixel z-buffer); `Camera::frame_scene(&world)` binary-searches camera distance to a projected-AABB fill (FRAME_TARGET_FILL=0.92, binding=horizontal at cell_aspect 2). Run `--release` for the kitty path; `--dump-rgba <path>` writes one RGBA frame for offline inspect (MEMORY: screenshot & verify after render changes). MOTION MODEL CHANGED (human override, RECONCILE in Phase 4): orbit disabled (YAW_RATE=0), each box self-spins about its own Y (SPIN_RATE 0.525), camera static & scene-framed — CAM-01 marked deviation. NEXT: Phase 3 — feed REAL Docker data (bollard) into this proven renderer, replacing synthetic_scene() output with live containers (same World/Entity shape); correct CPU%/mem (cumulative-delta), create/destroy events, graceful daemon-down/empty/permission states. Open roadmap deviation: kitty backend front-runs Phase 5 ROB-02; reconcile in Phase 5.

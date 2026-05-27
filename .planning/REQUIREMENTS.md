@@ -26,15 +26,15 @@ Full entity set bundled per PROJECT.md, but build order sequences render-correct
 
 ### Container Visuals
 
-- [ ] **CONT-01**: Each container is a box colored by status (running / paused / stopped / restarting / crashed)
-- [ ] **CONT-02**: Box dimensions scale with CPU/RAM usage, clamped/normalized so idle isn't invisible and a hog doesn't fill the screen
+- [x] **CONT-01**: Each container is a box colored by status (running / paused / stopped / restarting / crashed)
+- [x] **CONT-02**: Box dimensions scale with CPU/RAM usage, clamped/normalized so idle isn't invisible and a hog doesn't fill the screen
 - [ ] **CONT-03**: Boxes "breathe" — current size/state interpolates toward live-stat targets
 - [ ] **CONT-04**: Each container shows a name label, billboarded and occlusion-aware (handles overlap)
-- [ ] **CONT-05**: Containers occupy a stable rack/datacenter slot that persists frame-to-frame (no jitter/teleport)
+- [x] **CONT-05**: Containers occupy a stable rack/datacenter slot that persists frame-to-frame (no jitter/teleport)
 
 ### Camera & Interaction
 
-- [ ] **CAM-01**: Autopilot orbit camera runs by default (slow continuous orbit, screensaver feel, motion parallax)
+- [~] **CAM-01**: Autopilot orbit camera runs by default (slow continuous orbit, screensaver feel, motion parallax) — Phase 2 shipped per-box self-spin + static scene-framed camera instead of whole-scene orbit (human override, approved live). RECONCILE: motion model changed; revisit orbit vs per-box-spin in Phase 4 (CAM-02/03 manual explore).
 - [ ] **CAM-02**: Manual explore mode allows WASD/arrow orbit and zoom around the scene
 - [ ] **CAM-03**: Any user input switches from autopilot to manual explore
 - [ ] **CAM-04**: User can Tab-cycle through containers; the selected box is highlighted (outline/pulse)
@@ -111,12 +111,12 @@ Which phases cover which requirements. Updated by create-roadmap.
 | DOCK-02 | Phase 3 | Pending |
 | DOCK-03 | Phase 3 | Pending |
 | DOCK-04 | Phase 3 | Pending |
-| CONT-01 | Phase 2 | Pending |
-| CONT-02 | Phase 2 | Pending |
+| CONT-01 | Phase 2 | Complete |
+| CONT-02 | Phase 2 | Complete |
 | CONT-03 | Phase 4 | Pending |
 | CONT-04 | Phase 4 | Pending |
-| CONT-05 | Phase 2 | Pending |
-| CAM-01 | Phase 2 | Pending |
+| CONT-05 | Phase 2 | Complete |
+| CAM-01 | Phase 2 | Complete (deviation — see CAM-01 note) |
 | CAM-02 | Phase 4 | Pending |
 | CAM-03 | Phase 4 | Pending |
 | CAM-04 | Phase 4 | Pending |
