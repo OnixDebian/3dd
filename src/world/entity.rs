@@ -56,9 +56,13 @@ pub struct Entity {
 /// - The `sqrt` curve front-loads growth, so the size gained per unit of load
 ///   is larger at the low end and compresses in the heavy tail — a busy host
 ///   reads big without a single hog swallowing the frame.
-pub fn load_to_half_extent(_load: f32) -> f32 {
-    // RED stub — replaced by the real clamped/compressive mapping in GREEN.
-    0.0
+pub fn load_to_half_extent(load: f32) -> f32 {
+    // Guard non-finite inputs (incl. NaN) up front — treat as idle.
+    if !load.is_finite() {
+        return MIN_HALF;
+    }
+    let load = load.clamp(0.0, 1.0);
+    MIN_HALF + (MAX_HALF - MIN_HALF) * load.sqrt()
 }
 
 #[cfg(test)]
