@@ -34,7 +34,7 @@ use crate::camera::{Camera, DEFAULT_FOV};
 use crate::config::RenderConfig;
 use crate::render3d::render_scene as raster_render_scene;
 use crate::theme::Palette;
-use crate::world::Entity;
+use crate::world::{Entity, World};
 
 /// A ratatui [`Shape`] that blits a rendered multi-box framebuffer into a
 /// braille canvas. Owns a snapshot of the camera/config/entities it renders with.
@@ -83,18 +83,20 @@ impl Shape for SceneShape {
 /// is derived from the LIVE inner area every frame, so a resize re-sizes the
 /// framebuffer with no stale cache (PITFALLS #14).
 ///
-/// The camera is framed to the WHOLE scene via [`Camera::frame_scene`] (target =
-/// scene center, radius solved to fit the bounding sphere), not the unit-cube
-/// radius — so the orbit shows the whole rack.
+/// The `camera` passed in is ALREADY framed to the whole scene via
+/// [`Camera::frame_scene`] at app construction (target = scene center, radius
+/// solved to fit the bounding sphere). The scene is static this phase, so we do
+/// NOT re-frame per frame — that would re-derive bounds and target every draw
+/// (per-frame churn). The autopilot `step` only advances yaw/pitch, leaving the
+/// framing intact, so the orbit shows the whole rack with no recompute here.
 ///
-/// NOTE (02-04 seam): `entities` is passed in by the caller. Until the app owns a
-/// `World`, `ui::mod::view` threads a temporary `world::synthetic_scene()`
-/// through; plan 02-04 replaces that temporary with the app-owned World.
+/// `world` is the app-owned [`World`] — the single source of truth (the 02-02
+/// UI-layer `synthetic_scene()` temporary is gone).
 pub fn render_scene(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
     camera: &Camera,
-    entities: &[Entity],
+    world: &World,
     palette: &Palette,
     config: &RenderConfig,
 ) {
@@ -105,16 +107,10 @@ pub fn render_scene(
     let inner = block.inner(area);
     let viewport = (inner.width as usize * 2, inner.height as usize * 4);
 
-    // Frame the whole rack: target the scene center and solve the orbit radius
-    // for the scene bounding sphere (CAM-01), not the unit-cube radius.
-    let bounds = crate::world::SceneBounds::from_entities(entities);
-    let mut framed = *camera;
-    framed.frame_scene(&bounds);
-
     let shape = SceneShape {
         viewport,
-        entities: entities.to_vec(),
-        camera: framed,
+        entities: world.entities.clone(),
+        camera: *camera,
         palette: *palette,
         config: *config,
     };

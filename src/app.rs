@@ -14,6 +14,7 @@ use crate::camera::Camera;
 use crate::config::RenderConfig;
 use crate::tui::{Event, Tui};
 use crate::ui;
+use crate::world::{self, World};
 
 /// All application state. Mutated only by the main loop.
 pub struct App {
@@ -33,12 +34,23 @@ pub struct App {
     pub camera: Camera,
     /// Rendering knobs (cell_aspect, near/far). The camera owns the fov.
     pub render_config: RenderConfig,
+    /// The synthetic datacenter scene — the SINGLE source of truth for what the
+    /// braille UI renders. Built once at construction (static this phase); the
+    /// camera is framed to its bounds so the autopilot orbits the whole rack.
+    pub world: World,
 }
 
 impl App {
     /// Construct fresh app state.
     pub fn new() -> Self {
         let now = Instant::now();
+        // Build the synthetic scene once (static this phase) and frame the orbit
+        // to its bounds so the autopilot shows the whole rack from frame one
+        // (CAM-01 default-on). `step(dt)` only advances yaw/pitch, never radius/
+        // target, so this single framing stays correct as the scene is static.
+        let world = world::synthetic_scene();
+        let mut camera = Camera::new();
+        camera.frame_scene(&world.bounds);
         Self {
             should_quit: false,
             size: (0, 0),
@@ -46,8 +58,9 @@ impl App {
             last_render: now,
             fps: 0.0,
             last_tick: now,
-            camera: Camera::new(),
+            camera,
             render_config: RenderConfig::default(),
+            world,
         }
     }
 

@@ -12,8 +12,11 @@ use crate::app::App;
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let (w, h) = app.size;
     let text = format!(
-        "3dd | fps: {:.0} | size: {}x{} | q to quit",
-        app.fps, w, h
+        "3dd | fps: {:.0} | size: {}x{} | boxes: {} | q to quit",
+        app.fps,
+        w,
+        h,
+        app.world.entities.len()
     );
 
     let bar = Paragraph::new(Line::from(text))
