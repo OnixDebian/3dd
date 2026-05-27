@@ -10,7 +10,7 @@ use std::time::Instant;
 use color_eyre::Result;
 
 use crate::action::Action;
-use crate::camera::Camera;
+use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::tui::{Event, Tui};
 use crate::ui;
@@ -30,13 +30,18 @@ pub struct App {
     pub fps: f32,
     /// Timestamp of the previous logic tick (for dt).
     last_tick: Instant,
-    /// Autopilot orbit camera driving the 3D scene.
+    /// Static framing camera holding a fixed 3/4 view of the rack (the orbit was
+    /// disabled in the verify-tuning pass — see [`crate::camera`]).
     pub camera: Camera,
+    /// Per-box self-spin angle (radians), advanced on the logic tick. The camera
+    /// is static; this is the scene's motion — each box spins in place about its
+    /// own +Y axis. Framerate-independent (advanced by real `dt`).
+    pub spin: f32,
     /// Rendering knobs (cell_aspect, near/far). The camera owns the fov.
     pub render_config: RenderConfig,
     /// The synthetic datacenter scene — the SINGLE source of truth for what the
     /// braille UI renders. Built once at construction (static this phase); the
-    /// camera is framed to its bounds so the autopilot orbits the whole rack.
+    /// camera is framed to its bounds so the whole rack fills the frame.
     pub world: World,
 }
 
@@ -59,6 +64,7 @@ impl App {
             fps: 0.0,
             last_tick: now,
             camera,
+            spin: 0.0,
             render_config: RenderConfig::default(),
             world,
         }
@@ -82,7 +88,10 @@ impl App {
     /// camera advances by REAL elapsed time, not per-frame.
     pub fn on_tick(&mut self, dt: f32) {
         self.tick_count = self.tick_count.wrapping_add(1);
-        self.camera.step(dt);
+        self.camera.step(dt); // static framing now (no orbit)
+        // Advance the per-box self-spin by REAL elapsed time, wrapped to [0, TAU).
+        let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
+        self.spin = (self.spin + SPIN_RATE * dt).rem_euclid(std::f32::consts::TAU);
     }
 
     /// Run the main event loop until `should_quit`.

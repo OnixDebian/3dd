@@ -6,8 +6,9 @@
 //! no braille staircase. Reuses the existing [`Projector`], cube geometry, camera
 //! and palette; only the output target differs.
 //!
-//! Entered via `dd3 --kitty` (live orbit) or `dd3 --dump-rgba <path>` (one frame to
-//! a raw RGBA file, for offline inspection). Not wired into the ratatui app.
+//! Entered via `dd3 --kitty` (live render) or `dd3 --dump-rgba <path>` (one frame
+//! to a raw RGBA file, for offline inspection). The camera holds a fixed 3/4
+//! framing angle; the motion is each box spinning in place about its own +Y axis.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -19,11 +20,11 @@ use crossterm::{cursor, execute};
 use glam::Vec3;
 use ratatui::style::Color;
 
-use crate::camera::{Camera, DEFAULT_FOV};
+use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::render3d::cube::unit_cube;
 use crate::render3d::project::Projector;
-use crate::render3d::ViewParams;
+use crate::render3d::{rotate_y_about, ViewParams};
 use crate::theme::Palette;
 use crate::world::entity::Entity;
 use crate::world::scene::{synthetic_scene, SceneBounds};
@@ -47,6 +48,12 @@ const SS: usize = 2;
 ///
 /// Square pixels, so the projector's `cell_aspect` is 1.0 (the braille 2.0 value
 /// corrects for tall braille dots, which do not apply here).
+///
+/// `spin` is the per-box self-rotation angle (radians) about each box's OWN +Y
+/// axis. The camera is static (the human's verify override of the scene orbit);
+/// the motion is each box spinning in place. Each box's corners and face normals
+/// are rotated about that box's center before projection — the box stays a rigid
+/// convex solid so the shared z-buffer still resolves inter-box occlusion.
 pub fn render_rgba(
     entities: &[Entity],
     view: ViewParams,
@@ -54,6 +61,7 @@ pub fn render_rgba(
     palette: &Palette,
     w: usize,
     h: usize,
+    spin: f32,
 ) -> Vec<u8> {
     let (sw, sh) = (w * SS, h * SS);
     let bg = to_rgb(palette.background);
@@ -81,9 +89,10 @@ pub fn render_rgba(
 
     for entity in entities {
         let base = palette.status_color(entity.status);
-        // Per-axis scale = full extent (half_extents * 2); translate to position.
+        // Per-axis scale = full extent (half_extents * 2); translate to position,
+        // then spin the box about its OWN center around +Y by `spin`.
         let scale = entity.half_extents * 2.0;
-        let world = |v: Vec3| entity.position + v * scale;
+        let world = |v: Vec3| rotate_y_about(entity.position + v * scale, entity.position, spin);
 
         for face in &cube.faces {
             // World-space corners + centroid for this entity's face.
@@ -94,12 +103,13 @@ pub fn render_rgba(
                 world(cube.vertices[face.indices[3]]),
             ];
             let centroid = corners.iter().copied().sum::<Vec3>() / 4.0;
-            // Normals are axis-aligned and the scale is non-negative & uniform per
-            // axis sign, so the unit-cube outward normal still points outward.
-            if face.normal.dot(view.eye - centroid) <= 0.0 {
+            // The box is spun, so rotate the axis-aligned normal by the same spin
+            // to recover the true world normal for cull + Lambert shading.
+            let normal = rotate_y_about(face.normal, Vec3::ZERO, spin);
+            if normal.dot(view.eye - centroid) <= 0.0 {
                 continue; // back-face cull against the eye, in world space
             }
-            let shaded = face_shade(face.normal, centroid, &view, near, far, base, bg);
+            let shaded = face_shade(normal, centroid, &view, near, far, base, bg);
 
             // Project the 4 corners; skip face if any clips.
             let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
@@ -329,7 +339,8 @@ pub fn supports_kitty_graphics() -> bool {
     matches!(std::env::var("TERM"), Ok(t) if t.contains("kitty") || t.contains("ghostty"))
 }
 
-/// Live orbit loop rendering real pixels via kitty graphics. Quits on q/Esc/Ctrl-C.
+/// Live loop rendering real pixels via kitty graphics: a static-camera 3/4 view of
+/// the rack with each box spinning in place. Quits on q/Esc/Ctrl-C.
 pub fn run_kitty() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -343,6 +354,9 @@ pub fn run_kitty() -> Result<()> {
     camera.frame_scene(&world.bounds); // frame the whole rack (frustum-safe radius)
     let mut last = Instant::now();
     let mut fps = 0.0f32;
+    // Per-box self-spin angle, advanced by REAL dt (framerate-independent), since
+    // the camera is now static and the motion is each box spinning in place.
+    let mut spin = 0.0f32;
 
     let result = (|| -> Result<()> {
         loop {
@@ -381,10 +395,11 @@ pub fn run_kitty() -> Result<()> {
                 let inst = 1.0 / dt;
                 fps = if fps == 0.0 { inst } else { fps * 0.9 + inst * 0.1 };
             }
-            camera.step(dt);
+            camera.step(dt); // holds a fixed framing angle now (YAW_RATE == 0)
+            spin = (spin + SPIN_RATE * dt).rem_euclid(std::f32::consts::TAU);
             let view = camera.view_params(DEFAULT_FOV);
 
-            let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h);
+            let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
 
             delete_all(&mut stdout)?;
             write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
@@ -417,9 +432,11 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
     let palette = Palette::default();
     let mut camera = Camera::new();
     camera.frame_scene(&world.bounds); // frame the whole rack
-    camera.step(2.0); // advance to an informative 3/4 pose
+    // Static camera now; advance the per-box spin to an informative 3/4 pose so
+    // the dump shows boxes mid-rotation (not all axis-aligned/edge-on).
+    let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
-    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h);
+    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
     std::fs::write(path, &rgba)?;
     println!("{w} {h} {}", rgba.len());
     Ok(())
@@ -506,8 +523,8 @@ mod tests {
         };
 
         // Color A alone (drop B) to learn its exact rendered center pixel.
-        let only_a = render_rgba(&[near_box], view, &bounds, &palette, w, h);
-        let both = render_rgba(&entities, view, &bounds, &palette, w, h);
+        let only_a = render_rgba(&[near_box], view, &bounds, &palette, w, h, 0.0);
+        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
 
         let center = ((h / 2) * w + (w / 2)) * 4;
         let a_px = &only_a[center..center + 3];
@@ -560,7 +577,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h);
+        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
 
         let mut colors: HashSet<(u8, u8, u8)> = HashSet::new();
         for px in rgba.chunks_exact(4) {
@@ -588,7 +605,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&[], view, &bounds, &palette, w, h);
+        let rgba = render_rgba(&[], view, &bounds, &palette, w, h, 0.0);
         let bg = to_rgb(palette.background);
         assert_eq!(rgba.len(), w * h * 4);
         for px in rgba.chunks_exact(4) {

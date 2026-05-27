@@ -20,8 +20,13 @@ use crate::world::entity::{load_to_half_extent, Entity};
 use crate::world::layout::layout;
 use crate::world::World;
 
-/// Number of synthetic groups (future network floor-planes).
-const GROUP_COUNT: u16 = 5;
+/// Number of synthetic groups (future network floor-planes). Reduced from 5 to 3
+/// during the human verify-tuning pass: 5 groups stacked along Z made the scene
+/// far deeper than wide, so the bounding sphere the camera frames was dominated by
+/// depth and the rack rendered as a tiny diagonal ribbon (~10% of the frame). A
+/// shallower scene fills the frame far better while still showing distinct groups.
+/// Still yields 30 boxes (`scene_has_dozens_of_entities` needs >= 30).
+const GROUP_COUNT: u16 = 3;
 /// Entities per group; `GROUP_COUNT * PER_GROUP` is the total box count.
 const PER_GROUP: u32 = 10;
 

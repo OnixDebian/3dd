@@ -25,7 +25,7 @@ use crate::config::RenderConfig;
 use crate::render3d::cube::{unit_cube, Cube};
 use crate::render3d::framebuffer::Framebuffer;
 use crate::render3d::project::Projector;
-use crate::render3d::ViewParams;
+use crate::render3d::{rotate_y_about, ViewParams};
 use crate::theme::{self, Palette, Status};
 use crate::world::entity::Entity;
 
@@ -150,12 +150,20 @@ pub fn render(
 ///
 /// `viewport`, `view`, and `config` behave exactly as in [`render`]. Per-box
 /// color is `palette.status_color(entity.status)` (CONT-01) — no inline RGB.
+///
+/// `spin` is the current per-box self-rotation angle (radians) about each box's
+/// OWN vertical (+Y) axis. The camera is now static (no scene orbit — the human's
+/// verify-tuning override of the autopilot orbit), and the motion comes from each
+/// box spinning in place: every box's 8 world vertices AND its face normals are
+/// rotated about that box's center by `spin` before culling/projecting. Rotating
+/// a rigid box keeps it convex, so the cross-box painter's sort is still correct.
 pub fn render_scene(
     entities: &[Entity],
     view: ViewParams,
     viewport: (usize, usize),
     palette: &Palette,
     config: &RenderConfig,
+    spin: f32,
 ) -> Framebuffer {
     let (w, h) = viewport;
     let (hw, hh) = (w * SS, h * SS);
@@ -182,11 +190,13 @@ pub fn render_scene(
     for entity in entities {
         let base = palette.status_color(entity.status);
         // Transform the unit cube into world space ONCE per box: scale by the
-        // side length (2 * half_extents) then translate to the world position.
+        // side length (2 * half_extents), translate to the world position, then
+        // spin about THIS box's center around +Y by `spin` (self-rotation).
         let scale = entity.half_extents * 2.0;
         let mut world_verts = [Vec3::ZERO; 8];
         for (slot, &v) in world_verts.iter_mut().zip(cube.vertices.iter()) {
-            *slot = entity.position + v * scale;
+            let placed = entity.position + v * scale;
+            *slot = rotate_y_about(placed, entity.position, spin);
         }
 
         for face in &cube.faces {
@@ -196,16 +206,19 @@ pub fn render_scene(
                 world_verts[face.indices[2]],
                 world_verts[face.indices[3]],
             ];
+            // The box is now spun, so the unit-cube normal is NO LONGER the world
+            // normal — rotate it about the origin (a pure direction) by the same
+            // spin so cull and Lambert shading use the true world-space normal.
+            let normal = rotate_y_about(face.normal, Vec3::ZERO, spin);
             let centroid = verts.iter().copied().sum::<Vec3>() / 4.0;
             let to_eye = view.eye - centroid;
-            // Axis-aligned boxes (no rotation), so the unit-cube face normal IS
-            // the world normal. Back-face cull per face.
-            if face.normal.dot(to_eye) <= 0.0 {
+            // Back-face cull per face against the spun normal.
+            if normal.dot(to_eye) <= 0.0 {
                 continue;
             }
             visible.push(RenderFace {
                 verts,
-                normal: face.normal,
+                normal,
                 distance: to_eye.length(),
                 base,
             });
@@ -688,7 +701,7 @@ mod tests {
         let far = entity_at(1, Vec3::new(0.0, 0.0, -2.0), 0.6, Status::Crashed);
         let entities = [near, far];
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -731,7 +744,7 @@ mod tests {
         let near = entity_at(id, Vec3::new(0.0, 0.0, 2.0), 0.6, Status::Running);
         entities.push(near);
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -753,7 +766,7 @@ mod tests {
         let b = entity_at(1, Vec3::new(2.0, 0.0, 0.0), 0.6, Status::Crashed);
         let entities = [a, b];
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
 
         let distinct: std::collections::HashSet<_> =
             fb.lit_pixels().map(|(_, _, c)| c).collect();
@@ -768,7 +781,7 @@ mod tests {
     fn render_scene_empty_is_all_unlit_and_does_not_panic() {
         let pal = Palette::default();
         let cfg = RenderConfig::default();
-        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg);
+        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
         assert_eq!(fb.lit_pixels().count(), 0, "empty scene must be all unlit");
     }
 
@@ -785,7 +798,7 @@ mod tests {
             up: Vec3::Y,
             fov: std::f32::consts::FRAC_PI_3,
         };
-        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg);
+        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg, 0.0);
         assert!(
             fb.lit_pixels().count() > 50,
             "off-center box should rasterize a solid footprint when framed, got {}",

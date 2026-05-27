@@ -36,15 +36,33 @@ use crate::render3d::ViewParams;
 pub const DEFAULT_RADIUS: f32 = 6.0;
 
 /// Vertical field of view in radians (60°). The camera owns the lens; this
-/// overrides `RenderConfig::fov` when building [`ViewParams`].
+/// overrides `RenderConfig::fov` when building [`ViewParams`]. Kept at 60°: the
+/// zoom in the verify-tuning pass comes from a TIGHTER framing distance (a larger
+/// [`FRAME_HALF_FOV`] / smaller margin pulling the eye in) plus a denser, shallower
+/// rack — not from narrowing the lens, which fought the braille path's aspect-2
+/// horizontal narrowing and clipped boxes at the scene edge.
 pub const DEFAULT_FOV: f32 = std::f32::consts::FRAC_PI_3;
 
-/// Autopilot yaw rate in radians/sec. ~30°/s — a calm but unmistakable sweep (one
-/// full revolution every ~12s), still smooth and NOT frantic (PITFALLS #13). Bumped
-/// 1.5x from the original ~20°/s after the human re-verify wanted slightly faster
-/// rotation; the orbit visits the same camera positions (same pitch range, same
-/// radius), so the frustum-safe guarantee is unchanged.
-const YAW_RATE: f32 = 0.525;
+/// Autopilot yaw rate in radians/sec. SET TO 0 — the human's verify-tuning
+/// override: the camera no longer ORBITS the scene (the whole rack swinging
+/// around as a group was rejected). Instead the camera holds a fixed 3/4 framing
+/// angle ([`FRAME_YAW`]) and the motion comes from each box spinning in place
+/// (see [`SPIN_RATE`], applied per-box in the renderers). Left as a named knob so
+/// the orbit can be re-enabled later. NOTE: this deviates from roadmap success
+/// criterion #4 (autopilot orbit camera) — flagged for Phase reconciliation.
+const YAW_RATE: f32 = 0.0;
+
+/// Per-box self-spin rate in radians/sec (~30°/s — one revolution every ~12s, a
+/// calm unmistakable spin, not frantic; PITFALLS #13). The renderers advance a
+/// `spin` angle by REAL dt at this rate and rotate EACH box about its own +Y axis,
+/// so every box spins in place while the camera stays still. Framerate-independent
+/// (Gaffer decoupling), exactly like the old `YAW_RATE` was.
+pub const SPIN_RATE: f32 = 0.525;
+
+/// Fixed azimuth (radians, ~40°) the static camera frames the rack from, giving a
+/// pleasant 3/4 view (looking at the corner of the rack, not face-on). Combined
+/// with [`PITCH_BIAS`] this is the held viewing angle now that the orbit is off.
+const FRAME_YAW: f32 = 0.7;
 
 /// Autopilot pitch bob: the camera eases up and down by [`PITCH_AMPLITUDE`]
 /// (about a steady [`PITCH_BIAS`] downward tilt) at [`PITCH_RATE`] rad/s, sweeping
@@ -75,6 +93,13 @@ const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.15;
 /// though the bounding sphere "fits" the vertical cone.
 ///
 // Consumed by `frame_scene`, which the rasterizer plans (02-02/03) wire in.
+//
+// This is the braille path's BINDING horizontal half-angle at the 60° lens
+// (`atan(tan(30°) · (w/h)/cell_aspect) ≈ 0.367` for a ~4:3 braille viewport with
+// cell_aspect 2.0) — the tightest axis a box can clip against. Kept at the true
+// binding angle; the verify-tuning zoom comes from the much smaller safety margin
+// (the orbit headroom is gone — the camera is static now, so it never has to
+// survive a yaw sweep) and the denser/shallower rack, not from over-widening this.
 #[allow(dead_code)]
 const FRAME_HALF_FOV: f32 = 0.367;
 
@@ -86,7 +111,7 @@ const FRAME_HALF_FOV: f32 = 0.367;
 /// vertices toward the edge without clipping. Pinned by
 /// `frame_scene_keeps_whole_scene_in_frustum`.
 #[allow(dead_code)]
-const FRAME_SAFETY_MARGIN: f32 = 0.15;
+const FRAME_SAFETY_MARGIN: f32 = 0.02;
 
 /// An autopilot orbit camera circling a fixed `target`.
 ///
@@ -111,7 +136,7 @@ impl Camera {
     /// A camera at the frustum-safe defaults, orbiting the origin.
     pub fn new() -> Self {
         Self {
-            yaw: 0.0,
+            yaw: FRAME_YAW,
             pitch: PITCH_BIAS,
             radius: DEFAULT_RADIUS,
             target: Vec3::ZERO,
@@ -244,161 +269,108 @@ mod tests {
         }
     }
 
-    /// `step` advances yaw at the expected slow rate using real dt.
+    /// The camera now HOLDS its framing angle — `step` must NOT move the yaw
+    /// (the human's verify override: no scene orbit). The motion lives in the
+    /// per-box spin instead, exercised in the renderer tests.
     #[test]
-    fn yaw_advances_with_dt() {
+    fn yaw_is_static_under_step() {
         let mut cam = Camera::new();
         let start = cam.yaw;
-        cam.step(1.0);
-        // After 1s, yaw advanced by ~YAW_RATE radians (modulo wrap, which can't
-        // fire here since YAW_RATE < TAU).
-        let advanced = (cam.yaw - start).rem_euclid(std::f32::consts::TAU);
-        assert!((advanced - YAW_RATE).abs() < 1e-4, "yaw rate wrong: {advanced}");
+        for _ in 0..100 {
+            cam.step(0.1);
+        }
+        assert!(
+            (cam.yaw - start).abs() < 1e-6,
+            "camera yaw drifted though the orbit is disabled: {} -> {}",
+            start,
+            cam.yaw
+        );
+        // Sanity: YAW_RATE itself is pinned at 0 so the orbit really is off.
+        assert_eq!(YAW_RATE, 0.0, "orbit must be disabled (YAW_RATE == 0)");
     }
 
-    /// FRUSTUM-SAFE DEFAULTS pin: project all 8 unit-cube vertices through a
-    /// projector built from the camera's ViewParams and assert NONE clip to None,
-    /// across the FULL yaw turn crossed with the FULL widened pitch range —
-    /// including the worst-case extremes `bias ± amplitude`. The autopilot's bob
-    /// period is long relative to one yaw revolution, so stepping `step()` alone
-    /// would NOT visit the pitch extremes during a single turn; we therefore drive
-    /// yaw and pitch independently here so the test actually covers the worst case.
-    /// We also assert a comfortable NDC margin (not just `is_some()`), proving the
-    /// cube clears the frustum edge rather than grazing it. If this ever fails, a
-    /// face would be dropped mid-orbit and the human would see it pop.
+    /// FRUSTUM-SAFE FRAMING pin (static-camera form): the camera no longer orbits,
+    /// so we project all 8 unit-cube vertices through the SINGLE held framing pose
+    /// (`FRAME_YAW`, `PITCH_BIAS`) and assert NONE clip to None. With the orbit
+    /// gone there is no yaw sweep to survive — just the one pose the human sees.
+    /// This guards against the tightened framing constants pulling a vertex off
+    /// the edge. (Per-box spin is exercised in the renderer/`render3d` tests.)
     #[test]
-    fn orbit_keeps_all_vertices_in_frustum() {
-        use std::f32::consts::TAU;
-
+    fn framed_pose_keeps_all_vertices_in_frustum() {
         let cube = unit_cube();
         let cfg = RenderConfig::default();
         // A representative braille viewport (non-square, like a real terminal).
         let viewport = (160u32, 120u32);
         let proj_cfg = RenderConfig { fov: DEFAULT_FOV, ..cfg };
 
-        // The exact pitch extremes the autopilot can reach (bias ± amplitude).
-        let pitch_lo = PITCH_BIAS - PITCH_AMPLITUDE;
-        let pitch_hi = PITCH_BIAS + PITCH_AMPLITUDE;
+        let cam = Camera::new(); // FRAME_YAW / PITCH_BIAS / DEFAULT_RADIUS, origin
         assert!(
-            pitch_hi < PITCH_LIMIT && pitch_lo > -PITCH_LIMIT,
-            "sweep must stay inside the gimbal clamp: lo={pitch_lo}, hi={pitch_hi}"
+            cam.pitch.abs() < PITCH_LIMIT,
+            "framing pitch must stay inside the gimbal clamp: {}",
+            cam.pitch
         );
-
-        // Sweep yaw across a full turn × pitch across its full range, hitting the
-        // extremes. NDC margin: every vertex must sit within ±MARGIN of the cube
-        // edges, i.e. its |ndc| stays under (1 - MARGIN) on every axis.
-        const MARGIN: f32 = 0.12;
-        let yaw_steps = 72;
-        let pitch_steps = 24;
-        for yi in 0..yaw_steps {
-            let yaw = TAU * yi as f32 / yaw_steps as f32;
-            for pi in 0..=pitch_steps {
-                let pitch = pitch_lo + (pitch_hi - pitch_lo) * pi as f32 / pitch_steps as f32;
-                let cam = Camera {
-                    yaw,
-                    pitch,
-                    radius: DEFAULT_RADIUS,
-                    target: Vec3::ZERO,
-                    elapsed: 0.0,
-                };
-                let vp = cam.view_params(DEFAULT_FOV);
-                let proj = Projector::new(vp.eye, vp.target, vp.up, viewport, &proj_cfg);
-                for (i, &v) in cube.vertices.iter().enumerate() {
-                    let p = proj.project(v);
-                    assert!(
-                        p.is_some(),
-                        "vertex {i} ({v:?}) clipped at yaw={yaw}, pitch={pitch}",
-                    );
-                    // The projector returns (screen_x, screen_y, ndc_z). Re-derive
-                    // the on-screen position relative to the viewport center to
-                    // confirm a real margin, not just an in-frustum boolean.
-                    let (sx, sy, _z) = p.unwrap();
-                    let nx = (sx / viewport.0 as f32) * 2.0 - 1.0;
-                    let ny = (sy / viewport.1 as f32) * 2.0 - 1.0;
-                    assert!(
-                        nx.abs() <= 1.0 - MARGIN && ny.abs() <= 1.0 - MARGIN,
-                        "vertex {i} too close to frustum edge at yaw={yaw}, \
-                         pitch={pitch}: nx={nx}, ny={ny}",
-                    );
-                }
-            }
+        let vp = cam.view_params(DEFAULT_FOV);
+        let proj = Projector::new(vp.eye, vp.target, vp.up, viewport, &proj_cfg);
+        for (i, &v) in cube.vertices.iter().enumerate() {
+            assert!(
+                proj.project(v).is_some(),
+                "vertex {i} ({v:?}) clipped at the framing pose",
+            );
         }
     }
 
-    /// MULTI-BOX FRUSTUM PIN — the scene analogue of
-    /// `orbit_keeps_all_vertices_in_frustum`. Build the synthetic scene, frame it
-    /// with `frame_scene`, then sweep the FULL yaw turn (crossed with the pitch
-    /// range the autopilot reaches) and assert EVERY entity's 8 AABB corners
-    /// project to `Some(..)` with an NDC margin. Guards against a box popping at
-    /// the scene edge mid-orbit once the radius is solved from `SceneBounds`.
+    /// MULTI-BOX FRUSTUM PIN (static-camera form). Build the synthetic scene,
+    /// frame it with `frame_scene`, then at the SINGLE held framing pose assert
+    /// EVERY entity's 8 AABB corners — SPUN about the box's own +Y axis through a
+    /// representative range of spin angles — project to `Some(..)`. The camera no
+    /// longer orbits, so there is no yaw sweep; instead the boxes spin, so we
+    /// sweep the SPIN angle to confirm no corner clips as a box rotates in place.
+    /// Guards the tightened framing radius against a spun corner popping the edge.
     #[test]
-    fn frame_scene_keeps_whole_scene_in_frustum() {
+    fn frame_scene_keeps_spinning_scene_in_frustum() {
         use std::f32::consts::TAU;
+
+        use crate::render3d::rotate_y_about;
 
         let world = crate::world::scene::synthetic_scene();
 
-        let mut framing = Camera::new();
-        framing.frame_scene(&world.bounds);
-        // frame_scene must orbit the scene center, not the origin.
+        let mut cam = Camera::new();
+        cam.frame_scene(&world.bounds);
+        // frame_scene must target the scene center, not the origin.
         assert!(
-            (framing.target - world.bounds.center).length() < 1e-4,
+            (cam.target - world.bounds.center).length() < 1e-4,
             "frame_scene did not target the scene center"
         );
-        let framed_radius = framing.radius;
 
         let cfg = RenderConfig::default();
         let viewport = (160u32, 120u32);
         let proj_cfg = RenderConfig { fov: DEFAULT_FOV, ..cfg };
 
-        // The autopilot holds PITCH_BIAS (amplitude 0); sweep a band around it to
-        // be robust if the bob is ever re-enabled, staying inside the clamp.
-        let pitch_lo = (PITCH_BIAS - 0.2).max(-PITCH_LIMIT);
-        let pitch_hi = (PITCH_BIAS + 0.2).min(PITCH_LIMIT);
+        let vp = cam.view_params(DEFAULT_FOV);
+        let proj = Projector::new(vp.eye, vp.target, vp.up, viewport, &proj_cfg);
 
-        const MARGIN: f32 = 0.12;
-        let yaw_steps = 72;
-        let pitch_steps = 8;
-        for yi in 0..yaw_steps {
-            let yaw = TAU * yi as f32 / yaw_steps as f32;
-            for pi in 0..=pitch_steps {
-                let pitch = pitch_lo + (pitch_hi - pitch_lo) * pi as f32 / pitch_steps as f32;
-                let cam = Camera {
-                    yaw,
-                    pitch,
-                    radius: framed_radius,
-                    target: world.bounds.center,
-                    elapsed: 0.0,
-                };
-                let vp = cam.view_params(DEFAULT_FOV);
-                let proj = Projector::new(vp.eye, vp.target, vp.up, viewport, &proj_cfg);
-
-                for e in &world.entities {
-                    // The 8 corners of this entity's AABB.
-                    for &sx in &[-1.0f32, 1.0] {
-                        for &sy in &[-1.0f32, 1.0] {
-                            for &sz in &[-1.0f32, 1.0] {
-                                let corner = e.position
-                                    + glam::Vec3::new(
-                                        sx * e.half_extents.x,
-                                        sy * e.half_extents.y,
-                                        sz * e.half_extents.z,
-                                    );
-                                let p = proj.project(corner);
-                                assert!(
-                                    p.is_some(),
-                                    "entity {} corner {corner:?} clipped at yaw={yaw}, pitch={pitch}",
-                                    e.id
+        // Sweep the per-box spin so a box mid-rotation can't push a corner off.
+        let spin_steps = 24;
+        for si in 0..spin_steps {
+            let spin = TAU * si as f32 / spin_steps as f32;
+            for e in &world.entities {
+                for &sx in &[-1.0f32, 1.0] {
+                    for &sy in &[-1.0f32, 1.0] {
+                        for &sz in &[-1.0f32, 1.0] {
+                            let corner = e.position
+                                + glam::Vec3::new(
+                                    sx * e.half_extents.x,
+                                    sy * e.half_extents.y,
+                                    sz * e.half_extents.z,
                                 );
-                                let (scx, scy, _z) = p.unwrap();
-                                let nx = (scx / viewport.0 as f32) * 2.0 - 1.0;
-                                let ny = (scy / viewport.1 as f32) * 2.0 - 1.0;
-                                assert!(
-                                    nx.abs() <= 1.0 - MARGIN && ny.abs() <= 1.0 - MARGIN,
-                                    "entity {} corner too close to frustum edge at \
-                                     yaw={yaw}, pitch={pitch}: nx={nx}, ny={ny}",
-                                    e.id
-                                );
-                            }
+                            // Spin the corner about THIS box's center, as the
+                            // renderers do, before projecting.
+                            let spun = rotate_y_about(corner, e.position, spin);
+                            assert!(
+                                proj.project(spun).is_some(),
+                                "entity {} corner {spun:?} clipped at spin={spin}",
+                                e.id
+                            );
                         }
                     }
                 }

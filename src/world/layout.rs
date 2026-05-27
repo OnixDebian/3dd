@@ -17,13 +17,25 @@ use glam::Vec3;
 
 /// Center-to-center spacing between adjacent slots within a group's rack grid.
 /// Strictly greater than `2 * MAX_HALF` (= 2.4) so even two maxed-out boxes in
-/// neighbouring slots keep a clear gap (the no-overlap guarantee).
-pub const SLOT_SPACING: f32 = 3.0;
+/// neighbouring slots keep a clear gap (the no-overlap guarantee). Tightened from
+/// 3.0 to 2.6 during the human verify-tuning pass: a denser rack has a smaller
+/// bounding sphere, so the framing camera fills the frame far better (still
+/// clears 2.4, so no AABB overlap — `neighbours_clear_max_boxes` pins it).
+pub const SLOT_SPACING: f32 = 2.6;
 
 /// Z distance between consecutive group bands. Large enough that the gap between
 /// two groups' regions exceeds the spread within any single group's grid, so
 /// groups read as distinct clusters rather than interleaving.
-pub const GROUP_DEPTH: f32 = 18.0;
+///
+/// Reduced from 18.0 to 10.0 during the human verify-tuning pass: the deep scene
+/// gave a huge bounding-sphere radius, forcing the camera far back so the rack
+/// filled only ~10% of the frame. A shallower scene keeps the rack compact so the
+/// tightened framing fills most of the frame. It MUST still exceed the max
+/// intra-group corner-to-corner spread (~9.37 for the 4-col × 3-row grid at the
+/// tightened SLOT_SPACING) so two boxes in the same group are never farther apart
+/// than two in adjacent groups — i.e. groups stay distinct clusters
+/// (`groups_form_distinct_clusters` pins it).
+pub const GROUP_DEPTH: f32 = 10.0;
 
 /// Number of columns (along X) in each group's rack grid. Rows stack along Y;
 /// `index_in_group` fills column-major within a group.

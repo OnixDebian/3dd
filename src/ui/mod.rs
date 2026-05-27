@@ -38,6 +38,7 @@ pub fn view(frame: &mut Frame, app: &App) {
         &app.world,
         &palette,
         &app.render_config,
+        app.spin,
     );
 
     status_bar::render(frame, status_area, app);

@@ -48,6 +48,9 @@ struct SceneShape {
     camera: Camera,
     palette: Palette,
     config: RenderConfig,
+    /// Current per-box self-spin angle (radians), owned by the app and advanced
+    /// on the logic tick. The camera is static; this is the scene's motion.
+    spin: f32,
 }
 
 impl Shape for SceneShape {
@@ -66,6 +69,7 @@ impl Shape for SceneShape {
             self.viewport,
             &self.palette,
             &self.config,
+            self.spin,
         );
 
         // Blit: framebuffer top-left (x, y) maps to braille dot (x, y) with NO
@@ -87,8 +91,9 @@ impl Shape for SceneShape {
 /// [`Camera::frame_scene`] at app construction (target = scene center, radius
 /// solved to fit the bounding sphere). The scene is static this phase, so we do
 /// NOT re-frame per frame — that would re-derive bounds and target every draw
-/// (per-frame churn). The autopilot `step` only advances yaw/pitch, leaving the
-/// framing intact, so the orbit shows the whole rack with no recompute here.
+/// (per-frame churn). The camera now HOLDS a fixed 3/4 framing angle (the orbit
+/// was disabled in the verify-tuning pass); the motion is the per-box `spin`
+/// advanced on the logic tick, so the framing stays intact with no recompute here.
 ///
 /// `world` is the app-owned [`World`] — the single source of truth (the 02-02
 /// UI-layer `synthetic_scene()` temporary is gone).
@@ -99,6 +104,7 @@ pub fn render_scene(
     world: &World,
     palette: &Palette,
     config: &RenderConfig,
+    spin: f32,
 ) {
     let block = Block::default().title("scene").borders(Borders::ALL);
 
@@ -113,6 +119,7 @@ pub fn render_scene(
         camera: *camera,
         palette: *palette,
         config: *config,
+        spin,
     };
 
     let canvas = Canvas::default()
