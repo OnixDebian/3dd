@@ -53,33 +53,15 @@ pub fn render_rgba(
         ..RenderConfig::default()
     };
     let projector = Projector::new(view.eye, view.target, view.up, (sw as u32, sh as u32), &config);
-    let to_eye_dir = (view.eye - view.target).normalize_or_zero();
 
     let base = palette.status_color(crate::theme::Status::Running);
 
-    // Visible faces with distance, painter order is unnecessary (z-buffer), but we
-    // still cull back faces and shade by orientation + simple distance fog.
-    let mut dists = Vec::new();
     for face in &cube.faces {
         let centroid = face.indices.iter().map(|&i| cube.vertices[i]).sum::<Vec3>() / 4.0;
-        let to_eye = view.eye - centroid;
-        if face.normal.dot(to_eye) > 0.0 {
-            dists.push(to_eye.length());
-        }
-    }
-    let near = dists.iter().cloned().fold(f32::INFINITY, f32::min);
-    let far = dists.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-
-    for face in &cube.faces {
-        let centroid = face.indices.iter().map(|&i| cube.vertices[i]).sum::<Vec3>() / 4.0;
-        let to_eye = view.eye - centroid;
-        if face.normal.dot(to_eye) <= 0.0 {
+        if face.normal.dot(view.eye - centroid) <= 0.0 {
             continue; // back-face cull
         }
-        let lambert = face.normal.dot(to_eye_dir).max(0.0);
-        let orient = 0.62 + (1.0 - 0.62) * lambert;
-        let fog = fog_factor(to_eye.length(), near, far);
-        let shaded = shade(base, orient, bg, fog);
+        let shaded = face_shade(face.normal, centroid, &view, base, bg);
 
         // Project the 4 corners; skip face if any clips.
         let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
@@ -122,6 +104,30 @@ pub fn render_rgba(
         }
     }
     out
+}
+
+/// Flat-shade one face: orientation (Lambert toward the eye) plus ABSOLUTE
+/// distance fog. The fog bounds are the camera-to-center distance ± the cube's
+/// bounding radius, NOT a per-frame min/max of visible faces — that relative range
+/// made a face's brightness depend on which OTHER faces were visible, so the top
+/// face flickered as the sides rotated through. With fixed bounds each face's shade
+/// depends only on its own (here constant) geometry, so it is stable frame-to-frame.
+fn face_shade(
+    normal: Vec3,
+    centroid: Vec3,
+    view: &ViewParams,
+    base: Color,
+    bg: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    const CUBE_BOUND: f32 = 0.8660254; // unit-cube bounding sphere radius = sqrt(3)/2
+    let cam_dist = (view.eye - view.target).length();
+    let near = cam_dist - CUBE_BOUND;
+    let far = cam_dist + CUBE_BOUND;
+    let to_eye_dir = (view.eye - view.target).normalize_or_zero();
+    let lambert = normal.dot(to_eye_dir).max(0.0);
+    let orient = 0.62 + (1.0 - 0.62) * lambert;
+    let fog = fog_factor((view.eye - centroid).length(), near, far);
+    shade(base, orient, bg, fog)
 }
 
 /// Flat-shade the base color by orientation (toward black) then distance fog
@@ -346,4 +352,36 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
     std::fs::write(path, &rgba)?;
     println!("{w} {h} {}", rgba.len());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The top face's shade must NOT change as the camera orbits in yaw (fixed
+    /// pitch/radius). This pins the fix for the "top flickers brighter/darker"
+    /// bug — absolute fog bounds make a face's brightness independent of which
+    /// other faces are currently visible.
+    #[test]
+    fn top_face_shade_is_yaw_invariant() {
+        let palette = Palette::default();
+        let base = palette.status_color(crate::theme::Status::Running);
+        let bg = to_rgb(palette.background);
+        let top_normal = Vec3::Y;
+        let top_centroid = Vec3::new(0.0, 0.5, 0.0);
+
+        let mut camera = Camera::new();
+        camera.radius = 3.2;
+        let mut shades = Vec::new();
+        for _ in 0..12 {
+            camera.step(0.5); // advance yaw, pitch stays fixed
+            let view = camera.view_params(DEFAULT_FOV);
+            shades.push(face_shade(top_normal, top_centroid, &view, base, bg));
+        }
+        // Every sampled yaw must yield the identical top-face color.
+        assert!(
+            shades.windows(2).all(|w| w[0] == w[1]),
+            "top face shade varied across yaw (flicker): {shades:?}"
+        );
+    }
 }
