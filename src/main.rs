@@ -90,7 +90,104 @@ async fn main() -> Result<()> {
     // backend's render loop. Unbounded matches the 03-03 contract; cadence is
     // decoupled because the backend drains with try_recv each pass (DOCK-04).
     let (tx, rx) = mpsc::unbounded_channel::<DockerMsg>();
+    let test_mode = args.iter().any(|a| a == "--test");
+    // In --test mode, also keep a clone of the sender so we can inject
+    // synthetic Running + Stat messages for half the user's containers AFTER
+    // the natural list_containers seed has populated the world. The live
+    // event/stats streams keep working normally on the original tx.
+    let test_tx = test_mode.then(|| tx.clone());
     let docker_handle = docker::spawn_docker_tasks(docker, tx);
+
+    // --test: read the user's containers via `docker ps -a`, force every
+    // other (alphabetical by name) to Running with a varied synthetic load,
+    // and push the StatusChanged + Stat messages over the same mpsc that the
+    // real producer uses. Read-only: never starts or stops a container.
+    // Sleeps briefly first so the producer's initial Added messages land
+    // before our overrides, otherwise StatusChanged would target an unknown
+    // id and be dropped by the reconciler.
+    if let Some(tx) = test_tx {
+        tokio::spawn(async move {
+            use std::time::Duration as StdDuration;
+
+            use crate::docker::stats::StatSample;
+            use crate::theme::Status;
+
+            tokio::time::sleep(StdDuration::from_millis(750)).await;
+
+            let out = tokio::process::Command::new("docker")
+                .args([
+                    "ps",
+                    "-a",
+                    "--no-trunc",
+                    "--format",
+                    "{{.ID}}|{{.Names}}",
+                ])
+                .output()
+                .await;
+            let Ok(out) = out else { return };
+            if !out.status.success() {
+                return;
+            }
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let mut records: Vec<(String, String)> = stdout
+                .lines()
+                .filter_map(|line| {
+                    let parts: Vec<&str> = line.splitn(2, '|').collect();
+                    (parts.len() == 2 && !parts[0].is_empty())
+                        .then(|| (parts[0].to_string(), parts[1].to_string()))
+                })
+                .collect();
+            records.sort_by(|a, b| a.1.cmp(&b.1));
+
+            let forced: Vec<&(String, String)> = records.iter().step_by(2).collect();
+            let n = forced.len().max(1) as f32;
+            for (i, (id, _)) in forced.iter().enumerate() {
+                let _ = tx.send(DockerMsg::StatusChanged(id.clone(), Status::Running));
+                let load = 0.3 + 0.5 * (i as f32 / n);
+                let sample = StatSample {
+                    cpu_pct: 0.0,
+                    mem_used: 0,
+                    mem_limit: 0,
+                    mem_fraction: 0.0,
+                    load,
+                    warming_up: false,
+                };
+                let _ = tx.send(DockerMsg::Stat(id.clone(), sample));
+            }
+
+            // Smooth "breathing": Stat updates at ~20Hz (every 50ms) so the
+            // size sweep is sub-pixel between updates instead of jumping at a
+            // visible cadence. Cheap (a few hundred messages/sec total across
+            // ~7 forced boxes), well under the LiveWorld dedup path
+            // ("same load -> no rebuild"). Amplitude is gentler than the
+            // initial seed: load varies in [0.40, 0.70] so the size swing
+            // reads as breathing, not strobing.
+            let mut tick = tokio::time::interval(StdDuration::from_millis(50));
+            tick.tick().await; // skip the immediate first tick
+            let start = std::time::Instant::now();
+            loop {
+                tick.tick().await;
+                let t = start.elapsed().as_secs_f32();
+                for (i, (id, _)) in forced.iter().enumerate() {
+                    // Sinusoid in [0.40, 0.70] with a per-box phase offset so
+                    // each box breathes a bit out of sync with its neighbors.
+                    let phase = i as f32 * 0.6;
+                    let load = 0.55 + 0.15 * (t * 0.8 + phase).sin();
+                    let sample = StatSample {
+                        cpu_pct: 0.0,
+                        mem_used: 0,
+                        mem_limit: 0,
+                        mem_fraction: 0.0,
+                        load,
+                        warming_up: false,
+                    };
+                    if tx.send(DockerMsg::Stat(id.clone(), sample)).is_err() {
+                        return; // receiver dropped — app exiting
+                    }
+                }
+            }
+        });
+    }
 
     // Backend selection: explicit --kitty / --braille override; otherwise
     // auto-detect — real pixels where the graphics protocol exists (kitty/ghostty/
