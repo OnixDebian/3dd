@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-05-26)
 
 **Core value:** A beautiful, legible 3D scene that lets you grasp the state of your Docker environment at a glance — what's alive, what's hot, what's connected to what.
-**Current focus:** Phase 2 COMPLETE — next: Phase 3 (Docker Data Layer)
+**Current focus:** Phase 3 (Docker Data Layer) — Wave 1 in flight (03-01 done; 03-02 running in parallel)
 
 ## Current Position
 
-Phase: 2 of 5 (Scene Pipeline) — COMPLETE
-Plan: 4 of 4 complete (02-04 app integration + scene verify)
-Status: Phase 2 COMPLETE — multi-box scene verified by human in a real terminal across both backends; VERIFICATION passed 4/4
-Last activity: 2026-05-27 — Completed 02-04 (human-verify APPROVED); per-box self-spin + projected-AABB framing accepted
+Phase: 3 of 5 (Docker Data Layer) — IN PROGRESS
+Plan: 1 of 4 complete (03-01 docker stats normalizer)
+Status: 03-01 GREEN; normalizer pinned by 13 unit tests; 03-02 running in parallel (Wave 1)
+Last activity: 2026-05-28 — Completed 03-01 (docker stats normalizer); pure, NaN-safe, CPU%-delta + memory guarded, feeds existing load_to_half_extent
 
 ## Phase 2 Notes (for Phase 3 planning)
 
@@ -21,7 +21,7 @@ Last activity: 2026-05-27 — Completed 02-04 (human-verify APPROVED); per-box s
 - **DEVIATION / RECONCILE (CAM-01):** roadmap criterion #4 was "autopilot ORBIT camera". Human overrode it live → shipped PER-BOX self-spin (each box rotates about its own Y at SPIN_RATE 0.525) + STATIC scene-framed camera (YAW_RATE=0). Motion is framerate-independent (on logic tick). REVISIT in Phase 4 when manual explore (CAM-02/03) lands — decide whether orbit returns or per-box-spin stays.
 - **Roadmap deviation carried from Phase 1:** kitty backend front-runs part of Phase 5 ROB-02 (capability/degrade). Still open.
 
-Progress: ██████░░░░ ~60% (Phase 1: 5/5, Phase 2: 1/4)
+Progress: ███████░░░ ~65% (Phase 1: 5/5, Phase 2: 4/4, Phase 3: 1/4)
 
 ## Performance Metrics
 
@@ -65,6 +65,15 @@ Recent decisions affecting current work:
 - 01-05: Final yaw rate ~30°/s (YAW_RATE 0.525, ~12s/revolution) — bumped 1.5x from ~20°/s on human request
 - 01-05: y-flip lives once in NDC→screen projection (01-03); SceneShape blit does NOT re-invert — cube confirmed right-side-up
 
+**Phase 3 (Docker Data):**
+- 03-01: PURE normalizer — bollard-free. `src/docker/stats.rs` owns `RawCpu`/`RawMem` (plain input structs 03-03 maps `ContainerStatsResponse` onto) + `StatSample` (cpu_pct/mem_used/mem_limit/mem_fraction/load/warming_up) + `normalize()`. CPU%-delta formula per PITFALLS Pitfall 1 with EVERY guard pinned by 13 unit tests on synthetic before/after samples.
+- 03-01: `load = max(cpu_norm, mem_fraction)` in `[0,1]` — box grows for whichever resource it is hot on; `cpu_pct` + `mem_fraction` also exposed for future HUD.
+- 03-01: warming-up detection = `prev_cpu.is_none()` OR prev counters both zero (covers bollard's first-frame `precpu_stats` shape); load forced to 0.0.
+- 03-01: counter regression (`cur < prev`, e.g. daemon/container restart) also yields 0.0 cpu_pct — added as an explicit guard beyond the plan's list (auto-fix Rule 1).
+- 03-01: f64 for delta math (counters are large u64), f32 only on user-facing fields; final-scrub coerces any non-finite slip to 0.0.
+- 03-01: `src/docker/mod.rs` declares `pub mod stats;` live + MARKED commented stubs for `domain` / `connect` / `streams` — 03-02/03-03 each uncomment exactly one line when their file lands (no mod.rs conflict). Re-exports `normalize, RawCpu, RawMem, StatSample` for `crate::docker::normalize` call sites.
+- 03-01: 64 → 77 tests; `cargo clippy --tests -- -D warnings` clean; stats.rs has zero `use bollard`.
+
 **Phase 2 (Scene Pipeline):**
 - 02-01: LAYOUT RESOLVED (rack-grid vs network-floors) → network-grouped rack grid. Groups = contiguous Z-bands (Phase 4 ENT-01 floor-planes drop in as the band's plane); within a group boxes fill columns/X and shelves/Y. Network grouping is the first-class placement axis.
 - 02-01: `src/world` is pure deterministic data — layout()/sizing are closed-form functions of stable id/group (NO clock, NO rand, NO global mutable state). synthetic_scene() = 50 boxes / 5 groups, deterministic per-id load (Knuth hash) + status variety (id%10).
@@ -86,8 +95,10 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 2 next: 02-02 (braille rasterizer) + 02-03 (kitty rasterizer) — both consume world::synthetic_scene() + Camera::frame_scene
-- Render verify when a rasterizer lands: confirm the rack reads legibly; GROUP_DEPTH 18 makes a deep scene (far raised to 500) — tighten if too sparse/deep
+- Phase 3 next (Wave 1 continuation): 03-02 (`docker::domain` + `docker::connect`) — uncomments `pub mod domain;` and `pub mod connect;` in `src/docker/mod.rs` (the marked commented stubs); produces the bollard client + connection state machine + empty/permission/down domain states.
+- Phase 3 Wave 2: 03-03 (`docker::streams`) — uncomments `pub mod streams;`; maps bollard's `ContainerStatsResponse` onto `RawCpu`/`RawMem` and calls `crate::docker::normalize` per container; picks cgroup v1 `cache` vs v2 `inactive_file` per daemon.
+- Phase 3 Wave 3: 03-04 (renderer wire) — replaces `world::synthetic_scene()` output with live containers using the same `World/Entity` shape; `StatSample::load` feeds `world::entity::load_to_half_extent` directly.
+- Pre-existing fmt drift on the pre-phase-3 files (`src/world/scene.rs`, `src/app.rs`, etc.) — NOT touched by this plan; pick up in a separate `chore(fmt)` whenever.
 
 ### Blockers/Concerns
 
@@ -99,7 +110,7 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-05-27
-Stopped at: Phase 2 COMPLETE (all 4 plans + human-verify APPROVED + VERIFICATION passed 4/4). Multi-box scene shipped on both backends; per-box self-spin + projected-AABB framing accepted by human. build/clippy/test clean (64 tests).
+Last session: 2026-05-28
+Stopped at: 03-01 COMPLETE (Wave 1 of Phase 3). docker stats normalizer (`src/docker/stats.rs`) is pure, NaN-safe, CPU%-delta + memory guarded, pinned by 13 unit tests. 03-02 was running in parallel against the same working tree.
 Resume file: None
-Resume note: Phase 2 DONE. The synthetic multi-box scene reads legibly at scale on both backends and is human-approved. ARCHITECTURE: App owns one `World` (`src/world/`: entity/layout/scene/mod) — `synthetic_scene()` builds 30 boxes / 3 network-groups, deterministic from id (stable slots). Both renderers take `&[Entity]` + `SceneBounds`: braille `render3d::render_scene` (cross-box painter's sort) and kitty `render_rgba` (per-pixel z-buffer); `Camera::frame_scene(&world)` binary-searches camera distance to a projected-AABB fill (FRAME_TARGET_FILL=0.92, binding=horizontal at cell_aspect 2). Run `--release` for the kitty path; `--dump-rgba <path>` writes one RGBA frame for offline inspect (MEMORY: screenshot & verify after render changes). MOTION MODEL CHANGED (human override, RECONCILE in Phase 4): orbit disabled (YAW_RATE=0), each box self-spins about its own Y (SPIN_RATE 0.525), camera static & scene-framed — CAM-01 marked deviation. NEXT: Phase 3 — feed REAL Docker data (bollard) into this proven renderer, replacing synthetic_scene() output with live containers (same World/Entity shape); correct CPU%/mem (cumulative-delta), create/destroy events, graceful daemon-down/empty/permission states. Open roadmap deviation: kitty backend front-runs Phase 5 ROB-02; reconcile in Phase 5.
+Resume note: 03-01 done. The CPU%-delta gotcha (PITFALLS Pitfall 1) is now CONTAINED in a single pure function (`crate::docker::normalize`) with every guard pinned by tests on synthetic before/after samples. The `load` field on `StatSample` is in `[0,1]` and feeds `world::entity::load_to_half_extent` UNCHANGED — once 03-03 maps bollard's `ContainerStatsResponse` onto `RawCpu`/`RawMem`, the renderer's box-size signal becomes guaranteed-finite for real containers. `src/docker/mod.rs` declares `pub mod stats;` LIVE and carries MARKED commented stubs for `domain` / `connect` / `streams` — 03-02/03-03 each uncomment exactly one line when their file lands (no mod.rs conflict). NOTE on parallel execution: while 03-01 was running its Task 2 verification, the parallel 03-02 agent had simultaneously uncommented `pub mod domain;` in mod.rs and dropped an untracked `src/docker/domain.rs` into the tree; this plan's commits deliberately do NOT include those changes so 03-02 can land its own atomic commit. Wave 1 continues with 03-02; Wave 2 = 03-03 (streams); Wave 3 = 03-04 (renderer wire). All Phase-1/Phase-2 invariants intact: 77/77 tests, clippy clean on `--tests -- -D warnings`, no bollard import inside stats.rs.
