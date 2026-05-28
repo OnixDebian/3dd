@@ -30,7 +30,7 @@
 
 pub mod stats;
 
-// pub mod domain;   // created by 03-02 — uncomment when src/docker/domain.rs lands
+pub mod domain;
 // pub mod connect;  // created by 03-02 — uncomment when src/docker/connect.rs lands
 // pub mod streams;  // created by 03-03 — uncomment when src/docker/streams.rs lands
 
@@ -38,3 +38,4 @@ pub mod stats;
 // without reaching into the submodule path. Keep this list in sync with the
 // items the rest of the app speaks.
 pub use stats::{normalize, RawCpu, RawMem, StatSample};
+pub use domain::{from_bollard_summary, map_status, ContainerSnapshot};
