@@ -47,6 +47,32 @@ pub struct Cube {
     pub faces: [Face; 6],
 }
 
+/// The 12 edges of a cube as pairs of [`Cube::vertices`] indices. Used by the
+/// wireframe path (non-`Running` containers): instead of filling the 6 faces,
+/// the rasterizer draws lines between these vertex pairs so only the cube's
+/// silhouette + 4 hidden / 8 visible edges show — a "transparent cube". The
+/// indices match the vertex layout in [`unit_cube`] (bit pattern of the index
+/// encodes which corner: bit0=X, bit1=Y, bit2=Z, see the doc there).
+///
+/// Order: 4 bottom edges (Y=-HALF), 4 top edges (Y=+HALF), 4 vertical pillars.
+pub const CUBE_EDGES: [(usize, usize); 12] = [
+    // Bottom rectangle (Y = -HALF): 0-1, 1-5, 5-4, 4-0.
+    (0, 1),
+    (1, 5),
+    (5, 4),
+    (4, 0),
+    // Top rectangle (Y = +HALF): 2-3, 3-7, 7-6, 6-2.
+    (2, 3),
+    (3, 7),
+    (7, 6),
+    (6, 2),
+    // Vertical pillars connecting bottom <-> top.
+    (0, 2),
+    (1, 3),
+    (5, 7),
+    (4, 6),
+];
+
 /// Build the canonical unit cube centered at the origin.
 ///
 /// Vertex layout (bit pattern of the index = which corner):

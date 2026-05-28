@@ -218,6 +218,19 @@ impl Camera {
     /// Uses [`DEFAULT_FOV`] for the lens (the camera owns the lens); an empty
     /// scene or a degenerate projected extent falls back to [`DEFAULT_RADIUS`].
     pub fn frame_scene(&mut self, world: &crate::world::World) {
+        // Default to the braille/tighter case (`cell_aspect = 2.0`) — that is
+        // the backend that originally drove this method and is also the
+        // worst-case for fit (narrowest horizontal NDC at the same eye distance).
+        self.frame_scene_with_aspect(world, FRAME_REF_CELL_ASPECT);
+    }
+
+    /// Frame the scene at an EXPLICIT `cell_aspect`. The kitty backend (square
+    /// pixels, `cell_aspect = 1.0`) calls this with `1.0` so the projected
+    /// scene actually fills `FRAME_TARGET_FILL` of the kitty viewport instead
+    /// of the ~50% it would fill at the braille reference value. Picking the
+    /// aspect at the call site keeps the camera state itself backend-agnostic
+    /// (the same `Camera` can re-frame for whichever surface is being drawn).
+    pub fn frame_scene_with_aspect(&mut self, world: &crate::world::World, cell_aspect: f32) {
         use crate::config::RenderConfig;
         use crate::render3d::project::Projector;
         use crate::render3d::rotate_y_about;
@@ -229,7 +242,7 @@ impl Camera {
             return;
         }
 
-        let proj_cfg = RenderConfig { fov: DEFAULT_FOV, cell_aspect: FRAME_REF_CELL_ASPECT, ..RenderConfig::default() };
+        let proj_cfg = RenderConfig { fov: DEFAULT_FOV, cell_aspect, ..RenderConfig::default() };
 
         // Max horizontal NDC half-extent of the whole rack at a candidate radius,
         // swept across per-box spin so a mid-rotation corner can't be missed.

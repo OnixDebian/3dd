@@ -23,7 +23,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
-use crate::render3d::cube::unit_cube;
+use crate::render3d::cube::{unit_cube, CUBE_EDGES};
 use crate::render3d::project::Projector;
 use crate::render3d::{rotate_y_about, ViewParams};
 use crate::theme::Palette;
@@ -34,6 +34,13 @@ use crate::world::{DockerMsg, LiveWorld, World};
 /// Internal supersampling factor per axis for anti-aliasing. Real pixels, so this
 /// is plain box-filtered MSAA (no braille constraints).
 const SS: usize = 2;
+
+/// Half-thickness (in SUPERSAMPLED pixels) of wireframe edges in the kitty path.
+/// Chosen so the SS-downsampled line reads as ~1.5 output-pixels wide — thin
+/// enough that a dense wireframe (many stopped containers) doesn't visually
+/// collapse into a blob, thick enough to survive the box-filter downsample to
+/// the final RGBA.
+const WIRE_HALF_PX: f32 = 1.5;
 
 /// Render one frame of the whole World to a raw RGBA buffer (`w*h*4` bytes).
 ///
@@ -90,46 +97,65 @@ pub fn render_rgba(
     let cube = unit_cube();
 
     for entity in entities {
-        let base = palette.status_color(entity.status);
         // Per-axis scale = full extent (half_extents * 2); translate to position,
         // then spin the box about its OWN center around +Y by `spin`.
         let scale = entity.half_extents * 2.0;
         let world = |v: Vec3| rotate_y_about(entity.position + v * scale, entity.position, spin);
 
-        for face in &cube.faces {
-            // World-space corners + centroid for this entity's face.
-            let corners: [Vec3; 4] = [
-                world(cube.vertices[face.indices[0]]),
-                world(cube.vertices[face.indices[1]]),
-                world(cube.vertices[face.indices[2]]),
-                world(cube.vertices[face.indices[3]]),
-            ];
-            let centroid = corners.iter().copied().sum::<Vec3>() / 4.0;
-            // The box is spun, so rotate the axis-aligned normal by the same spin
-            // to recover the true world normal for cull + Lambert shading.
-            let normal = rotate_y_about(face.normal, Vec3::ZERO, spin);
-            if normal.dot(view.eye - centroid) <= 0.0 {
-                continue; // back-face cull against the eye, in world space
-            }
-            let shaded = face_shade(normal, centroid, &view, near, far, base, bg);
+        if entity.status.is_solid() {
+            // SOLID PATH (Running): fill the 6 cube faces (existing logic).
+            let base = palette.status_color(entity.status);
+            for face in &cube.faces {
+                let corners: [Vec3; 4] = [
+                    world(cube.vertices[face.indices[0]]),
+                    world(cube.vertices[face.indices[1]]),
+                    world(cube.vertices[face.indices[2]]),
+                    world(cube.vertices[face.indices[3]]),
+                ];
+                let centroid = corners.iter().copied().sum::<Vec3>() / 4.0;
+                let normal = rotate_y_about(face.normal, Vec3::ZERO, spin);
+                if normal.dot(view.eye - centroid) <= 0.0 {
+                    continue;
+                }
+                let shaded = face_shade(normal, centroid, &view, near, far, base, bg);
 
-            // Project the 4 corners; skip face if any clips.
-            let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
-            let mut clipped = false;
-            for (slot, corner) in pts.iter_mut().zip(corners.iter()) {
-                match projector.project(*corner) {
-                    Some((x, y, z)) => *slot = (x, y, z),
-                    None => {
-                        clipped = true;
-                        break;
+                let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
+                let mut clipped = false;
+                for (slot, corner) in pts.iter_mut().zip(corners.iter()) {
+                    match projector.project(*corner) {
+                        Some((x, y, z)) => *slot = (x, y, z),
+                        None => {
+                            clipped = true;
+                            break;
+                        }
                     }
                 }
+                if clipped {
+                    continue;
+                }
+                fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[1], pts[2], shaded);
+                fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[2], pts[3], shaded);
             }
-            if clipped {
-                continue;
+        } else {
+            // WIREFRAME PATH (non-Running): draw the 12 cube edges. The
+            // shared `depth` buffer makes the lines correctly occluded by
+            // solid boxes in front, and lets wireframes occlude each other
+            // edge-by-edge. Faces are transparent — only the outline shows.
+            //
+            // Per-edge color: palette.edge dimmed by midpoint distance (the
+            // SAME fog factor a face at that midpoint would get), so wire
+            // edges fog out at depth like the rest of the scene.
+            for &(ia, ib) in &CUBE_EDGES {
+                let a3 = world(cube.vertices[ia]);
+                let b3 = world(cube.vertices[ib]);
+                let (Some(pa), Some(pb)) = (projector.project(a3), projector.project(b3)) else {
+                    continue;
+                };
+                let midpoint_dist = (view.eye - (a3 + b3) * 0.5).length();
+                let fog = fog_factor(midpoint_dist, near, far);
+                let shaded = shade(palette.edge, 1.0, bg, fog);
+                draw_line_z(&mut color, &mut depth, sw, sh, pa, pb, shaded, WIRE_HALF_PX);
             }
-            fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[1], pts[2], shaded);
-            fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[2], pts[3], shaded);
         }
     }
 
@@ -262,6 +288,84 @@ fn edge(a: (f32, f32, f32), b: (f32, f32, f32), c: (f32, f32, f32)) -> f32 {
 }
 fn edge2(a: (f32, f32, f32), b: (f32, f32, f32), p: (f32, f32)) -> f32 {
     (b.0 - a.0) * (p.1 - a.1) - (b.1 - a.1) * (p.0 - a.0)
+}
+
+/// Z-buffered thick-line rasterizer. Draws a band of width `2 * half_px`
+/// around the segment `a` → `b` into the shared `color`/`depth` SS buffer.
+/// Depth is linearly interpolated along the line (NDC z, smaller = nearer)
+/// and z-tested per pixel — so a wireframe edge is correctly hidden behind a
+/// solid face that already filled the buffer there. Iterates the bounding
+/// box of the segment + thickness; perpendicular distance to the segment
+/// gives the band mask, with the projected `t` parameter giving the depth.
+#[allow(clippy::too_many_arguments)]
+fn draw_line_z(
+    color: &mut [(u8, u8, u8)],
+    depth: &mut [f32],
+    w: usize,
+    h: usize,
+    a: (f32, f32, f32),
+    b: (f32, f32, f32),
+    rgb: (u8, u8, u8),
+    half_px: f32,
+) {
+    let (ax, ay, az) = a;
+    let (bx, by, bz) = b;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    // Degenerate (start == end on screen): plant a single dot at `a`.
+    if len2 <= f32::EPSILON {
+        let xi = ax.round() as i32;
+        let yi = ay.round() as i32;
+        if (0..w as i32).contains(&xi) && (0..h as i32).contains(&yi) {
+            let idx = yi as usize * w + xi as usize;
+            if az < depth[idx] {
+                depth[idx] = az;
+                color[idx] = rgb;
+            }
+        }
+        return;
+    }
+    let inv_len2 = 1.0 / len2;
+
+    // Bounding box of the THICK segment (segment AABB inflated by half_px).
+    let pad = half_px + 1.0;
+    let min_x = (ax.min(bx) - pad).floor().max(0.0) as i32;
+    let max_x = (ax.max(bx) + pad).ceil().min(w as f32 - 1.0) as i32;
+    let min_y = (ay.min(by) - pad).floor().max(0.0) as i32;
+    let max_y = (ay.max(by) + pad).ceil().min(h as f32 - 1.0) as i32;
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+    let half_sq = half_px * half_px;
+
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            // Pixel center.
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            // Project pixel onto the line: t in [0,1] is the segment parameter
+            // at the closest point. Clamped so caps are flat (not capsule-round).
+            let t = ((px - ax) * dx + (py - ay) * dy) * inv_len2;
+            if !(0.0..=1.0).contains(&t) {
+                continue;
+            }
+            let cx = ax + t * dx;
+            let cy = ay + t * dy;
+            let ddx = px - cx;
+            let ddy = py - cy;
+            if ddx * ddx + ddy * ddy > half_sq {
+                continue;
+            }
+            // Interpolate depth along the segment at parameter `t`.
+            let z = az + t * (bz - az);
+            let idx = y as usize * w + x as usize;
+            if z < depth[idx] {
+                depth[idx] = z;
+                color[idx] = rgb;
+            }
+        }
+    }
 }
 
 fn to_rgb(c: Color) -> (u8, u8, u8) {
@@ -419,9 +523,12 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
             if rebuilt && world.entities.len() != last_count {
                 // Count changed (add or remove). Re-frame the camera so the
                 // new rack is fully in view; pure stat updates keep the
-                // existing framing intact.
+                // existing framing intact. Kitty renders at SQUARE pixels
+                // (cell_aspect = 1.0), so the framing aspect must match,
+                // otherwise the scene fills only ~50% of the viewport (the
+                // ratio of kitty's wider horizontal NDC to braille's).
                 if !world.entities.is_empty() {
-                    camera.frame_scene(&world);
+                    camera.frame_scene_with_aspect(&world, 1.0);
                 }
                 last_count = world.entities.len();
             }
@@ -507,9 +614,208 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
     let world = synthetic_scene();
     let palette = Palette::default();
     let mut camera = Camera::new();
-    camera.frame_scene(&world); // frame the whole rack
+    // Kitty pixels are square (cell_aspect 1.0), so frame for that aspect.
+    camera.frame_scene_with_aspect(&world, 1.0);
     // Static camera now; advance the per-box spin to an informative 3/4 pose so
     // the dump shows boxes mid-rotation (not all axis-aligned/edge-on).
+    let spin = SPIN_RATE * 2.0;
+    let view = camera.view_params(DEFAULT_FOV);
+    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
+    std::fs::write(path, &rgba)?;
+    println!("{w} {h} {}", rgba.len());
+    Ok(())
+}
+
+/// Render a snapshot of the user's ACTUAL local containers — read read-only
+/// via the `docker` CLI (no bollard, no daemon socket from this process), with
+/// every other container (alphabetical by name) forced to `Running` + a
+/// synthetic load so the resulting frame shows a 50/50 solid-vs-wireframe mix
+/// across the user's real network groups. Used for visual verification of
+/// the wireframe path against a realistic layout without touching real
+/// container state (no `start` / `stop`).
+///
+/// Falls back gracefully:
+///   - `docker` CLI not on `$PATH` -> error
+///   - `docker ps -a` returns 0 containers -> a small synthetic banner-ish
+///     scene so the dump isn't empty (and the caller still gets a valid file).
+pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
+    use std::process::Command;
+
+    use crate::docker::domain::map_status;
+    use crate::docker::stats::StatSample;
+    use crate::docker::ContainerSnapshot;
+    use crate::world::live::LiveWorld;
+    use crate::world::DockerMsg;
+
+    // Read containers via the docker CLI (no bollard / no async). We need a
+    // record per container: id, name, lowercase state (running/exited/...),
+    // and the first network name. `--format` with `|` separators sidesteps
+    // tabs in name fields and lets us split deterministically.
+    let out = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--no-trunc",
+            "--format",
+            "{{.ID}}|{{.Names}}|{{.State}}|{{.Networks}}",
+        ])
+        .output()
+        .map_err(|e| color_eyre::eyre::eyre!("failed to run `docker ps -a`: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        return Err(color_eyre::eyre::eyre!("`docker ps -a` failed: {stderr}"));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Parse + sort by NAME so the test frame is deterministic frame-to-frame
+    // (the LiveWorld slot assignment is first-seen, so a stable input order
+    // yields a stable layout). One record per non-empty line.
+    let mut records: Vec<(String, String, String, String)> = stdout
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.splitn(4, '|').collect();
+            if parts.len() != 4 || parts[0].is_empty() {
+                return None;
+            }
+            Some((
+                parts[0].to_string(),
+                parts[1].to_string(),
+                parts[2].to_string(),
+                parts[3].to_string(),
+            ))
+        })
+        .collect();
+    records.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // Build the live world by replaying Added for each container — uses the
+    // SAME slot-assignment / layout / sizing pipeline as the live render
+    // (CONT-05 / first-seen-by-group). Then force every OTHER entry to
+    // Running and feed a synthetic load so it renders as solid green at a
+    // visible size (the wireframe-vs-solid ratio is the whole point here).
+    // If we got 0 containers from the CLI, fall back to the mixed test scene
+    // so the caller still gets a frame.
+    if records.is_empty() {
+        return dump_rgba_mixed(path, w, h);
+    }
+
+    let mut live = LiveWorld::new();
+    // Track the most recent World returned by `apply` — that's the final
+    // state after all messages, since `apply` rebuilds on every message that
+    // actually changes the scene.
+    let mut latest: Option<World> = None;
+    for (id, name, state, networks) in &records {
+        let group_key = networks
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .min() // alphabetically-first, mirrors `from_bollard_summary` in domain.rs
+            .unwrap_or("none")
+            .to_string();
+        let snap = ContainerSnapshot {
+            id: id.clone(),
+            name: name.clone(),
+            status: map_status(state, None, None),
+            group_key,
+        };
+        if let Some(w) = live.apply(DockerMsg::Added(snap)) {
+            latest = Some(w);
+        }
+    }
+    // Force half to Running with a synthetic load. `load` varies in [0.3,
+    // 0.8] across the forced set so the solid boxes also have varied sizes
+    // (avoids a "row of identical cubes" look). Uses StatusChanged + Stat,
+    // the same path the live event stream would drive.
+    let forced: Vec<&(String, String, String, String)> =
+        records.iter().step_by(2).collect();
+    let n = forced.len().max(1) as f32;
+    for (i, rec) in forced.iter().enumerate() {
+        let id = &rec.0;
+        if let Some(w) = live.apply(DockerMsg::StatusChanged(
+            id.clone(),
+            crate::theme::Status::Running,
+        )) {
+            latest = Some(w);
+        }
+        let load = 0.3 + 0.5 * (i as f32 / n);
+        let sample = StatSample {
+            cpu_pct: 0.0,
+            mem_used: 0,
+            mem_limit: 0,
+            mem_fraction: 0.0,
+            load,
+            warming_up: false,
+        };
+        if let Some(w) = live.apply(DockerMsg::Stat(id.clone(), sample)) {
+            latest = Some(w);
+        }
+    }
+    let world = latest.expect("non-empty record set must yield at least one rebuild");
+
+    let palette = Palette::default();
+    let mut camera = Camera::new();
+    camera.frame_scene_with_aspect(&world, 1.0);
+    let spin = SPIN_RATE * 2.0;
+    let view = camera.view_params(DEFAULT_FOV);
+    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
+    std::fs::write(path, &rgba)?;
+    let solid = world
+        .entities
+        .iter()
+        .filter(|e| e.status.is_solid())
+        .count();
+    let total = world.entities.len();
+    println!("{w} {h} {} (solid {solid}/{total})", rgba.len());
+    Ok(())
+}
+
+/// Render a mixed-status scene: a small set of Running boxes (solid green
+/// faces) interleaved with many non-Running boxes (wireframe gray) across
+/// several network groups, mimicking a real-world mostly-stopped Docker rack.
+/// Used to verify the wireframe path offline.
+pub fn dump_rgba_mixed(path: &str, w: usize, h: usize) -> Result<()> {
+    use crate::theme::Status;
+    use crate::world::entity::load_to_half_extent;
+    use crate::world::layout::layout;
+
+    let palette = Palette::default();
+    // 4 network groups × 4 containers each. Status pattern picks a couple of
+    // Running per group (the "alive" cluster) and the rest non-Running (the
+    // "off / paused / crashed" set) — same mix shape as the user's local rack.
+    let statuses = [
+        Status::Stopped, Status::Running, Status::Stopped, Status::Stopped,
+        Status::Stopped, Status::Stopped, Status::Running, Status::Stopped,
+        Status::Paused,  Status::Stopped, Status::Stopped, Status::Crashed,
+        Status::Stopped, Status::Restarting, Status::Stopped, Status::Stopped,
+    ];
+    let groups: u16 = 4;
+    let per_group: u32 = 4;
+
+    let mut entities: Vec<Entity> = Vec::with_capacity((groups as usize) * per_group as usize);
+    for g in 0..groups {
+        for i in 0..per_group {
+            let idx = (g as usize) * (per_group as usize) + i as usize;
+            let status = statuses[idx];
+            // Match the live-world rule: Running with no live stats sits at
+            // MIN_HALF; non-Running uses the baseline (~mid-range). Mock-Running
+            // gets a varied small load so the alive boxes also breathe in size.
+            let half = match status {
+                Status::Running => load_to_half_extent(0.55 + 0.1 * (i as f32 % 2.0)),
+                _ => 0.85, // mirrors BASELINE_HALF_NO_LOAD in src/world/live.rs
+            };
+            entities.push(Entity {
+                id: (g as u32) * (1 << 16) + i,
+                position: layout(g, i),
+                half_extents: Vec3::splat(half),
+                status,
+                group: g,
+            });
+        }
+    }
+    let bounds = SceneBounds::from_entities(&entities);
+    let world = World { entities, bounds };
+
+    let mut camera = Camera::new();
+    camera.frame_scene_with_aspect(&world, 1.0);
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
     let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
@@ -573,18 +879,24 @@ mod tests {
         let (w, h) = (40usize, 40usize);
 
         // A in front (z = +2), B behind (z = -2); both centered on the view axis.
+        // Use Running (solid) so both boxes fill their faces — the test is
+        // about the z-buffer correctness on overlapping SOLID geometry. With
+        // wireframe (non-Running) boxes the center pixel lands between two
+        // edges and is empty; the same z-buffer is still in effect for
+        // wireframe (verified separately), but the center-pixel probe only
+        // makes sense for filled faces.
         let near_box = Entity {
             id: 0,
             position: Vec3::new(0.0, 0.0, 2.0),
             half_extents: Vec3::splat(0.6),
-            status: Status::Crashed, // red — distinct from the running color
+            status: Status::Running,
             group: 0,
         };
         let far_box = Entity {
             id: 1,
             position: Vec3::new(0.0, 0.0, -2.0),
             half_extents: Vec3::splat(0.6),
-            status: Status::Crashed,
+            status: Status::Running,
             group: 0,
         };
         let entities = [near_box, far_box];
@@ -667,6 +979,126 @@ mod tests {
             "expected >= 2 distinct non-background colors, got {}",
             colors.len()
         );
+    }
+
+    /// Non-Running boxes render as a wireframe: SOME pixels are lit (the cube
+    /// edges) but the box is mostly hollow — the center of a single stopped
+    /// box is background (no face fill), and the lit pixels are the configured
+    /// edge color (fog-modulated). Pins the wireframe path.
+    #[test]
+    fn stopped_box_renders_as_wireframe() {
+        use crate::theme::Status;
+        let palette = Palette::default();
+        let (w, h) = (80usize, 80usize);
+        let entities = [Entity {
+            id: 0,
+            position: Vec3::ZERO,
+            half_extents: Vec3::splat(0.8),
+            status: Status::Stopped,
+            group: 0,
+        }];
+        let bounds = SceneBounds::from_entities(&entities);
+        // Head-on view so the front face is centered.
+        let view = ViewParams {
+            eye: Vec3::new(0.6, 0.5, 4.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov: DEFAULT_FOV,
+        };
+        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
+        let bg = to_rgb(palette.background);
+
+        // Pixels are lit (the 12 edges project to some screen pixels).
+        let lit: usize = rgba
+            .chunks_exact(4)
+            .filter(|px| (px[0], px[1], px[2]) != bg)
+            .count();
+        assert!(lit > 50, "wireframe edges should light some pixels, got {lit}");
+
+        // Lit pixels are gray-ish (channels are close to each other) — the
+        // configured `palette.edge` is a neutral gray, fog only dims it.
+        for px in rgba.chunks_exact(4) {
+            let (r, g, b) = (px[0], px[1], px[2]);
+            if (r, g, b) == bg {
+                continue;
+            }
+            let max = r.max(g).max(b) as i16;
+            let min = r.min(g).min(b) as i16;
+            // Edge color is near-gray; allow some tolerance for the fog blend
+            // toward the background (which carries a faint indigo tint).
+            assert!(
+                max - min < 24,
+                "wireframe pixel not near-gray: ({r},{g},{b}) span={}",
+                max - min
+            );
+        }
+
+        // The 2x2 patch dead-center is between the front face's edges (the
+        // edges are at the projected ±half_extent corners, not at the center)
+        // — so the center is background, proving the cube is transparent.
+        let center = ((h / 2) * w + (w / 2)) * 4;
+        assert_eq!(
+            (rgba[center], rgba[center + 1], rgba[center + 2]),
+            bg,
+            "center of wireframe cube should be transparent (background)"
+        );
+    }
+
+    /// A wireframe box BEHIND a solid box must NOT show its edges through the
+    /// solid face — the shared z-buffer hides them. Pins wireframe/solid
+    /// occlusion (the property the `Crashed` test used to pin for solid/solid).
+    #[test]
+    fn wireframe_behind_solid_is_occluded() {
+        use crate::theme::Status;
+        let palette = Palette::default();
+        let (w, h) = (80usize, 80usize);
+        // Solid in front (Running, z=+1), wireframe behind (Stopped, z=-1).
+        let entities = [
+            Entity {
+                id: 0,
+                position: Vec3::new(0.0, 0.0, 1.0),
+                half_extents: Vec3::splat(0.6),
+                status: Status::Running,
+                group: 0,
+            },
+            Entity {
+                id: 1,
+                position: Vec3::new(0.0, 0.0, -1.0),
+                half_extents: Vec3::splat(0.6),
+                status: Status::Stopped,
+                group: 0,
+            },
+        ];
+        let bounds = SceneBounds::from_entities(&entities);
+        let view = ViewParams {
+            eye: Vec3::new(0.0, 0.0, 6.0),
+            target: Vec3::ZERO,
+            up: Vec3::Y,
+            fov: DEFAULT_FOV,
+        };
+        // Render the solid alone, then both, and compare the front-face region.
+        let solid_only = render_rgba(&[entities[0]], view, &bounds, &palette, w, h, 0.0);
+        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
+        // Sample a horizontal strip across the middle row — wherever the
+        // solid box lit a pixel, the BOTH render must match exactly (the
+        // wireframe behind was occluded, contributing nothing).
+        let bg = to_rgb(palette.background);
+        let row = h / 2;
+        let mut compared = 0usize;
+        for x in 0..w {
+            let i = (row * w + x) * 4;
+            let sa = (solid_only[i], solid_only[i + 1], solid_only[i + 2]);
+            if sa == bg {
+                continue;
+            }
+            let bo = (both[i], both[i + 1], both[i + 2]);
+            assert_eq!(
+                sa, bo,
+                "wireframe behind solid bled through at ({x},{row}): solid={sa:?}, both={bo:?}"
+            );
+            compared += 1;
+        }
+        assert!(compared > 10, "no overlap to test; got {compared} pixels");
     }
 
     /// An empty scene renders all-background, no panic (degenerate bounds safe).

@@ -22,7 +22,7 @@ use glam::Vec3;
 use ratatui::style::Color;
 
 use crate::config::RenderConfig;
-use crate::render3d::cube::{unit_cube, Cube};
+use crate::render3d::cube::{unit_cube, Cube, CUBE_EDGES};
 use crate::render3d::framebuffer::Framebuffer;
 use crate::render3d::project::Projector;
 use crate::render3d::{rotate_y_about, ViewParams};
@@ -185,13 +185,15 @@ pub fn render_scene(
     // materializes its OWN 8 world verts from these.
     let cube = unit_cube();
 
-    // ONE combined face list spanning EVERY box (cross-box painter's pool).
-    let mut visible: Vec<RenderFace> = Vec::new();
+    // ONE combined fragment list spanning EVERY box (cross-box painter's pool).
+    // A SOLID entity (Status::Running) contributes up to 6 Face fragments
+    // (back-face culled); a wireframe entity contributes 12 Edge fragments
+    // (all 12 cube edges, no culling — even back edges show, since the cube
+    // is "transparent"). Sort by distance and draw back-to-front: a near
+    // SOLID face overwrites the wireframe edges behind it (occluded), and a
+    // near wireframe's edges overwrite faces behind it (drawn on top).
+    let mut fragments: Vec<Fragment> = Vec::new();
     for entity in entities {
-        let base = palette.status_color(entity.status);
-        // Transform the unit cube into world space ONCE per box: scale by the
-        // side length (2 * half_extents), translate to the world position, then
-        // spin about THIS box's center around +Y by `spin` (self-rotation).
         let scale = entity.half_extents * 2.0;
         let mut world_verts = [Vec3::ZERO; 8];
         for (slot, &v) in world_verts.iter_mut().zip(cube.vertices.iter()) {
@@ -199,54 +201,216 @@ pub fn render_scene(
             *slot = rotate_y_about(placed, entity.position, spin);
         }
 
-        for face in &cube.faces {
-            let verts = [
-                world_verts[face.indices[0]],
-                world_verts[face.indices[1]],
-                world_verts[face.indices[2]],
-                world_verts[face.indices[3]],
-            ];
-            // The box is now spun, so the unit-cube normal is NO LONGER the world
-            // normal — rotate it about the origin (a pure direction) by the same
-            // spin so cull and Lambert shading use the true world-space normal.
-            let normal = rotate_y_about(face.normal, Vec3::ZERO, spin);
-            let centroid = verts.iter().copied().sum::<Vec3>() / 4.0;
-            let to_eye = view.eye - centroid;
-            // Back-face cull per face against the spun normal.
-            if normal.dot(to_eye) <= 0.0 {
-                continue;
+        if entity.status.is_solid() {
+            // SOLID PATH: cull back-faces, push the visible faces as fragments.
+            let base = palette.status_color(entity.status);
+            for face in &cube.faces {
+                let verts = [
+                    world_verts[face.indices[0]],
+                    world_verts[face.indices[1]],
+                    world_verts[face.indices[2]],
+                    world_verts[face.indices[3]],
+                ];
+                let normal = rotate_y_about(face.normal, Vec3::ZERO, spin);
+                let centroid = verts.iter().copied().sum::<Vec3>() / 4.0;
+                let to_eye = view.eye - centroid;
+                if normal.dot(to_eye) <= 0.0 {
+                    continue;
+                }
+                fragments.push(Fragment::Face(RenderFace {
+                    verts,
+                    normal,
+                    distance: to_eye.length(),
+                    base,
+                }));
             }
-            visible.push(RenderFace {
-                verts,
-                normal,
-                distance: to_eye.length(),
-                base,
-            });
+        } else {
+            // WIREFRAME PATH: every edge contributes regardless of facing — a
+            // transparent cube shows all 12 edges (the silhouette + the
+            // interior edges that would be "hidden" on a solid).
+            for &(ia, ib) in &CUBE_EDGES {
+                let a = world_verts[ia];
+                let b = world_verts[ib];
+                let midpoint = (a + b) * 0.5;
+                fragments.push(Fragment::Edge(RenderEdge {
+                    a,
+                    b,
+                    distance: (view.eye - midpoint).length(),
+                }));
+            }
         }
     }
 
-    if visible.is_empty() {
+    if fragments.is_empty() {
         return Framebuffer::new(w, h);
     }
 
-    // CROSS-BOX PAINTER'S SORT (the critical correctness step): sort the SINGLE
-    // combined face pool farthest-first, so a near box's faces are drawn LAST and
-    // overwrite the far ones. Do NOT sort per-box then concatenate.
-    visible.sort_unstable_by(|a, b| {
-        b.distance
-            .partial_cmp(&a.distance)
+    // CROSS-BOX PAINTER'S SORT: sort the combined pool farthest-first, so near
+    // fragments draw LAST and overwrite far ones (correct depth ordering for
+    // mixed solid/wireframe — both contribute to the same sort).
+    fragments.sort_unstable_by(|a, b| {
+        b.distance()
+            .partial_cmp(&a.distance())
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Scene-wide fog range: near/far across ALL visible faces of ALL boxes, so
-    // far boxes dim and near boxes stay bright (depth reads at scale).
-    let (near_d, far_d) = distance_range(&visible);
+    // Scene-wide fog range across ALL fragments (faces AND edges) so the depth
+    // cue is consistent: a far wireframe fogs out the same way a far face does.
+    let (near_d, far_d) = fragment_distance_range(&fragments);
 
     let to_eye_dir = (view.eye - view.target).normalize_or_zero();
 
-    shade_and_fill(&mut hi, &projector, &visible, to_eye_dir, near_d, far_d, palette);
+    shade_and_fill_fragments(
+        &mut hi,
+        &projector,
+        &fragments,
+        to_eye_dir,
+        near_d,
+        far_d,
+        palette,
+    );
 
     resolve_supersampled(&hi, w, h)
+}
+
+/// A culled wireframe edge: two WORLD-SPACE endpoints + camera distance to
+/// the edge midpoint (the painter-sort key). Edges have no normal — they only
+/// fog by midpoint distance, never Lambert-shaded.
+struct RenderEdge {
+    a: Vec3,
+    b: Vec3,
+    distance: f32,
+}
+
+/// One drawable fragment in the cross-box painter's pool. A solid box pushes
+/// up to 6 `Face` fragments (back-face culled); a wireframe box pushes 12
+/// `Edge` fragments. Sorted together by `.distance()` so a near edge correctly
+/// overwrites a far face and vice versa.
+enum Fragment {
+    Face(RenderFace),
+    Edge(RenderEdge),
+}
+
+impl Fragment {
+    fn distance(&self) -> f32 {
+        match self {
+            Fragment::Face(f) => f.distance,
+            Fragment::Edge(e) => e.distance,
+        }
+    }
+}
+
+/// Half-thickness (in SUPERSAMPLED pixels) of wireframe edges in the braille
+/// path. SS=3 means the supersample grid is 3× the dot resolution per axis;
+/// a `1.6` half-thickness gives ~3 SS-pixels of total line width, enough that
+/// a 45° edge passes the majority-coverage threshold in
+/// [`resolve_supersampled`] and lights one column/row of dots along the edge.
+/// Picked empirically to read as a clean ~1-dot-wide outline without ballooning
+/// into a thick blob at scale.
+const EDGE_HALF_PX_SS: f32 = 1.6;
+
+/// Scene-wide near/far across both face and edge fragments — the fog range.
+fn fragment_distance_range(frags: &[Fragment]) -> (f32, f32) {
+    let mut near = f32::INFINITY;
+    let mut far = f32::NEG_INFINITY;
+    for f in frags {
+        let d = f.distance();
+        near = near.min(d);
+        far = far.max(d);
+    }
+    (near, far)
+}
+
+/// Shade and fill each fragment back-to-front. Faces use Lambert×fog; edges
+/// use the palette edge color fogged by midpoint distance. Drawing into the
+/// SS framebuffer in this order means a near fragment's pixels overwrite a
+/// far fragment's pixels (painter occlusion, the existing scheme generalized
+/// from "faces only" to "faces + edges").
+fn shade_and_fill_fragments(
+    hi: &mut Framebuffer,
+    projector: &Projector,
+    fragments: &[Fragment],
+    to_eye_dir: Vec3,
+    near_d: f32,
+    far_d: f32,
+    palette: &Palette,
+) {
+    for frag in fragments {
+        match frag {
+            Fragment::Face(rf) => {
+                let lambert = rf.normal.dot(to_eye_dir).max(0.0);
+                let orient = MIN_LAMBERT + (1.0 - MIN_LAMBERT) * lambert;
+                let fog = fog_factor(rf.distance, near_d, far_d);
+                let shaded = theme::dim(rf.base, orient);
+                let color = palette.fog(shaded, fog);
+                fill_face(hi, projector, &rf.verts, color);
+            }
+            Fragment::Edge(re) => {
+                let fog = fog_factor(re.distance, near_d, far_d);
+                let color = palette.fog(palette.edge, fog);
+                fill_edge(hi, projector, re.a, re.b, color);
+            }
+        }
+    }
+}
+
+/// Project both endpoints of a 3D edge and stripe a thick line into the
+/// framebuffer. Skips the edge if either endpoint clips off-screen (rare:
+/// scene-framed cameras keep the whole rack in the frustum).
+fn fill_edge(fb: &mut Framebuffer, projector: &Projector, a: Vec3, b: Vec3, color: Color) {
+    let pa = projector.project(a);
+    let pb = projector.project(b);
+    let (Some((ax, ay, _)), Some((bx, by, _))) = (pa, pb) else {
+        return;
+    };
+    draw_thick_line(fb, (ax, ay), (bx, by), EDGE_HALF_PX_SS, color);
+}
+
+/// Rasterize a screen-space line `a` → `b` as a rectangular band of half-width
+/// `half_px`. Iterates the segment's AABB inflated by thickness; lights every
+/// framebuffer pixel whose center is inside the band (perpendicular distance
+/// to the segment ≤ `half_px`, with `t` clamped to `[0,1]` so caps are flat
+/// rather than rounded). Out-of-range writes pass silently through
+/// [`Framebuffer::set`] — the resize/clip safety carries through.
+fn draw_thick_line(fb: &mut Framebuffer, a: (f32, f32), b: (f32, f32), half_px: f32, color: Color) {
+    let (ax, ay) = a;
+    let (bx, by) = b;
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len2 = dx * dx + dy * dy;
+    if len2 <= f32::EPSILON {
+        // Degenerate (start == end on screen): plant a single dot.
+        fb.set(ax.round() as usize, ay.round() as usize, color);
+        return;
+    }
+    let inv_len2 = 1.0 / len2;
+    let (w, h) = (fb.width() as f32, fb.height() as f32);
+    let pad = half_px + 1.0;
+    let min_x = (ax.min(bx) - pad).floor().max(0.0) as i32;
+    let max_x = (ax.max(bx) + pad).ceil().min(w - 1.0) as i32;
+    let min_y = (ay.min(by) - pad).floor().max(0.0) as i32;
+    let max_y = (ay.max(by) + pad).ceil().min(h - 1.0) as i32;
+    if min_x > max_x || min_y > max_y {
+        return;
+    }
+    let half_sq = half_px * half_px;
+    for y in min_y..=max_y {
+        for x in min_x..=max_x {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let t = ((px - ax) * dx + (py - ay) * dy) * inv_len2;
+            if !(0.0..=1.0).contains(&t) {
+                continue;
+            }
+            let cx = ax + t * dx;
+            let cy = ay + t * dy;
+            let ddx = px - cx;
+            let ddy = py - cy;
+            if ddx * ddx + ddy * ddy <= half_sq {
+                fb.set(x as usize, y as usize, color);
+            }
+        }
+    }
 }
 
 /// Shade each visible face (orientation Lambert × distance fog, per-face `base`
