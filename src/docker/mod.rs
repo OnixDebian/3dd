@@ -31,7 +31,7 @@
 pub mod stats;
 
 pub mod domain;
-// pub mod connect;  // created by 03-02 — uncomment when src/docker/connect.rs lands
+pub mod connect;
 // pub mod streams;  // created by 03-03 — uncomment when src/docker/streams.rs lands
 
 // Re-export the normalizer surface so call sites can write `crate::docker::normalize`
@@ -39,3 +39,4 @@ pub mod domain;
 // items the rest of the app speaks.
 pub use stats::{normalize, RawCpu, RawMem, StatSample};
 pub use domain::{from_bollard_summary, map_status, ContainerSnapshot};
+pub use connect::{connect_and_probe, ProbeError};
