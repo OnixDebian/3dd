@@ -32,7 +32,7 @@ pub mod stats;
 
 pub mod domain;
 pub mod connect;
-// pub mod streams;  // created by 03-03 — uncomment when src/docker/streams.rs lands
+pub mod streams;
 
 // Re-export the normalizer surface so call sites can write `crate::docker::normalize`
 // without reaching into the submodule path. Keep this list in sync with the
@@ -40,3 +40,4 @@ pub mod connect;
 pub use stats::{normalize, RawCpu, RawMem, StatSample};
 pub use domain::{from_bollard_summary, map_status, ContainerSnapshot};
 pub use connect::{connect_and_probe, ProbeError};
+pub use streams::spawn_docker_tasks;
