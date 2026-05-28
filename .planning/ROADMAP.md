@@ -17,7 +17,7 @@ well-understood Docker work comes only once the renderer is trustworthy.
 
 - [x] **Phase 1: Render Core & Legibility Spike** - App skeleton + one aspect-correct, depth-shaded cube that orbits smoothly at low CPU
 - [x] **Phase 2: Scene Pipeline & Layout** - Many synthetic boxes in a stable rack layout, occluded, status-colored, load-sized, per-box self-spin (orbit overridden)
-- [ ] **Phase 3: Docker Data Layer** - Real containers + correct live stats + events feed the proven renderer
+- [x] **Phase 3: Docker Data Layer** - Real containers + correct live stats + events feed the proven renderer
 - [ ] **Phase 4: Animation, Interaction & Full Entity Set** - Breathing boxes, manual explore + detail panel, networks/volumes/images/ports
 - [ ] **Phase 5: Theming, Config & Robustness** - TOML config, runtime palette switching, legend HUD, SSH/degrade path
 
@@ -74,10 +74,14 @@ Plans:
   4. Stat update rate is decoupled from render rate — slow Docker data still yields smooth motion
   5. Daemon-down, zero-containers, and permission errors show a graceful state, never a crash or blank void
 **Research**: Unlikely (bollard well-documented; CPU% delta gotcha already captured in research PITFALLS)
-**Plans**: TBD
+**Plans**: 4 (3 waves)
+**Status**: COMPLETE (2026-05-28)
 
 Plans:
-- [ ] 03-01: TBD
+- [x] 03-01: stats normalizer (pure, bollard-free CPU%/mem/load via PITFALLS Pitfall 1)
+- [x] 03-02: bollard wiring — connect_and_probe + ProbeError + domain mapping
+- [x] 03-03: producer/consumer split — DockerMsg + LiveWorld + spawn_docker_tasks
+- [x] 03-04: renderer wire — pre-TUI probe + mpsc drain in both backends + empty-state banner
 
 ### Phase 4: Animation, Interaction & Full Entity Set
 **Goal**: Make the scene live and explorable — breathing boxes, manual orbit/select/detail interaction, and the remaining entities (networks, ports, volumes, images).
