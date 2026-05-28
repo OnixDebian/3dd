@@ -19,10 +19,10 @@ Full entity set bundled per PROJECT.md, but build order sequences render-correct
 
 ### Docker Data
 
-- [ ] **DOCK-01**: App lists containers and inspects them from the local Docker daemon (bollard)
-- [ ] **DOCK-02**: Live stats stream feeds CPU% and memory, with the correct cumulative-counter delta formula and guards against NaN/empty first sample
-- [ ] **DOCK-03**: Scene rebuilds as containers are created/destroyed (Docker events drive add/remove)
-- [ ] **DOCK-04**: Stat update rate is decoupled from render rate (slow Docker data still yields smooth motion)
+- [x] **DOCK-01**: App lists containers and inspects them from the local Docker daemon (bollard)
+- [x] **DOCK-02**: Live stats stream feeds CPU% and memory, with the correct cumulative-counter delta formula and guards against NaN/empty first sample
+- [x] **DOCK-03**: Scene rebuilds as containers are created/destroyed (Docker events drive add/remove)
+- [x] **DOCK-04**: Stat update rate is decoupled from render rate (slow Docker data still yields smooth motion)
 
 ### Container Visuals
 
@@ -55,7 +55,7 @@ Full entity set bundled per PROJECT.md, but build order sequences render-correct
 - [ ] **THEME-04**: Palettes are switchable at runtime (hot re-map, no scene rebuild)
 - [ ] **THEME-05**: A persistent legend HUD shows the active status color key
 - [ ] **THEME-06**: Config and themes load from a TOML file (serde)
-- [ ] **ROB-01**: Graceful states for daemon-down, zero-containers, and permission errors (never a crash or blank void)
+- [x] **ROB-01**: Graceful states for daemon-down, zero-containers, and permission errors (never a crash or blank void)
 - [ ] **ROB-02**: SSH/degrade path auto-detects terminal capability and downshifts braille→ASCII with an FPS cap
 
 ## v2 Requirements
@@ -107,10 +107,10 @@ Which phases cover which requirements. Updated by create-roadmap.
 | REND-05 | Phase 1 | Complete |
 | REND-06 | Phase 1 | Complete |
 | REND-07 | Phase 1 | Complete |
-| DOCK-01 | Phase 3 | Pending |
-| DOCK-02 | Phase 3 | Pending |
-| DOCK-03 | Phase 3 | Pending |
-| DOCK-04 | Phase 3 | Pending |
+| DOCK-01 | Phase 3 | Complete |
+| DOCK-02 | Phase 3 | Complete |
+| DOCK-03 | Phase 3 | Complete |
+| DOCK-04 | Phase 3 | Complete |
 | CONT-01 | Phase 2 | Complete |
 | CONT-02 | Phase 2 | Complete |
 | CONT-03 | Phase 4 | Pending |
@@ -131,7 +131,7 @@ Which phases cover which requirements. Updated by create-roadmap.
 | THEME-04 | Phase 5 | Pending |
 | THEME-05 | Phase 5 | Pending |
 | THEME-06 | Phase 5 | Pending |
-| ROB-01 | Phase 3 | Pending |
+| ROB-01 | Phase 3 | Complete |
 | ROB-02 | Phase 5 | Pending |
 
 **Coverage:**
