@@ -32,6 +32,16 @@ pub enum Status {
     Crashed,
 }
 
+impl Status {
+    /// Visual mode: `Running` renders as a solid (filled) box; every other status
+    /// renders as a wireframe (only the 12 cube edges, transparent faces). The
+    /// renderer asks here instead of pattern-matching the enum directly so the
+    /// rule has a single home.
+    pub fn is_solid(self) -> bool {
+        matches!(self, Status::Running)
+    }
+}
+
 /// The set of colors the renderer is allowed to draw with.
 ///
 /// Prefer truecolor [`Color::Rgb`] values here; Phase 5 adds quantization for
@@ -65,9 +75,9 @@ impl Default for Palette {
     fn default() -> Self {
         Self {
             background: Color::Rgb(0x1A, 0x1A, 0x22), // muted near-black with a faint indigo tint
-            edge: Color::Rgb(0x9A, 0x9A, 0xA8),       // soft gray wireframe (brightened)
+            edge: Color::Rgb(0x9A, 0x9A, 0xA8),       // soft gray — wireframe color for non-Running
             glow: Color::Rgb(0x8A, 0x8A, 0xF0),       // bright indigo accent
-            running: Color::Rgb(0x8A, 0x8A, 0xF0),    // bright indigo — alive (vivid faces)
+            running: Color::Rgb(0x7F, 0xE0, 0x8A),    // light green — alive (vivid faces)
             paused: Color::Rgb(0xE2, 0xB1, 0x4F),     // amber — held
             stopped: Color::Rgb(0x6B, 0x6B, 0x78),    // gray — dormant
             restarting: Color::Rgb(0x4F, 0xA6, 0xE2), // cyan-blue — in flux

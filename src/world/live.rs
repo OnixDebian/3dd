@@ -92,6 +92,15 @@ struct LiveEntry {
 /// for any plausible container count.
 const GROUP_STRIDE: u32 = 1 << 16;
 
+/// Half-extent for non-Running containers that have no live stats stream
+/// (Stopped/Paused/Restarting/Crashed never emit a Stat sample, so their
+/// `load` is permanently `None`). Picked big enough to read clearly as a
+/// wireframe in a deep multi-group scene where `frame_scene` pulls the
+/// camera back to fit several network bands. With `MIN_HALF=0.3` and
+/// `MAX_HALF=1.2`, `0.85` is comfortably mid-range — still visibly smaller
+/// than a max-loaded running box, so live load is the dominant size signal.
+const BASELINE_HALF_NO_LOAD: f32 = 0.85;
+
 /// Live reconciliation state.
 ///
 /// Apply [`DockerMsg`]s with [`LiveWorld::apply`] to keep the entity set in
@@ -282,10 +291,22 @@ impl LiveWorld {
                 let Some(id) = occupant else { continue };
                 let Some(entry) = self.entries.get(id) else { continue };
 
-                // No load yet (just created, or only warming-up samples)
-                // -> floor size.
-                let load = entry.load.unwrap_or(0.0);
-                let half = load_to_half_extent(load);
+                // Size:
+                //   - With a live load -> existing sqrt-compressive load map.
+                //   - No load yet AND status == Running (warming-up, no first
+                //     non-warming sample) -> floor (MIN_HALF) so it stays small
+                //     until a real sample arrives, then breathes up.
+                //   - No load and status != Running (Stopped/Paused/etc — these
+                //     statuses never get a stats stream, so `load` is always
+                //     None) -> a fixed BASELINE_HALF chosen big enough that
+                //     wireframe boxes stay legible even in a deep multi-group
+                //     scene. Wireframe is rendered downstream by status, so the
+                //     box still reads as "off" — it's just a visible outline.
+                let half = match (entry.load, entry.snap.status) {
+                    (Some(load), _) => load_to_half_extent(load),
+                    (None, Status::Running) => load_to_half_extent(0.0),
+                    (None, _) => BASELINE_HALF_NO_LOAD,
+                };
 
                 entities.push(Entity {
                     // Flat stable id encoding (group << 16 | index_in_group).
