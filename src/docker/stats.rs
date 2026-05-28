@@ -79,11 +79,115 @@ pub struct StatSample {
 
 /// Normalize one stats sample.
 ///
-/// STUB — implemented in the GREEN pass (Task 2). The full contract is
-/// documented in PITFALLS Pitfall 1 and on [`StatSample`]; the tests below
-/// pin every guard.
-pub fn normalize(_cur_cpu: &RawCpu, _prev_cpu: Option<&RawCpu>, _mem: &RawMem) -> StatSample {
-    StatSample::default()
+/// `prev_cpu` is the previous sample's CPU counters (i.e. bollard's
+/// `precpu_stats`). When it is `None` — or its counters are all zero — the
+/// sample is marked [`StatSample::warming_up`] and `load` is `0.0`: the box
+/// is not sized from it (PITFALLS Pitfall 1).
+///
+/// Formula (the CPU%-delta gotcha):
+/// ```text
+/// cpu_delta    = cur.total_usage - prev.total_usage
+/// system_delta = cur.system_usage - prev.system_usage
+/// online_cpus  = cur.online_cpus, fallback to cur.percpu_len if missing/0
+/// cpu_pct      = (cpu_delta / system_delta) * online_cpus * 100
+/// ```
+///
+/// Guards (all enforced):
+/// - First sample → `warming_up=true`, `load=0.0`.
+/// - `system_delta <= 0` → `cpu_pct = 0.0`.
+/// - `online_cpus == 0` → `cpu_pct = 0.0`.
+/// - Final `cpu_pct` clamped to `[0, online_cpus * 100]`.
+/// - Any non-finite intermediate coerced to `0.0` before returning.
+///
+/// Memory: `mem_used = usage.saturating_sub(cache)`, clamped to `limit`;
+/// `mem_fraction = mem_used / limit` in `[0,1]` (or `0.0` when `limit == 0`).
+pub fn normalize(cur_cpu: &RawCpu, prev_cpu: Option<&RawCpu>, mem: &RawMem) -> StatSample {
+    // --- Memory: pure, no division-by-zero risk on `saturating_sub`. ----------
+    let mem_used_raw = mem.usage.saturating_sub(mem.cache);
+    let mem_used = if mem.limit > 0 {
+        mem_used_raw.min(mem.limit)
+    } else {
+        mem_used_raw
+    };
+    let mem_fraction: f32 = if mem.limit > 0 {
+        (mem_used as f64 / mem.limit as f64).clamp(0.0, 1.0) as f32
+    } else {
+        0.0
+    };
+
+    // --- online_cpus with the percpu_len fallback ------------------------------
+    let online_cpus: u64 = match cur_cpu.online_cpus {
+        Some(n) if n > 0 => n,
+        _ => cur_cpu.percpu_len as u64,
+    };
+
+    // --- First-sample / warming-up detection -----------------------------------
+    // Treat as warming up when there is no prior sample at all, or when the
+    // prior sample's counters look uninitialized (both zero — the precpu_stats
+    // shape Docker emits on the very first frame of a stream).
+    let warming_up = match prev_cpu {
+        None => true,
+        Some(p) => p.total_usage == 0 && p.system_usage.unwrap_or(0) == 0,
+    };
+
+    // --- CPU%: only meaningful with a real previous sample AND a real online ---
+    let cpu_pct: f32 = if warming_up || online_cpus == 0 {
+        0.0
+    } else {
+        // `prev_cpu` is Some here (warming_up handled None).
+        let prev = prev_cpu.expect("prev_cpu is Some when not warming up");
+        let cur_sys = cur_cpu.system_usage.unwrap_or(0);
+        let prev_sys = prev.system_usage.unwrap_or(0);
+
+        // Use f64 for the delta math: counters are u64 and large.
+        let cpu_delta = cur_cpu.total_usage as f64 - prev.total_usage as f64;
+        let system_delta = cur_sys as f64 - prev_sys as f64;
+
+        if system_delta <= 0.0 || cpu_delta < 0.0 {
+            // Zero/negative system_delta -> never divide.
+            // Negative cpu_delta (counter regression) -> treat as idle.
+            0.0
+        } else {
+            let raw = (cpu_delta / system_delta) * online_cpus as f64 * 100.0;
+            let ceiling = online_cpus as f64 * 100.0;
+            let clamped = raw.clamp(0.0, ceiling);
+            if clamped.is_finite() {
+                clamped as f32
+            } else {
+                0.0
+            }
+        }
+    };
+
+    // --- Load: max of cpu_norm and mem_fraction, in [0,1] ----------------------
+    let load: f32 = if warming_up {
+        0.0
+    } else {
+        let cpu_norm: f32 = if online_cpus > 0 {
+            (cpu_pct / (online_cpus as f32 * 100.0)).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        cpu_norm.max(mem_fraction).clamp(0.0, 1.0)
+    };
+
+    // --- Final scrub: coerce any non-finite slip to 0.0 ------------------------
+    let cpu_pct = if cpu_pct.is_finite() { cpu_pct } else { 0.0 };
+    let mem_fraction = if mem_fraction.is_finite() {
+        mem_fraction
+    } else {
+        0.0
+    };
+    let load = if load.is_finite() { load } else { 0.0 };
+
+    StatSample {
+        cpu_pct,
+        mem_used,
+        mem_limit: mem.limit,
+        mem_fraction,
+        load,
+        warming_up,
+    }
 }
 
 #[cfg(test)]
@@ -255,7 +359,11 @@ mod tests {
         };
         let s = normalize(&c, Some(&p), &m);
         assert_eq!(s.mem_used, 600);
-        assert!((s.mem_fraction - 0.3).abs() < 1e-6, "frac = {}", s.mem_fraction);
+        assert!(
+            (s.mem_fraction - 0.3).abs() < 1e-6,
+            "frac = {}",
+            s.mem_fraction
+        );
     }
 
     #[test]
@@ -426,11 +534,23 @@ mod tests {
         for (cur, p, m) in cases {
             let s = normalize(&cur, p.as_ref(), &m);
             assert!(s.cpu_pct.is_finite(), "cpu_pct = {}", s.cpu_pct);
-            assert!(s.mem_fraction.is_finite(), "mem_fraction = {}", s.mem_fraction);
+            assert!(
+                s.mem_fraction.is_finite(),
+                "mem_fraction = {}",
+                s.mem_fraction
+            );
             assert!(s.load.is_finite(), "load = {}", s.load);
-            assert!((0.0..=1.0).contains(&s.load), "load out of [0,1] = {}", s.load);
+            assert!(
+                (0.0..=1.0).contains(&s.load),
+                "load out of [0,1] = {}",
+                s.load
+            );
             assert!(s.cpu_pct >= 0.0, "negative cpu_pct = {}", s.cpu_pct);
-            assert!(s.mem_fraction >= 0.0, "negative mem_fraction = {}", s.mem_fraction);
+            assert!(
+                s.mem_fraction >= 0.0,
+                "negative mem_fraction = {}",
+                s.mem_fraction
+            );
         }
     }
 }
