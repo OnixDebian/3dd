@@ -18,6 +18,7 @@
 
 pub mod entity;
 pub mod layout;
+pub mod live;
 pub mod scene;
 
 // Re-exported for the rasterizer plans (02-02 braille, 02-03 kitty); not all
@@ -27,6 +28,8 @@ pub mod scene;
 pub use entity::{load_to_half_extent, Entity, MAX_HALF, MIN_HALF};
 #[allow(unused_imports)]
 pub use layout::layout;
+#[allow(unused_imports)]
+pub use live::{DockerMsg, LiveWorld};
 #[allow(unused_imports)]
 pub use scene::{synthetic_scene, SceneBounds};
 
