@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-05-26)
 
 **Core value:** A beautiful, legible 3D scene that lets you grasp the state of your Docker environment at a glance — what's alive, what's hot, what's connected to what.
-**Current focus:** Phase 3 (Docker Data Layer) — Wave 1 in flight (03-01 done; 03-02 running in parallel)
+**Current focus:** Phase 3 (Docker Data Layer) — Wave 1 COMPLETE (03-01 + 03-02); next: Wave 2 (03-03 streams)
 
 ## Current Position
 
 Phase: 3 of 5 (Docker Data Layer) — IN PROGRESS
-Plan: 1 of 4 complete (03-01 docker stats normalizer)
-Status: 03-01 GREEN; normalizer pinned by 13 unit tests; 03-02 running in parallel (Wave 1)
-Last activity: 2026-05-28 — Completed 03-01 (docker stats normalizer); pure, NaN-safe, CPU%-delta + memory guarded, feeds existing load_to_half_extent
+Plan: 2 of 4 complete (03-01 stats normalizer + 03-02 connect/domain)
+Status: Wave 1 COMPLETE; bollard 0.21 wired, pre-TUI daemon probe + ContainerSnapshot domain boundary in place; 102/102 tests pass, clippy clean
+Last activity: 2026-05-28 — Completed 03-02 (bollard + connect_and_probe + ContainerSnapshot); ROB-01 / Pitfall 9 foundation in place ready for 03-04 to wire BEFORE Tui::enter
 
 ## Phase 2 Notes (for Phase 3 planning)
 
@@ -21,7 +21,7 @@ Last activity: 2026-05-28 — Completed 03-01 (docker stats normalizer); pure, N
 - **DEVIATION / RECONCILE (CAM-01):** roadmap criterion #4 was "autopilot ORBIT camera". Human overrode it live → shipped PER-BOX self-spin (each box rotates about its own Y at SPIN_RATE 0.525) + STATIC scene-framed camera (YAW_RATE=0). Motion is framerate-independent (on logic tick). REVISIT in Phase 4 when manual explore (CAM-02/03) lands — decide whether orbit returns or per-box-spin stays.
 - **Roadmap deviation carried from Phase 1:** kitty backend front-runs part of Phase 5 ROB-02 (capability/degrade). Still open.
 
-Progress: ███████░░░ ~65% (Phase 1: 5/5, Phase 2: 4/4, Phase 3: 1/4)
+Progress: ███████░░░ ~70% (Phase 1: 5/5, Phase 2: 4/4, Phase 3: 2/4; Phase 4+5 plans not yet drafted)
 
 ## Performance Metrics
 
@@ -73,6 +73,11 @@ Recent decisions affecting current work:
 - 03-01: f64 for delta math (counters are large u64), f32 only on user-facing fields; final-scrub coerces any non-finite slip to 0.0.
 - 03-01: `src/docker/mod.rs` declares `pub mod stats;` live + MARKED commented stubs for `domain` / `connect` / `streams` — 03-02/03-03 each uncomment exactly one line when their file lands (no mod.rs conflict). Re-exports `normalize, RawCpu, RawMem, StatSample` for `crate::docker::normalize` call sites.
 - 03-01: 64 → 77 tests; `cargo clippy --tests -- -D warnings` clean; stats.rs has zero `use bollard`.
+- 03-02: bollard 0.21 wired (`Cargo.toml`), resolves with tokio 1.47, no conflict. bollard 0.21 type/module paths PINNED in 03-02-SUMMARY for 03-03: `bollard::Docker`, `Docker::connect_with_local_defaults` (sync), `Docker::version`/`ping` (async, in `bollard::system`), `bollard::models::ContainerStatsResponse` + `ContainerSummary` + `ContainerState` (re-exports of `bollard_stubs::models`), `bollard::query_parameters::StatsOptions[Builder]` (re-export of stubs), `Docker::stats(name, Option<StatsOptions>) -> impl Stream<Item = Result<ContainerStatsResponse, Error>>`.
+- 03-02: `src/docker/domain.rs` (NEW) is the bollard isolation boundary (ARCHITECTURE Anti-Pattern 4). `ContainerSnapshot { id, name, status: theme::Status, group_key }` — bollard-free downstream shape. `map_status(state: &str, oom: Option<bool>, exit_code: Option<i64>) -> theme::Status` total mapping (Docker `dead`/exited-OOM/exited-nonzero → Crashed; exited(0)/created/removing/stopping/unknown → Stopped safe default; running/paused/restarting → direct). `from_bollard_summary(&bollard::models::ContainerSummary) -> ContainerSnapshot` is the SOLE function importing bollard container types (strips Docker's leading '/' on names; primary network = sorted-keys-first, "none" default).
+- 03-02: `src/docker/connect.rs` (NEW) — `connect_and_probe()` async, returns `Result<Docker, ProbeError>`. Builds via `connect_with_local_defaults`, probes with `version()` (full handshake/parse, single request). `ProbeError` 4 variants: SocketMissing (path + install hint) / PermissionDenied (path + "docker group" hint) / DaemonDown (path + "systemctl start docker" hint + raw detail) / Other (raw detail). Classifier matches bollard `SocketNotFoundError`/`IOError` directly + walks `Error::source()` chain looking for inner `io::Error` (handles bollard 0.21's hyper/hyper-util legacy wrapping); unknown io kinds and unclassified bollard errors fall back to DaemonDown with raw detail — NEVER panics, ALWAYS yields a non-empty actionable message (ROB-01 invariant pinned by test). `connect_and_probe` performs ZERO terminal I/O — caller (03-04) prints + exits on `Err` BEFORE `Tui::enter` (Pitfall 9).
+- 03-02: `mod.rs` uncomments `pub mod domain;` + `pub mod connect;` (the marked lines 03-01 left); re-exports `ContainerSnapshot/map_status/from_bollard_summary/connect_and_probe/ProbeError` on `crate::docker`. `mod docker;` is in main.rs (03-01's wiring); 03-02 did not touch main.rs.
+- 03-02: 25 new tests (11 domain + 14 connect); 77 → 102 tests. `cargo clippy --all-targets -- -D warnings` clean. `bollard::*` imports CONFINED to `src/docker/connect.rs` (`use bollard::Docker;` + `use bollard::errors::Error as B;` in classifier) and the fully-qualified `bollard::models::ContainerSummary` in the single `from_bollard_summary` fn in `src/docker/domain.rs`.
 
 **Phase 2 (Scene Pipeline):**
 - 02-01: LAYOUT RESOLVED (rack-grid vs network-floors) → network-grouped rack grid. Groups = contiguous Z-bands (Phase 4 ENT-01 floor-planes drop in as the band's plane); within a group boxes fill columns/X and shelves/Y. Network grouping is the first-class placement axis.
@@ -95,9 +100,10 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 3 next (Wave 1 continuation): 03-02 (`docker::domain` + `docker::connect`) — uncomments `pub mod domain;` and `pub mod connect;` in `src/docker/mod.rs` (the marked commented stubs); produces the bollard client + connection state machine + empty/permission/down domain states.
-- Phase 3 Wave 2: 03-03 (`docker::streams`) — uncomments `pub mod streams;`; maps bollard's `ContainerStatsResponse` onto `RawCpu`/`RawMem` and calls `crate::docker::normalize` per container; picks cgroup v1 `cache` vs v2 `inactive_file` per daemon.
-- Phase 3 Wave 3: 03-04 (renderer wire) — replaces `world::synthetic_scene()` output with live containers using the same `World/Entity` shape; `StatSample::load` feeds `world::entity::load_to_half_extent` directly.
+- Phase 3 Wave 2 (next): 03-03 (`docker::streams`) — uncomments `pub mod streams;`; subscribes `Docker::events()` for create/destroy/die and spawns per-running-container `Docker::stats(id, Some(StatsOptions { stream: true }))` streams; maps bollard's `ContainerStatsResponse` onto `RawCpu`/`RawMem` and calls `crate::docker::normalize` per container; uses `crate::docker::from_bollard_summary` to convert `list_containers` output into `ContainerSnapshot`; picks cgroup v1 `cache` vs v2 `inactive_file` per daemon. Reuses the `Docker` handle returned by `connect_and_probe()` (no reconnect).
+- Phase 3 Wave 3: 03-04 (renderer wire) — call `connect_and_probe()` in `main.rs::main` BEFORE `Tui::enter` (and before `run_kitty`); on `Err(e)` print `e.user_message()` (or `{e}`) to stderr and `std::process::exit(1)`. Replace `world::synthetic_scene()` output with live `Vec<ContainerSnapshot>` -> `Vec<Entity>` using the same `World/Entity` shape; `StatSample::load` feeds `world::entity::load_to_half_extent` directly; `ContainerSnapshot.group_key` becomes the layout's group axis (replacing the synthetic `id / GROUP_SIZE` derivation).
+- For 03-03 consideration: `from_bollard_summary` doesn't carry OOM/exit-code (ContainerSummary doesn't expose them), so `exited` from `list_containers` surfaces as `Stopped` not `Crashed`. Either (a) inspect each exited container for the precise OOM/exit signal, or (b) live with `Stopped` and let stream-fed crash events from `events()` upgrade the status. Documented in `from_bollard_summary` doc comment.
+- For Phase 4 planning: `ContainerSnapshot.group_key` is the canonical layout group axis. Decide whether `synthetic_scene` continues to invent group keys or feeds through the same `Vec<ContainerSnapshot>` shape.
 - Pre-existing fmt drift on the pre-phase-3 files (`src/world/scene.rs`, `src/app.rs`, etc.) — NOT touched by this plan; pick up in a separate `chore(fmt)` whenever.
 
 ### Blockers/Concerns
@@ -111,6 +117,6 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-05-28
-Stopped at: 03-01 COMPLETE (Wave 1 of Phase 3). docker stats normalizer (`src/docker/stats.rs`) is pure, NaN-safe, CPU%-delta + memory guarded, pinned by 13 unit tests. 03-02 was running in parallel against the same working tree.
+Stopped at: 03-02 COMPLETE (Wave 1 of Phase 3 DONE — both 03-01 and 03-02 landed). bollard 0.21 wired; daemon connect + classified probe + bollard-free ContainerSnapshot domain boundary in place. cargo build/test/clippy all clean; 102/102 tests pass.
 Resume file: None
-Resume note: 03-01 done. The CPU%-delta gotcha (PITFALLS Pitfall 1) is now CONTAINED in a single pure function (`crate::docker::normalize`) with every guard pinned by tests on synthetic before/after samples. The `load` field on `StatSample` is in `[0,1]` and feeds `world::entity::load_to_half_extent` UNCHANGED — once 03-03 maps bollard's `ContainerStatsResponse` onto `RawCpu`/`RawMem`, the renderer's box-size signal becomes guaranteed-finite for real containers. `src/docker/mod.rs` declares `pub mod stats;` LIVE and carries MARKED commented stubs for `domain` / `connect` / `streams` — 03-02/03-03 each uncomment exactly one line when their file lands (no mod.rs conflict). NOTE on parallel execution: while 03-01 was running its Task 2 verification, the parallel 03-02 agent had simultaneously uncommented `pub mod domain;` in mod.rs and dropped an untracked `src/docker/domain.rs` into the tree; this plan's commits deliberately do NOT include those changes so 03-02 can land its own atomic commit. Wave 1 continues with 03-02; Wave 2 = 03-03 (streams); Wave 3 = 03-04 (renderer wire). All Phase-1/Phase-2 invariants intact: 77/77 tests, clippy clean on `--tests -- -D warnings`, no bollard import inside stats.rs.
+Resume note: Wave 1 of Phase 3 COMPLETE. The Phase-3 data-layer foundation is in place: (1) the CPU%-delta gotcha (Pitfall 1) is CONTAINED in `crate::docker::normalize` (03-01); (2) bollard is connected via `crate::docker::connect_and_probe()` returning `Result<Docker, ProbeError>` (03-02) — the `Docker` handle is reused throughout, no reconnect; (3) the bollard isolation boundary (Anti-Pattern 4) is enforced — bollard imports are CONFINED to `src/docker/connect.rs` and the single `from_bollard_summary` fn in `src/docker/domain.rs`. ROB-01 / Pitfall 9 is satisfied: `ProbeError` has 4 actionable variants (SocketMissing / PermissionDenied / DaemonDown / Other), each Display message names the socket path and includes a remediation hint (install/run, `docker` group, `systemctl start docker`), and `connect_and_probe` performs ZERO terminal I/O so it's safe to call BEFORE `Tui::enter`. NEXT (Wave 2): 03-03 (streams) — subscribe `events()` + spawn per-running-container `stats()` streams, map `ContainerStatsResponse` -> `RawCpu`/`RawMem` and call `normalize`, use `from_bollard_summary` to map `list_containers` -> `ContainerSnapshot`. Reuses the `Docker` handle from `connect_and_probe`. THEN Wave 3: 03-04 (renderer wire) — call `connect_and_probe` in `main.rs` BEFORE `Tui::enter`, exit on Err with `e.user_message()` to stderr; replace `synthetic_scene()` with live `Vec<ContainerSnapshot>` and feed `StatSample::load` into `world::entity::load_to_half_extent`. bollard 0.21 type paths are PINNED in 03-02-SUMMARY.md so 03-03 doesn't re-discover them. Race-window note on Wave 1 parallelism: `src/docker/mod.rs` saw two non-conflicting one-line edits (one from each plan, both inside the marked commented-stub region) — the contract held. All Phase-1/Phase-2 invariants intact: 102/102 tests, clippy clean on `--all-targets -- -D warnings`, no bollard import outside `src/docker/`.
