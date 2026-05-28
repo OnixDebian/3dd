@@ -2,6 +2,7 @@ mod action;
 mod app;
 mod camera;
 mod config;
+mod docker;
 mod kitty;
 mod render3d;
 mod theme;
