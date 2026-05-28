@@ -29,7 +29,7 @@ use crate::render3d::{rotate_y_about, ViewParams};
 use crate::theme::Palette;
 use crate::world::entity::Entity;
 use crate::world::scene::{synthetic_scene, SceneBounds};
-use crate::world::DockerMsg;
+use crate::world::{DockerMsg, LiveWorld, World};
 
 /// Internal supersampling factor per axis for anti-aliasing. Real pixels, so this
 /// is plain box-filtered MSAA (no braille constraints).
@@ -342,28 +342,51 @@ pub fn supports_kitty_graphics() -> bool {
 }
 
 /// Live loop rendering real pixels via kitty graphics: a static-camera 3/4 view of
-/// the rack with each box spinning in place. Quits on q/Esc/Ctrl-C.
+/// the live container rack with each box spinning in place. Quits on q/Esc/Ctrl-C.
 ///
-/// `_docker_rx` carries typed [`DockerMsg`] values from `docker::streams`. Task 1
-/// only THREADS the receiver in; Task 3 swaps the synthetic seed for a LiveWorld
-/// reconciler driven by this channel. Until then it's accepted and ignored —
-/// `_` prefix silences the unused-warning.
-pub fn run_kitty(_docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
+/// `docker_rx` carries typed [`DockerMsg`] values from `docker::streams`. Each
+/// loop iteration we drain the channel non-blocking via `try_recv` (the
+/// `UnboundedReceiver` doesn't need a runtime for this), feed every message to
+/// the [`LiveWorld`] reconciler, and swap the local `world` binding on each
+/// rebuild. The render call (`render_rgba`) is byte-for-byte unchanged — only
+/// the data source flipped from `synthetic_scene()` to the live reconciler
+/// (DOCK-01/03/04). When no entities are alive we skip the image entirely and
+/// write a centered plain-text banner (criterion #5 — never a blank void).
+///
+/// SYNC path retained: bollard's producer task lives on the existing tokio
+/// runtime (from `main.rs`), feeds the channel, and we read from it here
+/// without needing our own runtime. The 33ms pacing + raw-mode lifecycle +
+/// quit-key handling are untouched.
+pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, cursor::Hide)?;
     write!(stdout, "\x1b[2J")?; // clear screen
     stdout.flush()?;
 
-    let world = synthetic_scene();
     let palette = Palette::default();
+    // Live reconciler + an initially empty World. The banner kicks in until
+    // the first `Added` from the producer lands; `render_rgba` is never called
+    // on an empty entity set.
+    let mut live = LiveWorld::new();
+    let mut world = World {
+        entities: Vec::new(),
+        bounds: SceneBounds::from_entities(&[]),
+    };
     let mut camera = Camera::new();
-    camera.frame_scene(&world); // frame the whole rack (frustum-safe radius)
     let mut last = Instant::now();
     let mut fps = 0.0f32;
     // Per-box self-spin angle, advanced by REAL dt (framerate-independent), since
     // the camera is now static and the motion is each box spinning in place.
     let mut spin = 0.0f32;
+    // Track the last seen entity count so we know when to re-frame the camera.
+    // Add/remove changes the rack radius; pure stat updates don't, so a Stat-
+    // only drain pass MUST NOT re-frame (avoids per-second view jitter).
+    let mut last_count: usize = 0;
+    // Track whether the previous frame painted an image (vs the empty banner)
+    // so we can clear the image surface exactly when transitioning empty ->
+    // non-empty (and vice versa) without flickering on every banner-only loop.
+    let mut last_was_empty = true;
 
     let result = (|| -> Result<()> {
         loop {
@@ -379,6 +402,28 @@ pub fn run_kitty(_docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
                         }
                     }
                 }
+            }
+
+            // Drain pending DockerMsgs non-blocking. `try_recv` on
+            // `UnboundedReceiver` doesn't require a tokio runtime — it just
+            // pops from the in-process queue. Cadence is fully decoupled from
+            // the 33ms render pacing (DOCK-04 / Pitfall 3). On
+            // Empty/Disconnected we just stop draining for this iteration.
+            let mut rebuilt = false;
+            while let Ok(msg) = docker_rx.try_recv() {
+                if let Some(w) = live.apply(msg) {
+                    world = w;
+                    rebuilt = true;
+                }
+            }
+            if rebuilt && world.entities.len() != last_count {
+                // Count changed (add or remove). Re-frame the camera so the
+                // new rack is fully in view; pure stat updates keep the
+                // existing framing intact.
+                if !world.entities.is_empty() {
+                    camera.frame_scene(&world);
+                }
+                last_count = world.entities.len();
             }
 
             // Terminal geometry: cells (cols/rows) for the status line + pixels for
@@ -404,17 +449,41 @@ pub fn run_kitty(_docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
             }
             camera.step(dt); // holds a fixed framing angle now (YAW_RATE == 0)
             spin = (spin + SPIN_RATE * dt).rem_euclid(std::f32::consts::TAU);
-            let view = camera.view_params(DEFAULT_FOV);
 
-            let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
-
-            delete_all(&mut stdout)?;
-            write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
-            emit_kitty(&mut stdout, &rgba, w, h)?;
+            if world.entities.is_empty() {
+                // Empty state: skip the image, write a centered banner. The
+                // image surface is cleared once on the empty->non-empty edge
+                // so a stale frame doesn't linger underneath.
+                if !last_was_empty {
+                    delete_all(&mut stdout)?;
+                    last_was_empty = true;
+                }
+                // Clear screen + place a centered banner. Use cell math (cols/
+                // rows) for centering since this is plain text, not pixels.
+                write!(stdout, "\x1b[2J\x1b[H")?;
+                let banner = crate::ui::EMPTY_BANNER;
+                let banner_col = if (cols as usize) > banner.len() {
+                    ((cols as usize - banner.len()) / 2 + 1) as u16
+                } else {
+                    1
+                };
+                let banner_row = (rows / 2).max(1);
+                write!(stdout, "\x1b[{banner_row};{banner_col}H{banner}")?;
+            } else {
+                let view = camera.view_params(DEFAULT_FOV);
+                let rgba =
+                    render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
+                delete_all(&mut stdout)?;
+                write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
+                emit_kitty(&mut stdout, &rgba, w, h)?;
+                last_was_empty = false;
+            }
             // Status bar on the reserved bottom row (mirrors the braille HUD).
+            // The box count is the live container count (or 0 in the empty state).
+            let boxes = world.entities.len();
             write!(
                 stdout,
-                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | kitty | q to quit"
+                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | boxes: {boxes} | kitty | q to quit"
             )?;
             stdout.flush()?;
 
