@@ -55,6 +55,25 @@ async fn main() -> Result<()> {
         return kitty::dump_rgba(path, 720, 560);
     }
 
+    // Mixed-status dump: like --dump-rgba, but the scene mimics a real-world
+    // mostly-stopped Docker rack (a few Running, many Stopped/Paused, spread
+    // across several network groups). Used to verify the wireframe path
+    // visually without needing a live daemon with that exact mix.
+    if let Some(pos) = args.iter().position(|a| a == "--dump-mixed") {
+        let path = args.get(pos + 1).map(String::as_str).unwrap_or("/tmp/dd3_mixed.rgba");
+        return kitty::dump_rgba_mixed(path, 720, 560);
+    }
+
+    // Real-snapshot dump: shells out to `docker ps -a`, builds a scene using
+    // the user's ACTUAL container names + networks + states (same layout
+    // pipeline as the live render), then forces every other container to
+    // Running with a synthetic load — so the test frame shows a realistic
+    // mixed solid/wireframe rack. Read-only: never starts/stops anything.
+    if let Some(pos) = args.iter().position(|a| a == "--dump-snapshot") {
+        let path = args.get(pos + 1).map(String::as_str).unwrap_or("/tmp/dd3_snapshot.rgba");
+        return kitty::dump_snapshot(path, 720, 560);
+    }
+
     // ROB-01 / PITFALLS Pitfall 9: probe the Docker daemon BEFORE entering raw
     // mode (Tui::enter for braille, enable_raw_mode inside run_kitty for kitty).
     // On failure we print the actionable ProbeError to a CLEAN terminal and
