@@ -19,6 +19,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{cursor, execute};
 use glam::Vec3;
 use ratatui::style::Color;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
@@ -28,6 +29,7 @@ use crate::render3d::{rotate_y_about, ViewParams};
 use crate::theme::Palette;
 use crate::world::entity::Entity;
 use crate::world::scene::{synthetic_scene, SceneBounds};
+use crate::world::DockerMsg;
 
 /// Internal supersampling factor per axis for anti-aliasing. Real pixels, so this
 /// is plain box-filtered MSAA (no braille constraints).
@@ -341,7 +343,12 @@ pub fn supports_kitty_graphics() -> bool {
 
 /// Live loop rendering real pixels via kitty graphics: a static-camera 3/4 view of
 /// the rack with each box spinning in place. Quits on q/Esc/Ctrl-C.
-pub fn run_kitty() -> Result<()> {
+///
+/// `_docker_rx` carries typed [`DockerMsg`] values from `docker::streams`. Task 1
+/// only THREADS the receiver in; Task 3 swaps the synthetic seed for a LiveWorld
+/// reconciler driven by this channel. Until then it's accepted and ignored —
+/// `_` prefix silences the unused-warning.
+pub fn run_kitty(_docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, cursor::Hide)?;

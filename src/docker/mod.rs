@@ -21,10 +21,10 @@
 //! commented `pub mod` lines below tell them which line to uncomment, never
 //! editing the structure of this file).
 
-// Phase-3 surface is consumed by the renderer wiring (03-04) and Phase 4 — the
-// items are intentionally public before their first call site lands. The
-// re-exports below are part of that forward-facing API and will be wired in
-// by 03-04 / Phase 4; silence the warning until then.
+// Phase-3 surface — most items are now wired through main.rs (03-04). A few
+// helpers (RawCpu/RawMem/map_status/from_bollard_summary) are still only used
+// inside the docker layer; keep dead_code/unused_imports allowed at module
+// scope rather than scattered attributes on each re-export.
 #![allow(dead_code)]
 #![allow(unused_imports)]
 

@@ -8,13 +8,14 @@
 use std::time::Instant;
 
 use color_eyre::Result;
+use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::action::Action;
 use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::tui::{Event, Tui};
 use crate::ui;
-use crate::world::{self, World};
+use crate::world::{self, DockerMsg, World};
 
 /// All application state. Mutated only by the main loop.
 pub struct App {
@@ -43,10 +44,16 @@ pub struct App {
     /// braille UI renders. Built once at construction (static this phase); the
     /// camera is framed to its bounds so the whole rack fills the frame.
     pub world: World,
+    /// Non-blocking receiver for typed DockerMsg events from the producer task
+    /// in `docker::streams`. `None` for the test/dump constructor (`App::new`)
+    /// so unit tests don't need a producer. The drain wiring (Task 2) reads
+    /// from this once per outer loop iteration.
+    #[allow(dead_code)]
+    docker_rx: Option<UnboundedReceiver<DockerMsg>>,
 }
 
 impl App {
-    /// Construct fresh app state.
+    /// Construct fresh app state for tests / the offline dump path.
     pub fn new() -> Self {
         let now = Instant::now();
         // Build the synthetic scene once (static this phase) and frame the orbit
@@ -67,7 +74,17 @@ impl App {
             spin: 0.0,
             render_config: RenderConfig::default(),
             world,
+            docker_rx: None,
         }
+    }
+
+    /// Construct fresh app state for the live binary, holding the Docker
+    /// receiver. The world is still seeded from `synthetic_scene()` for this
+    /// task — Task 2 swaps that for an empty start + LiveWorld reconciliation.
+    pub fn with_docker_rx(rx: UnboundedReceiver<DockerMsg>) -> Self {
+        let mut s = Self::new();
+        s.docker_rx = Some(rx);
+        s
     }
 
     /// Dispatch a high-level intent to a state mutation.
