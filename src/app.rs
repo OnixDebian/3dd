@@ -256,6 +256,7 @@ mod tests {
             name: id.to_string(),
             status: Status::Running,
             group_key: "net0".to_string(),
+            ..ContainerSnapshot::default()
         }
     }
 

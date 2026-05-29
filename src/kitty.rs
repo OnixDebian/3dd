@@ -716,6 +716,7 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
             name: name.clone(),
             status: map_status(state, None, None),
             group_key,
+            ..ContainerSnapshot::default()
         };
         if let Some(w) = live.apply(DockerMsg::Added(snap)) {
             latest = Some(w);

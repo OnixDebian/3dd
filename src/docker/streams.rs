@@ -190,6 +190,7 @@ async fn run_events_loop(
                     name: container_name_from_event(&evt, id),
                     status: map_status("created", None, None),
                     group_key: "none".to_string(),
+                    ..crate::docker::ContainerSnapshot::default()
                 };
                 send(DockerMsg::Added(snap))
             }
