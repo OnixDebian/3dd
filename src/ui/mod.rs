@@ -54,6 +54,8 @@ pub fn view(frame: &mut Frame, app: &App) {
             &palette,
             &app.render_config,
             app.spin,
+            app.selection.selected_id,
+            app.selection.pulse_phase,
         );
     }
 

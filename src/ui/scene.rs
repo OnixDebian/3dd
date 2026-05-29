@@ -51,6 +51,13 @@ struct SceneShape {
     /// Current per-box self-spin angle (radians), owned by the app and advanced
     /// on the logic tick. The camera is static; this is the scene's motion.
     spin: f32,
+    /// Entity id of the Tab-cycled selection (04-03 / CAM-04), or `None`.
+    /// Copy primitive so the `Fn` closure on `Canvas::paint` stays compatible
+    /// with the shape's `Sync` bound (no `&Selection` lifetime inside).
+    selected_id: Option<u32>,
+    /// `[0, 1)` brightness-pulse phase; the rasterizer applies
+    /// `1 + 0.18 * sin(phase * TAU)` to the selected entity's RGB.
+    selection_pulse_phase: f32,
 }
 
 impl Shape for SceneShape {
@@ -70,6 +77,8 @@ impl Shape for SceneShape {
             &self.palette,
             &self.config,
             self.spin,
+            self.selected_id,
+            self.selection_pulse_phase,
         );
 
         // Blit: framebuffer top-left (x, y) maps to braille dot (x, y) with NO
@@ -97,6 +106,7 @@ impl Shape for SceneShape {
 ///
 /// `world` is the app-owned [`World`] — the single source of truth (the 02-02
 /// UI-layer `synthetic_scene()` temporary is gone).
+#[allow(clippy::too_many_arguments)]
 pub fn render_scene(
     frame: &mut Frame,
     area: ratatui::layout::Rect,
@@ -105,6 +115,8 @@ pub fn render_scene(
     palette: &Palette,
     config: &RenderConfig,
     spin: f32,
+    selected_id: Option<u32>,
+    selection_pulse_phase: f32,
 ) {
     let block = Block::default().title("scene").borders(Borders::ALL);
 
@@ -120,6 +132,8 @@ pub fn render_scene(
         palette: *palette,
         config: *config,
         spin,
+        selected_id,
+        selection_pulse_phase,
     };
 
     let canvas = Canvas::default()

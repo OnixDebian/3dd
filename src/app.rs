@@ -389,4 +389,80 @@ mod tests {
         assert!(app.world.bounds.center.x.is_finite());
         assert!(app.world.bounds.radius.is_finite());
     }
+
+    /// App::update dispatches Action::SelectNext through apply_input_action and
+    /// the Selection moves to the lowest-id entity in the world.
+    #[test]
+    fn app_update_dispatches_select_next_changes_selection() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        tx.send(DockerMsg::Added(snap("a"))).unwrap();
+        tx.send(DockerMsg::Added(snap("b"))).unwrap();
+        app.drain_docker();
+        assert!(app.selection.selected_id.is_none());
+
+        app.update(Action::SelectNext);
+        // First slot in group net0 has entity id 0 (0 << 16 | 0).
+        assert_eq!(app.selection.selected_id, Some(0));
+    }
+
+    /// First camera-key dispatch flips autopilot to manual.
+    #[test]
+    fn app_update_nudge_yaw_flips_autopilot_off() {
+        let app_init = App::new();
+        assert!(app_init.camera.autopilot_active);
+        let mut app = app_init;
+        app.update(Action::NudgeYaw(0.1));
+        assert!(
+            !app.camera.autopilot_active,
+            "first camera-key Action must flip autopilot off"
+        );
+    }
+
+    /// Removing the selected container moves the selection to the next live
+    /// entity via Selection::reconcile (called inside drain_docker on count
+    /// change).
+    #[test]
+    fn app_drain_docker_runs_reconcile_on_count_change() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        tx.send(DockerMsg::Added(snap("a"))).unwrap();
+        tx.send(DockerMsg::Added(snap("b"))).unwrap();
+        app.drain_docker();
+        // Select the FIRST container (entity id 0).
+        app.update(Action::SelectNext);
+        assert_eq!(app.selection.selected_id, Some(0));
+
+        // Removing "a" empties slot 0 — entity id 0 disappears; reconcile
+        // moves the selection to whatever entity is first in the rebuilt
+        // World (which is now b at slot 1, entity id 1).
+        tx.send(DockerMsg::Removed("a".to_string())).unwrap();
+        app.drain_docker();
+        assert_eq!(
+            app.selection.selected_id,
+            Some(1),
+            "selection must reconcile to the surviving entity (b at slot 1)"
+        );
+    }
+
+    /// Effect::Quit path is observable through update().
+    #[test]
+    fn app_update_quit_sets_should_quit() {
+        let mut app = App::new();
+        assert!(!app.should_quit);
+        app.update(Action::Quit);
+        assert!(app.should_quit, "Action::Quit must set should_quit via Effect");
+    }
+
+    /// Esc with no panel open quits via the Effect::Quit branch.
+    #[test]
+    fn app_update_esc_with_no_panel_quits() {
+        let mut app = App::new();
+        assert!(!app.selection.detail_open);
+        app.update(Action::CloseDetail);
+        assert!(
+            app.should_quit,
+            "Esc with no panel must surface Effect::Quit through update()"
+        );
+    }
 }

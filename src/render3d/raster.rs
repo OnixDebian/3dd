@@ -109,6 +109,7 @@ pub fn render(
                 normal: face.normal,
                 distance: to_eye.length(),
                 base,
+                pulse_mult: 1.0,
             })
         })
         .collect();
@@ -157,6 +158,7 @@ pub fn render(
 /// box spinning in place: every box's 8 world vertices AND its face normals are
 /// rotated about that box's center by `spin` before culling/projecting. Rotating
 /// a rigid box keeps it convex, so the cross-box painter's sort is still correct.
+#[allow(clippy::too_many_arguments)]
 pub fn render_scene(
     entities: &[Entity],
     view: ViewParams,
@@ -164,6 +166,8 @@ pub fn render_scene(
     palette: &Palette,
     config: &RenderConfig,
     spin: f32,
+    selected_id: Option<u32>,
+    selection_pulse_phase: f32,
 ) -> Framebuffer {
     let (w, h) = viewport;
     let (hw, hh) = (w * SS, h * SS);
@@ -192,6 +196,18 @@ pub fn render_scene(
     // is "transparent"). Sort by distance and draw back-to-front: a near
     // SOLID face overwrites the wireframe edges behind it (occluded), and a
     // near wireframe's edges overwrite faces behind it (drawn on top).
+    // Per-entity brightness pulse for the Tab-selected box (04-03 / CAM-04).
+    // Computed once per entity (constant across its faces); the renderer
+    // multiplies it into the resolved color and clamps to [0, 255].
+    let pulse_mult_for = |entity_id: u32| -> f32 {
+        if Some(entity_id) == selected_id {
+            const AMPLITUDE: f32 = 0.18;
+            1.0 + AMPLITUDE * (selection_pulse_phase * std::f32::consts::TAU).sin()
+        } else {
+            1.0
+        }
+    };
+
     let mut fragments: Vec<Fragment> = Vec::new();
     for entity in entities {
         let scale = entity.half_extents * 2.0;
@@ -200,6 +216,7 @@ pub fn render_scene(
             let placed = entity.position + v * scale;
             *slot = rotate_y_about(placed, entity.position, spin);
         }
+        let pulse_mult = pulse_mult_for(entity.id);
 
         if entity.status.is_solid() {
             // SOLID PATH: cull back-faces, push the visible faces as fragments.
@@ -222,6 +239,7 @@ pub fn render_scene(
                     normal,
                     distance: to_eye.length(),
                     base,
+                    pulse_mult,
                 }));
             }
         } else {
@@ -236,6 +254,7 @@ pub fn render_scene(
                     a,
                     b,
                     distance: (view.eye - midpoint).length(),
+                    pulse_mult,
                 }));
             }
         }
@@ -280,6 +299,9 @@ struct RenderEdge {
     a: Vec3,
     b: Vec3,
     distance: f32,
+    /// Brightness multiplier for the Tab-selection pulse (1.0 for unselected,
+    /// `1 + 0.18 * sin(pulse_phase * TAU)` for the selected entity).
+    pulse_mult: f32,
 }
 
 /// One drawable fragment in the cross-box painter's pool. A solid box pushes
@@ -343,14 +365,39 @@ fn shade_and_fill_fragments(
                 let fog = fog_factor(rf.distance, near_d, far_d);
                 let shaded = theme::dim(rf.base, orient);
                 let color = palette.fog(shaded, fog);
+                // Apply the selection brightness pulse (04-03 / CAM-04): a
+                // small ±18% RGB swing on the selected entity, no-op on
+                // others. Clamped to [0,255].
+                let color = scale_brightness(color, rf.pulse_mult);
                 fill_face(hi, projector, &rf.verts, color);
             }
             Fragment::Edge(re) => {
                 let fog = fog_factor(re.distance, near_d, far_d);
                 let color = palette.fog(palette.edge, fog);
+                let color = scale_brightness(color, re.pulse_mult);
                 fill_edge(hi, projector, re.a, re.b, color);
             }
         }
+    }
+}
+
+/// Scale an RGB color's brightness by `mult`, clamped per-channel to `[0, 255]`.
+/// Non-RGB colors pass through unchanged (the palette resolves everything to
+/// `Color::Rgb` in this crate). `mult` near 1.0 leaves the color visually
+/// untouched; the selection-pulse amplitude (0.18) keeps the swing readable
+/// without ever saturating to white.
+fn scale_brightness(color: Color, mult: f32) -> Color {
+    if (mult - 1.0).abs() < 1e-6 {
+        return color;
+    }
+    if let Color::Rgb(r, g, b) = color {
+        let m = mult.max(0.0);
+        let r = ((r as f32 * m).round()).clamp(0.0, 255.0) as u8;
+        let g = ((g as f32 * m).round()).clamp(0.0, 255.0) as u8;
+        let b = ((b as f32 * m).round()).clamp(0.0, 255.0) as u8;
+        Color::Rgb(r, g, b)
+    } else {
+        color
     }
 }
 
@@ -499,6 +546,10 @@ struct RenderFace {
     normal: Vec3,
     distance: f32,
     base: Color,
+    /// Brightness multiplier for the Tab-selection pulse (1.0 for unselected,
+    /// `1 + 0.18 * sin(pulse_phase * TAU)` for the selected entity). Defaults
+    /// to 1.0 in the legacy single-cube `render` path (no selection there).
+    pulse_mult: f32,
 }
 
 /// Min/max camera distance across the visible faces (the fog range).
@@ -743,9 +794,9 @@ mod tests {
         let v = [Vec3::ZERO; 4];
         let base = Palette::default().status_color(Status::Running);
         let mut faces = [
-            RenderFace { verts: v, normal: Vec3::Z, distance: 1.0, base },
-            RenderFace { verts: v, normal: Vec3::Z, distance: 5.0, base },
-            RenderFace { verts: v, normal: Vec3::Z, distance: 3.0, base },
+            RenderFace { verts: v, normal: Vec3::Z, distance: 1.0, base, pulse_mult: 1.0 },
+            RenderFace { verts: v, normal: Vec3::Z, distance: 5.0, base, pulse_mult: 1.0 },
+            RenderFace { verts: v, normal: Vec3::Z, distance: 3.0, base, pulse_mult: 1.0 },
         ];
         faces.sort_unstable_by(|a, b| {
             b.distance
@@ -865,7 +916,7 @@ mod tests {
         let far = entity_at(1, Vec3::new(0.0, 0.0, -2.0), 0.6, Status::Crashed);
         let entities = [near, far];
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -908,7 +959,7 @@ mod tests {
         let near = entity_at(id, Vec3::new(0.0, 0.0, 2.0), 0.6, Status::Running);
         entities.push(near);
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -930,7 +981,7 @@ mod tests {
         let b = entity_at(1, Vec3::new(2.0, 0.0, 0.0), 0.6, Status::Crashed);
         let entities = [a, b];
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
 
         let distinct: std::collections::HashSet<_> =
             fb.lit_pixels().map(|(_, _, c)| c).collect();
@@ -945,7 +996,7 @@ mod tests {
     fn render_scene_empty_is_all_unlit_and_does_not_panic() {
         let pal = Palette::default();
         let cfg = RenderConfig::default();
-        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg, 0.0);
+        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
         assert_eq!(fb.lit_pixels().count(), 0, "empty scene must be all unlit");
     }
 
@@ -962,7 +1013,7 @@ mod tests {
             up: Vec3::Y,
             fov: std::f32::consts::FRAC_PI_3,
         };
-        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg, 0.0);
+        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
         assert!(
             fb.lit_pixels().count() > 50,
             "off-center box should rasterize a solid footprint when framed, got {}",

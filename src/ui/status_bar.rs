@@ -11,8 +11,9 @@ use crate::app::App;
 /// Render the status bar into `area`.
 pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let (w, h) = app.size;
+    let mode = if app.camera.autopilot_active { "auto" } else { "manual" };
     let text = format!(
-        "3dd | fps: {:.0} | size: {}x{} | boxes: {} | q to quit",
+        "3dd | fps: {:.0} | size: {}x{} | boxes: {} | mode: {mode} | arrows orbit, Tab select, q to quit",
         app.fps,
         w,
         h,
