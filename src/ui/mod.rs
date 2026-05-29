@@ -22,8 +22,11 @@ use crate::app::App;
 /// the kitty backend can mirror the exact same string (criterion #5).
 pub const EMPTY_BANNER: &str = "No containers running — start one and it'll appear here.";
 
-/// Render the whole UI for one frame. Synchronous, read-only on `App`.
-pub fn view(frame: &mut Frame, app: &App) {
+/// Render the whole UI for one frame. Synchronous; takes `&mut App` so the
+/// label hysteresis state (`Selection::last_label_cell`) can be mutated AT
+/// the snap-and-decide step BEFORE the `Canvas::paint` closure is built (the
+/// closure itself is `Fn`-bound and only sees Copy primitives).
+pub fn view(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
 
     // Vertical split: scene fills the screen above a 1-row status bar.
@@ -47,16 +50,20 @@ pub fn view(frame: &mut Frame, app: &App) {
         // to the scene on entity-count changes by `App::run`) feeds
         // render_scene a ViewParams. The app owns the World — the single
         // source of truth.
+        //
+        // 04-04: render_scene also reads `live` + `&mut selection` for the
+        // floor-plane palette decision, the per-entity port lookup, and the
+        // selected-only label's hysteresis update.
         scene::render_scene(
             frame,
             scene_area,
             &app.camera,
             &app.world,
+            &app.live,
+            &mut app.selection,
             &palette,
             &app.render_config,
             app.spin,
-            app.selection.selected_id,
-            app.selection.pulse_phase,
         );
     }
 

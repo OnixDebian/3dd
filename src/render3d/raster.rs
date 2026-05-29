@@ -24,7 +24,9 @@ use ratatui::style::Color;
 use crate::config::RenderConfig;
 use crate::render3d::cube::{unit_cube, Cube, CUBE_EDGES};
 use crate::render3d::framebuffer::Framebuffer;
+use crate::render3d::plane::rasterize_floor_plane;
 use crate::render3d::project::Projector;
+use crate::render3d::scene_extras::SceneExtras;
 use crate::render3d::{rotate_y_about, ViewParams};
 use crate::theme::{self, Palette, Status};
 use crate::world::entity::Entity;
@@ -168,6 +170,7 @@ pub fn render_scene(
     spin: f32,
     selected_id: Option<u32>,
     selection_pulse_phase: f32,
+    extras: &SceneExtras<'_>,
 ) -> Framebuffer {
     let (w, h) = viewport;
     let (hw, hh) = (w * SS, h * SS);
@@ -184,6 +187,16 @@ pub fn render_scene(
         (hw as u32, hh as u32),
         &proj_config,
     );
+
+    // ENT-01 (04-04): network floor-planes go DOWN FIRST. They sit at fixed
+    // y below the box floor, so cube fragments coming via the painter's sort
+    // overwrite them where their projected footprints overlap on screen (a
+    // floor edge under a near box is correctly hidden). Drawing into the
+    // same SS framebuffer means the resolve_supersampled pass downsamples
+    // floor + cubes together, keeping the visual weight consistent.
+    for floor in extras.floors {
+        rasterize_floor_plane(&mut hi, &projector, floor.center, floor.half_size_xz, floor.color);
+    }
 
     // The shared unit-cube topology (indices + outward normals); each entity
     // materializes its OWN 8 world verts from these.
@@ -260,10 +273,6 @@ pub fn render_scene(
         }
     }
 
-    if fragments.is_empty() {
-        return Framebuffer::new(w, h);
-    }
-
     // CROSS-BOX PAINTER'S SORT: sort the combined pool farthest-first, so near
     // fragments draw LAST and overwrite far ones (correct depth ordering for
     // mixed solid/wireframe — both contribute to the same sort).
@@ -273,21 +282,101 @@ pub fn render_scene(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // Scene-wide fog range across ALL fragments (faces AND edges) so the depth
-    // cue is consistent: a far wireframe fogs out the same way a far face does.
-    let (near_d, far_d) = fragment_distance_range(&fragments);
+    if !fragments.is_empty() {
+        // Scene-wide fog range across ALL fragments (faces AND edges) so the
+        // depth cue is consistent: a far wireframe fogs out the same way a
+        // far face does.
+        let (near_d, far_d) = fragment_distance_range(&fragments);
+        let to_eye_dir = (view.eye - view.target).normalize_or_zero();
+        shade_and_fill_fragments(
+            &mut hi,
+            &projector,
+            &fragments,
+            to_eye_dir,
+            near_d,
+            far_d,
+            palette,
+        );
+    }
 
-    let to_eye_dir = (view.eye - view.target).normalize_or_zero();
+    // ENT-02 (04-04): port glow pass. Goes AFTER cubes so the bright dots sit
+    // ON TOP of the front face (overwriting the cube fill where the dot lands).
+    // Emissive: no fog, no Lambert — the dot's color is the palette indigo
+    // glow at full brightness regardless of distance or orientation.
+    let glow_color = palette.status_color(Status::Running);
+    let port_face_axes = [
+        (Vec3::Z, Vec3::X, Vec3::Y),     // +Z face (front), tie-break #1
+        (Vec3::X, Vec3::NEG_Z, Vec3::Y), // +X face (right), tie-break #2
+        (Vec3::NEG_Z, Vec3::NEG_X, Vec3::Y), // -Z face (back), tie-break #3
+        (Vec3::NEG_X, Vec3::Z, Vec3::Y), // -X face (left), tie-break #4
+    ];
+    for entity in entities {
+        let Some(ports) = extras.ports.get(&entity.id) else {
+            continue;
+        };
+        if ports.is_empty() {
+            continue;
+        }
+        // Pick camera-facing vertical face. Walk in tie-break order and keep
+        // the one whose SPUN normal has the largest positive dot with
+        // (eye - entity.center). Deterministic — equal-dot ties resolve to
+        // the earlier axis (+Z first).
+        let to_eye = view.eye - entity.position;
+        let mut best: Option<(usize, f32)> = None;
+        for (i, (n, _, _)) in port_face_axes.iter().enumerate() {
+            let spun_n = rotate_y_about(*n, Vec3::ZERO, spin);
+            let d = spun_n.dot(to_eye);
+            if d <= 0.0 {
+                continue; // back-facing
+            }
+            best = match best {
+                None => Some((i, d)),
+                Some((_, prev_d)) if d > prev_d => Some((i, d)),
+                _ => best,
+            };
+        }
+        let Some((face_idx, _)) = best else { continue };
+        let (normal, u_axis_local, v_axis_local) = port_face_axes[face_idx];
+        // Spin the face's local axes into world.
+        let spun_n = rotate_y_about(normal, Vec3::ZERO, spin);
+        let spun_u = rotate_y_about(u_axis_local, Vec3::ZERO, spin);
+        let spun_v = v_axis_local; // +Y is invariant under Y rotation
 
-    shade_and_fill_fragments(
-        &mut hi,
-        &projector,
-        &fragments,
-        to_eye_dir,
-        near_d,
-        far_d,
-        palette,
-    );
+        let h_u = match normal {
+            v if v.x.abs() > 0.5 => entity.half_extents.z, // ±X face: u runs along Z
+            _ => entity.half_extents.x,                    // ±Z face: u runs along X
+        };
+        let h_v = entity.half_extents.y;
+        // Slight outward push so the dot sits ON the face, not embedded in it.
+        const FACE_EPS: f32 = 1e-3;
+        let h_n = match normal {
+            v if v.x.abs() > 0.5 => entity.half_extents.x,
+            _ => entity.half_extents.z,
+        };
+        let face_center = entity.position + spun_n * (h_n + FACE_EPS);
+
+        // Emissive quad half-size, scaled with the box so big boxes get
+        // proportionally bigger dots (still much smaller than a face).
+        let dot_half = 0.08 * h_u.min(h_v).max(0.05);
+
+        for (i, _port) in ports.iter().take(9).enumerate() {
+            let col = (i % 3) as f32;
+            let row = (i / 3) as f32;
+            // UV in {0.25, 0.5, 0.75} -> face-local offset in {-0.5, 0, +0.5}.
+            let u_off = ((col + 1.0) / 4.0 - 0.5) * 2.0;
+            let v_off = ((row + 1.0) / 4.0 - 0.5) * 2.0;
+            let port_pos = face_center + spun_u * (u_off * h_u) + spun_v * (v_off * h_v);
+            // Build a small quad in the face plane (u/v axes) at the port.
+            let verts = [
+                port_pos - spun_u * dot_half - spun_v * dot_half,
+                port_pos + spun_u * dot_half - spun_v * dot_half,
+                port_pos + spun_u * dot_half + spun_v * dot_half,
+                port_pos - spun_u * dot_half + spun_v * dot_half,
+            ];
+            // Emissive: write the bright glow color directly, no shade/fog.
+            fill_face(&mut hi, &projector, &verts, glow_color);
+        }
+    }
 
     resolve_supersampled(&hi, w, h)
 }
@@ -686,6 +775,16 @@ mod tests {
         fb.lit_pixels().collect()
     }
 
+    /// Empty SceneExtras factory: borrows of empty slices/maps. The cube tests
+    /// don't exercise floor-planes or port glow — those have their own focused
+    /// suites in `render3d::plane` and the per-backend visual gates.
+    fn empty_extras<'a>(
+        floors: &'a [crate::render3d::scene_extras::FloorPlane],
+        ports: &'a crate::render3d::scene_extras::PortLookup<'a>,
+    ) -> SceneExtras<'a> {
+        SceneExtras::new(floors, ports)
+    }
+
     #[test]
     fn renders_nontrivial_pixels_near_center() {
         let cube = unit_cube();
@@ -923,7 +1022,10 @@ mod tests {
         let far = entity_at(1, Vec3::new(0.0, 0.0, -2.0), 0.6, Status::Crashed);
         let entities = [near, far];
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports: crate::render3d::scene_extras::PortLookup = Default::default();
+        let extras = empty_extras(&floors, &ports);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -966,7 +1068,10 @@ mod tests {
         let near = entity_at(id, Vec3::new(0.0, 0.0, 2.0), 0.6, Status::Running);
         entities.push(near);
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports: crate::render3d::scene_extras::PortLookup = Default::default();
+        let extras = empty_extras(&floors, &ports);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -988,7 +1093,10 @@ mod tests {
         let b = entity_at(1, Vec3::new(2.0, 0.0, 0.0), 0.6, Status::Crashed);
         let entities = [a, b];
 
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports: crate::render3d::scene_extras::PortLookup = Default::default();
+        let extras = empty_extras(&floors, &ports);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
 
         let distinct: std::collections::HashSet<_> =
             fb.lit_pixels().map(|(_, _, c)| c).collect();
@@ -1003,7 +1111,10 @@ mod tests {
     fn render_scene_empty_is_all_unlit_and_does_not_panic() {
         let pal = Palette::default();
         let cfg = RenderConfig::default();
-        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports: crate::render3d::scene_extras::PortLookup = Default::default();
+        let extras = empty_extras(&floors, &ports);
+        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
         assert_eq!(fb.lit_pixels().count(), 0, "empty scene must be all unlit");
     }
 
@@ -1020,7 +1131,10 @@ mod tests {
             up: Vec3::Y,
             fov: std::f32::consts::FRAC_PI_3,
         };
-        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg, 0.0, None, 0.0);
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports: crate::render3d::scene_extras::PortLookup = Default::default();
+        let extras = empty_extras(&floors, &ports);
+        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
         assert!(
             fb.lit_pixels().count() > 50,
             "off-center box should rasterize a solid footprint when framed, got {}",

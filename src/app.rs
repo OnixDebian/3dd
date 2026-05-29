@@ -64,7 +64,7 @@ pub struct App {
     pub world: World,
     /// Live reconciler that turns DockerMsg into the World shape the renderer
     /// already consumes. Owns the stable per-id slot scheme (CONT-05).
-    live: LiveWorld,
+    pub(crate) live: LiveWorld,
     /// Tab-cycle selection + brightness pulse + detail-panel toggle (04-03).
     /// Mutated by `update()` (via `apply_input_action`) and by
     /// `on_tick`/`drain_docker` (pulse advance + reconcile-on-remove).
