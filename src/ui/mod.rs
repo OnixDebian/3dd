@@ -6,6 +6,7 @@
 //! a centered plain-text "no containers" banner (so an idle Docker host doesn't
 //! render a blank void, per Phase 3 criterion #5).
 
+pub mod labels;
 pub mod scene;
 pub mod status_bar;
 

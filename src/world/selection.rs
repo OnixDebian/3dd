@@ -48,8 +48,14 @@ const AMPLITUDE: f32 = 0.18;
 pub struct Selection {
     /// Selected entity id (`group << 16 | index_in_group`), or None.
     pub selected_id: Option<u32>,
-    /// Last drawn label anchor in CELL coordinates (04-04 hysteresis).
+    /// Last drawn label anchor in BRAILLE CELL coordinates (04-04 hysteresis).
+    /// Braille uses `(dot_x / 2, dot_y / 4)` quantization.
     pub last_label_cell: Option<(i16, i16)>,
+    /// Last drawn label anchor in KITTY CELL coordinates (04-04 hysteresis).
+    /// Kitty cells are in PIXEL units (cell_w × cell_h from terminal metrics);
+    /// the two cell systems disagree (RESEARCH Open Question #4: per-backend
+    /// state in v1), so each backend keeps its own hysteresis cache.
+    pub last_label_cell_kitty: Option<(i16, i16)>,
     /// Brightness-pulse phase in `[0, 1)`, advanced per-frame by [`Selection::tick`].
     pub pulse_phase: f32,
     /// Detail panel open flag (CAM-05). Toggled by Enter (open) / Esc (close).
@@ -79,6 +85,7 @@ impl Selection {
             self.selected_id = None;
             self.detail_open = false;
             self.last_label_cell = None;
+            self.last_label_cell_kitty = None;
             return;
         }
         let mut ids: Vec<u32> = world.entities.iter().map(|e| e.id).collect();
@@ -91,6 +98,7 @@ impl Selection {
             },
         });
         self.last_label_cell = None;
+        self.last_label_cell_kitty = None;
     }
 
     /// Cycle the selection backward through ids-ascending. From None lands on
@@ -100,6 +108,7 @@ impl Selection {
             self.selected_id = None;
             self.detail_open = false;
             self.last_label_cell = None;
+            self.last_label_cell_kitty = None;
             return;
         }
         let mut ids: Vec<u32> = world.entities.iter().map(|e| e.id).collect();
@@ -112,6 +121,7 @@ impl Selection {
             },
         });
         self.last_label_cell = None;
+        self.last_label_cell_kitty = None;
     }
 
     /// Drop a stale selection if the world no longer contains it.
@@ -126,6 +136,7 @@ impl Selection {
             self.selected_id = world.entities.first().map(|e| e.id);
             self.detail_open = false;
             self.last_label_cell = None;
+            self.last_label_cell_kitty = None;
         }
     }
 
