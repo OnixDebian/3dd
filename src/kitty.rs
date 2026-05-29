@@ -230,7 +230,11 @@ pub fn render_rgba(
     // the picked face, so its NDC z is fractionally smaller than the face
     // it sits on; the shared z-buffer keeps it from being eaten by the
     // cube fill that just landed there.
-    let glow_rgb = to_rgb(palette.status_color(Status::Running));
+    //
+    // Color = palette.glow (bright indigo) — deliberately DIFFERENT from the
+    // Running face color (light green) so the port dot reads as a port and
+    // doesn't blend invisibly into the cube it sits on.
+    let glow_rgb = to_rgb(palette.glow);
     let port_face_axes: [(Vec3, Vec3, Vec3); 4] = [
         (Vec3::Z, Vec3::X, Vec3::Y),         // +Z front (tie-break #1)
         (Vec3::X, Vec3::NEG_Z, Vec3::Y),     // +X right
@@ -277,7 +281,11 @@ pub fn render_rgba(
         };
         const FACE_EPS: f32 = 1e-3;
         let face_center = entity.position + spun_n * (h_n + FACE_EPS);
-        let dot_half = 0.08 * h_u.min(h_v).max(0.05);
+        // Dot half-size: 18% of the box face's shorter axis with a 0.10
+        // world-unit floor so the glow remains readable on idle MIN_HALF
+        // (0.3) boxes (matches the braille formula in render3d::raster).
+        let face_min = h_u.min(h_v);
+        let dot_half = (0.18 * face_min).max(0.10);
         for (i, _port) in ports.iter().take(9).enumerate() {
             let col = (i % 3) as f32;
             let row = (i / 3) as f32;
@@ -1087,6 +1095,11 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
     // 0.8] across the forced set so the solid boxes also have varied sizes
     // (avoids a "row of identical cubes" look). Uses StatusChanged + Stat,
     // the same path the live event stream would drive.
+    //
+    // Every other forced container also gets a synthetic Enriched message
+    // carrying 1-3 fake ports, so the offline dump exercises the ENT-02
+    // port glow path the same way the live `from_bollard_summary` seed
+    // would (the dump_snapshot CLI doesn't have port info).
     let forced: Vec<&(String, String, String, String)> =
         records.iter().step_by(2).collect();
     let n = forced.len().max(1) as f32;
@@ -1109,6 +1122,33 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
         };
         if let Some(w) = live.apply(DockerMsg::Stat(id.clone(), sample)) {
             latest = Some(w);
+        }
+        // Synthetic ports for every OTHER forced container so the dump shows
+        // the ENT-02 glow pass against a varied port count distribution.
+        if i % 2 == 0 {
+            let port_count = (i % 4 + 1) as u16;
+            let ports: Vec<crate::docker::PortSummary> = (0..port_count)
+                .map(|p| crate::docker::PortSummary {
+                    private: 8000 + p,
+                    public: Some(8000 + p),
+                    proto: crate::docker::PortProto::Tcp,
+                })
+                .collect();
+            // Read current snap to preserve group_key during enrich.
+            let group_key = live
+                .snapshot(id)
+                .map(|s| s.group_key.clone())
+                .unwrap_or_else(|| "none".to_string());
+            let enriched = crate::docker::EnrichedSnapshot {
+                id: id.clone(),
+                group_key,
+                ports,
+                mount_count: 0,
+                status_override: None,
+            };
+            if let Some(w) = live.apply(DockerMsg::Enriched(enriched)) {
+                latest = Some(w);
+            }
         }
     }
     let world = latest.expect("non-empty record set must yield at least one rebuild");

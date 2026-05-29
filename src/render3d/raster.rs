@@ -303,7 +303,11 @@ pub fn render_scene(
     // ON TOP of the front face (overwriting the cube fill where the dot lands).
     // Emissive: no fog, no Lambert — the dot's color is the palette indigo
     // glow at full brightness regardless of distance or orientation.
-    let glow_color = palette.status_color(Status::Running);
+    //
+    // Color = palette.glow (bright indigo) — deliberately DIFFERENT from the
+    // Running face color (light green) so the port dot reads as a port and
+    // doesn't blend invisibly into the cube it sits on.
+    let glow_color = palette.glow;
     let port_face_axes = [
         (Vec3::Z, Vec3::X, Vec3::Y),     // +Z face (front), tie-break #1
         (Vec3::X, Vec3::NEG_Z, Vec3::Y), // +X face (right), tie-break #2
@@ -355,9 +359,16 @@ pub fn render_scene(
         };
         let face_center = entity.position + spun_n * (h_n + FACE_EPS);
 
-        // Emissive quad half-size, scaled with the box so big boxes get
-        // proportionally bigger dots (still much smaller than a face).
-        let dot_half = 0.08 * h_u.min(h_v).max(0.05);
+        // Emissive quad half-size. Scaled with the box face so big boxes get
+        // proportionally bigger dots, with a generous minimum so the glow is
+        // still readable on idle MIN_HALF-sized containers (a small fraction
+        // of MIN_HALF=0.3 collapses below the braille majority-coverage
+        // threshold). 0.10 world units is ~2 braille dots at the standard
+        // framing distance — visible at MIN_HALF without dominating the face,
+        // and at MAX_HALF=1.2 the 0.18*face_min term wins so the dot scales
+        // proportionally upward.
+        let face_min = h_u.min(h_v);
+        let dot_half = (0.18 * face_min).max(0.10);
 
         for (i, _port) in ports.iter().take(9).enumerate() {
             let col = (i % 3) as f32;
