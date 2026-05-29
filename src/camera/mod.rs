@@ -25,6 +25,8 @@
 //! dropped mid-rotation. The `orbit_keeps_all_vertices_in_frustum` test pins this
 //! across a full turn AND across the worst-case pitch extremes.
 
+pub mod manual;
+
 use glam::Vec3;
 
 use crate::render3d::ViewParams;
@@ -81,7 +83,7 @@ const PITCH_AMPLITUDE: f32 = 0.0;
 
 /// Hard clamp on pitch so the camera can never reach the poles (gimbal flip).
 /// The widened sweep peaks at `bias + amplitude ≈ 60.8°`, comfortably under this.
-const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.15;
+pub(crate) const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.15;
 
 /// Reference braille viewport [`Camera::frame_scene`] solves the framing distance
 /// against. The live braille/kitty viewports vary with terminal size, but the
@@ -127,6 +129,16 @@ pub struct Camera {
     pub target: Vec3,
     /// Accumulated time (seconds) driving the eased pitch bob.
     elapsed: f32,
+    /// Whether autopilot motion is active (CAM-03, 04-03). `true` until the
+    /// user presses a camera-driving key (WASD / arrows / +/- / PageUp/Down /
+    /// Tab / Enter) — at which point [`Camera::on_user_input`] flips it to
+    /// `false` permanently for this session (no auto-revert in v1). When
+    /// `false`, [`Camera::step`] is a no-op (the autopilot rates currently
+    /// resolve to a static pose anyway, but the gate keeps any future re-enable
+    /// of `YAW_RATE`/`PITCH_AMPLITUDE` from leaking into manual mode), and
+    /// `App::run` / `run_kitty` skip the count-change auto re-frame so a manual
+    /// driver isn't yanked back by every container add/remove.
+    pub autopilot_active: bool,
 }
 
 impl Camera {
@@ -138,6 +150,7 @@ impl Camera {
             radius: DEFAULT_RADIUS,
             target: Vec3::ZERO,
             elapsed: 0.0,
+            autopilot_active: true,
         }
     }
 
@@ -148,7 +161,17 @@ impl Camera {
     /// optional bob contributes nothing) and is hard-clamped away from the gimbal
     /// poles. Using real `dt` keeps the motion framerate-independent (Gaffer
     /// decoupling).
+    ///
+    /// GATED behind [`Camera::autopilot_active`] (04-03 / CAM-03): once the
+    /// user presses a camera key, [`Camera::on_user_input`] flips the flag
+    /// and `step` becomes a no-op so the user's manual orbit doesn't fight a
+    /// background autopilot. Today the autopilot is effectively static
+    /// (`YAW_RATE = 0`, `PITCH_AMPLITUDE = 0`), but the gate keeps any future
+    /// re-enable of those constants from leaking into manual mode.
     pub fn step(&mut self, dt: f32) {
+        if !self.autopilot_active {
+            return;
+        }
         // Ignore non-finite / negative dt defensively (e.g. a clock hiccup).
         let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
 
@@ -160,6 +183,13 @@ impl Camera {
         // top face while only the yaw spins.
         self.pitch = (PITCH_BIAS + PITCH_AMPLITUDE * (self.elapsed * PITCH_RATE).sin())
             .clamp(-PITCH_LIMIT, PITCH_LIMIT);
+    }
+
+    /// Flip [`Camera::autopilot_active`] to `false` — called by the dispatch
+    /// layer the moment the user presses a camera-driving key (CAM-03, 04-03).
+    /// One-way: there is no auto-revert in v1 (RESEARCH Open Question #1).
+    pub fn on_user_input(&mut self) {
+        self.autopilot_active = false;
     }
 
     /// World-space eye position from the spherical (yaw, pitch, radius) orbit
