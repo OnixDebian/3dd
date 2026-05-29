@@ -50,7 +50,7 @@ use ratatui::Frame;
 use crate::camera::{Camera, DEFAULT_FOV};
 use crate::config::RenderConfig;
 use crate::render3d::render_scene as raster_render_scene;
-use crate::render3d::scene_extras::{FloorPlane, PortLookup, SceneExtras};
+use crate::render3d::scene_extras::{Cylinder, FloorPlane, ImageStack, PortLookup, SceneExtras};
 use crate::theme::{Palette, Status};
 use crate::ui::labels::{project_label_anchor, snap_anchor_with_hysteresis, truncate_label};
 use crate::world::live::LiveWorld;
@@ -172,6 +172,60 @@ fn build_port_lookup<'a>(world: &World, live: &'a LiveWorld) -> PortLookup<'a> {
     map
 }
 
+/// Build per-frame volume cylinders for the braille path (ENT-03 / 04-05).
+///
+/// One [`Cylinder`] per entity with `mount_count >= 1`. The cylinder sits
+/// on TOP of the cube (`center.y = entity.position.y + half_extents.y`),
+/// with radius narrower than the cube so it reads as a separate object
+/// (`0.4 * half_extents.x`). Height comes from the mount-count proxy
+/// (`world::volume::proxy_volume_height`). Color is `palette.volume`.
+///
+/// I12 closure: uses the existing `LiveWorld::snapshot(id).mount_count`
+/// accessor (added in 04-02) — NO `LiveWorld::mount_count(id)` helper.
+fn build_volume_cylinders(world: &World, live: &LiveWorld, palette: &Palette) -> Vec<Cylinder> {
+    let mut out: Vec<Cylinder> = Vec::new();
+    for entity in &world.entities {
+        let mc = live
+            .id_string_for_entity(entity.id)
+            .and_then(|cid| live.snapshot(cid))
+            .map(|s| s.mount_count)
+            .unwrap_or(0);
+        if mc == 0 {
+            continue;
+        }
+        let height = crate::world::volume::proxy_volume_height(mc);
+        let center = glam::Vec3::new(
+            entity.position.x,
+            entity.position.y + entity.half_extents.y,
+            entity.position.z,
+        );
+        let radius = entity.half_extents.x * 0.4;
+        out.push(Cylinder {
+            center,
+            radius,
+            height,
+            color: palette.volume,
+        });
+    }
+    out
+}
+
+/// Build per-frame image stacks for the braille path (ENT-04 / 04-05).
+///
+/// One [`ImageStack`] per image in `LiveWorld::image_stack_positions()`.
+/// Positions are deterministic (BTreeMap-by-id order + MAX_RACK_X
+/// constant — W9 closure). Drops the repo_tag tuple element (labels not
+/// part of the v1 stack visual).
+fn build_image_stacks(live: &LiveWorld) -> Vec<ImageStack> {
+    live.image_stack_positions()
+        .into_iter()
+        .map(|(base, layer_count, _tag)| ImageStack {
+            base,
+            layer_count,
+        })
+        .collect()
+}
+
 /// Render the orbiting World of boxes into the scene `area`.
 ///
 /// Builds a `Marker::Braille` canvas inside a bordered "scene" block and paints
@@ -206,6 +260,12 @@ pub fn render_scene(
     // 04-04 optional primitives — built per-frame from the live world.
     let floors = build_floor_planes(live, selection, palette);
     let ports = build_port_lookup(world, live);
+    // 04-05 optional primitives: volume cylinders + image stacks. Both are
+    // owned `Vec`s borrowed by the SceneExtras for the canvas closure's
+    // lifetime (the shape captures the extras via `move`, so the binding
+    // here must stay alive until the closure runs).
+    let cylinders = build_volume_cylinders(world, live, palette);
+    let image_stacks = build_image_stacks(live);
 
     // -- LABEL PRE-COMPUTATION (option (a)) --
     // The `Canvas::paint` closure is `Fn` (not `FnMut`), so &mut Selection cannot
@@ -255,7 +315,12 @@ pub fn render_scene(
         spin,
         selected_id: selection.selected_id,
         selection_pulse_phase: selection.pulse_phase,
-        extras: SceneExtras::new(floors.as_slice(), &ports, &[], &[]),
+        extras: SceneExtras::new(
+            floors.as_slice(),
+            &ports,
+            cylinders.as_slice(),
+            image_stacks.as_slice(),
+        ),
     };
 
     // Canvas X bounds are in DOT coordinates (top-left origin); ctx.print

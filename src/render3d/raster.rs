@@ -389,6 +389,41 @@ pub fn render_scene(
         }
     }
 
+    // ENT-03 (04-05): volume cylinders. Drawn AFTER cubes + ports so a
+    // cylinder sitting on top of a cube paints over the cube's top face
+    // where they overlap. Per-cylinder yaw-to-camera dot sort (Pitfall H)
+    // lives inside `rasterize_cylinder` — keeps seams stable as the
+    // cylinder rotates.
+    for cyl in extras.cylinders {
+        crate::render3d::cylinder::rasterize_cylinder(
+            &mut hi,
+            &projector,
+            view.eye,
+            cyl.center,
+            cyl.radius,
+            cyl.height,
+            cyl.color,
+        );
+    }
+
+    // ENT-04 (04-05): image stacks. Drawn LAST so a stack in the side
+    // region overwrites any rack fragment that happened to project on
+    // top of it (the painter's-sort order is "scene first, side region
+    // on top" — the side region is conceptually "in front of" the rack
+    // from any orbit angle the user is likely to choose). The per-cube
+    // back-face cull inside `rasterize_image_stack` keeps each layer
+    // crisp without a z-buffer.
+    for stack in extras.image_stacks {
+        crate::render3d::stack::rasterize_image_stack(
+            &mut hi,
+            &projector,
+            view.eye,
+            stack.base,
+            stack.layer_count,
+            palette,
+        );
+    }
+
     resolve_supersampled(&hi, w, h)
 }
 

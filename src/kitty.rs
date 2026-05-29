@@ -336,6 +336,157 @@ pub fn render_rgba(
         }
     }
 
+    // ENT-03 (04-05): volume cylinders. N-gon prism (8 sides by default)
+    // sitting on TOP of containers with mount_count >= 1. The shared
+    // z-buffer in fill_tri resolves overlap with cubes correctly (cube
+    // top face is one layer deep; the cylinder sits +1e-3 above so its
+    // depth wins at every shared pixel of the cube top). No back-face
+    // cull on the sides — the per-face yaw-to-camera dot sort is the
+    // braille trick; kitty's z-buffer makes it unnecessary, but we still
+    // skip back-facing sides to halve the fill cost.
+    const CYL_SIDES: usize = 8;
+    for cyl in extras.cylinders {
+        use std::f32::consts::TAU;
+        let cyl_rgb = to_rgb(cyl.color);
+        let bot_y = cyl.center.y;
+        let top_y = cyl.center.y + cyl.height;
+        let mut top_ring: [Vec3; CYL_SIDES] = [Vec3::ZERO; CYL_SIDES];
+        let mut bot_ring: [Vec3; CYL_SIDES] = [Vec3::ZERO; CYL_SIDES];
+        for i in 0..CYL_SIDES {
+            let ang = TAU * i as f32 / CYL_SIDES as f32;
+            let (s, c) = ang.sin_cos();
+            let x = cyl.center.x + cyl.radius * c;
+            let z = cyl.center.z + cyl.radius * s;
+            top_ring[i] = Vec3::new(x, top_y, z);
+            bot_ring[i] = Vec3::new(x, bot_y, z);
+        }
+        // Sides — back-face cull via outward-XZ normal dotted with
+        // (eye - centroid). Front-facing only.
+        for i in 0..CYL_SIDES {
+            let a = top_ring[i];
+            let b = top_ring[(i + 1) % CYL_SIDES];
+            let c_v = bot_ring[(i + 1) % CYL_SIDES];
+            let d = bot_ring[i];
+            let centroid = (a + b + c_v + d) * 0.25;
+            let normal_xz = Vec3::new(
+                centroid.x - cyl.center.x,
+                0.0,
+                centroid.z - cyl.center.z,
+            )
+            .normalize_or_zero();
+            if normal_xz.dot(view.eye - centroid) <= 0.0 {
+                continue;
+            }
+            let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
+            let verts = [a, b, c_v, d];
+            let mut clipped = false;
+            for (slot, v) in pts.iter_mut().zip(verts.iter()) {
+                match projector.project(*v) {
+                    Some(p) => *slot = p,
+                    None => {
+                        clipped = true;
+                        break;
+                    }
+                }
+            }
+            if clipped {
+                continue;
+            }
+            fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[1], pts[2], cyl_rgb);
+            fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[2], pts[3], cyl_rgb);
+        }
+        // Caps — top cap visible from above, bottom cap from below.
+        let top_n = Vec3::Y;
+        let bot_n = Vec3::NEG_Y;
+        for (ring, normal, ring_y) in [(top_ring, top_n, top_y), (bot_ring, bot_n, bot_y)] {
+            let centroid = Vec3::new(cyl.center.x, ring_y, cyl.center.z);
+            if normal.dot(view.eye - centroid) <= 0.0 {
+                continue;
+            }
+            // Project all ring corners.
+            let mut pts: [(f32, f32, f32); CYL_SIDES] = [(0.0, 0.0, 0.0); CYL_SIDES];
+            let mut clipped = false;
+            for (slot, v) in pts.iter_mut().zip(ring.iter()) {
+                match projector.project(*v) {
+                    Some(p) => *slot = p,
+                    None => {
+                        clipped = true;
+                        break;
+                    }
+                }
+            }
+            if clipped {
+                continue;
+            }
+            // Fan-triangulate from vertex 0.
+            for i in 1..CYL_SIDES - 1 {
+                fill_tri(
+                    &mut color,
+                    &mut depth,
+                    sw,
+                    sh,
+                    pts[0],
+                    pts[i],
+                    pts[i + 1],
+                    cyl_rgb,
+                );
+            }
+        }
+    }
+
+    // ENT-04 (04-05): image stacks. Each stack is N short cubes stacked
+    // along +Y at `base`. Reuses the cube geometry + back-face cull, but
+    // through the kitty path's z-buffered fill_tri (not the braille
+    // fill_face). Color is palette.edge — same muted gray as floor lines
+    // and wireframe cubes.
+    let stack_rgb = to_rgb(palette.edge);
+    let stack_cube = unit_cube();
+    let layer_half = crate::render3d::stack::LAYER_HALF;
+    let layer_gap = crate::render3d::stack::LAYER_GAP;
+    let max_layers = crate::render3d::stack::MAX_LAYERS;
+    for stack in extras.image_stacks {
+        if stack.layer_count == 0 {
+            continue;
+        }
+        let n = stack.layer_count.min(max_layers);
+        let scale = Vec3::splat(layer_half * 2.0);
+        for i in 0..n {
+            let center = Vec3::new(
+                stack.base.x,
+                stack.base.y + i as f32 * layer_gap + layer_half,
+                stack.base.z,
+            );
+            for face in &stack_cube.faces {
+                let corners = [
+                    center + stack_cube.vertices[face.indices[0]] * scale,
+                    center + stack_cube.vertices[face.indices[1]] * scale,
+                    center + stack_cube.vertices[face.indices[2]] * scale,
+                    center + stack_cube.vertices[face.indices[3]] * scale,
+                ];
+                let centroid = corners.iter().copied().sum::<Vec3>() / 4.0;
+                if face.normal.dot(view.eye - centroid) <= 0.0 {
+                    continue;
+                }
+                let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
+                let mut clipped = false;
+                for (slot, c) in pts.iter_mut().zip(corners.iter()) {
+                    match projector.project(*c) {
+                        Some(p) => *slot = p,
+                        None => {
+                            clipped = true;
+                            break;
+                        }
+                    }
+                }
+                if clipped {
+                    continue;
+                }
+                fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[1], pts[2], stack_rgb);
+                fill_tri(&mut color, &mut depth, sw, sh, pts[0], pts[2], pts[3], stack_rgb);
+            }
+        }
+    }
+
     // Box-downsample SS×SS -> final RGBA.
     let mut out = vec![0u8; w * h * 4];
     let n = (SS * SS) as u32;
