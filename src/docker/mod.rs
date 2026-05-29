@@ -45,5 +45,8 @@ pub use domain::{
 };
 pub use connect::{connect_and_probe, ProbeError};
 pub use images::{fetch_image_snapshots, ImageSnapshot};
-pub use inspect::{enrich_snapshot_on_seed, enrich_snapshot_on_start};
+pub use inspect::{
+    enrich_snapshot_on_seed, enrich_snapshot_on_start, fetch_detail, DetailSnapshot,
+    HealthSummary, MountSummary,
+};
 pub use streams::spawn_docker_tasks;

@@ -155,6 +155,15 @@ pub async fn connect_and_probe() -> Result<Docker, ProbeError> {
     }
 }
 
+/// Classify a bollard error using the platform-default socket path for the
+/// user-facing message. Convenience wrapper around [`classify`] for callers
+/// that don't keep their own resolved path (the off-thread `inspect` path
+/// in 04-06a calls this on every bollard error from `fetch_detail`).
+pub(crate) fn classify_default_path(err: &bollard::errors::Error) -> ProbeError {
+    let path = effective_socket_path();
+    classify(err, &path)
+}
+
 /// Resolve the socket path we'll mention in error messages. Honors
 /// `DOCKER_HOST` (the bollard default) when set, otherwise falls back to the
 /// platform default.
@@ -182,7 +191,13 @@ fn effective_socket_path() -> String {
 /// `kind()`. Anything we can't classify lands in [`ProbeError::DaemonDown`]
 /// (the most common real-world cause when classification fails) with the raw
 /// error appended — or [`ProbeError::Other`] when we genuinely have no signal.
-fn classify(err: &bollard::errors::Error, path: &str) -> ProbeError {
+///
+/// `pub(crate)` so [`crate::docker::inspect::fetch_detail`] (04-06a) reuses
+/// the same 4-variant error classifier instead of inventing its own — every
+/// inspect-style call routes user-facing errors through one place. The
+/// `effective_socket_path()` helper is invoked by callers via
+/// [`classify_default_path`] so the path string the user sees is consistent.
+pub(crate) fn classify(err: &bollard::errors::Error, path: &str) -> ProbeError {
     use bollard::errors::Error as B;
 
     // Easy case: bollard already pre-classified this as "socket file missing".
