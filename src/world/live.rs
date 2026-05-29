@@ -764,6 +764,8 @@ mod tests {
             mem_fraction: 0.0,
             load,
             warming_up: false,
+            blkio_r_bytes: 0,
+            blkio_w_bytes: 0,
         }
     }
 
@@ -941,6 +943,8 @@ mod tests {
             mem_fraction: 0.0,
             load: 0.0,
             warming_up: true,
+            blkio_r_bytes: 0,
+            blkio_w_bytes: 0,
         };
         // Warming-up sample is a no-op everywhere.
         assert!(lw.apply(DockerMsg::Stat("a".to_string(), warming)).is_none());

@@ -408,6 +408,14 @@ fn spawn_stats_task(
 ///
 /// Factored out so unit tests can hand-build a `ContainerStatsResponse`
 /// fixture (no daemon needed) and assert the mapping is finite.
+///
+/// 04-06a: block I/O is sourced HERE from the same stats stream (RESEARCH
+/// "Field-by-Field Source Map": blkio bytes are on the stats response, NOT
+/// on inspect). Sum the `Read` / `Write` rows of
+/// `blkio_stats.io_service_bytes_recursive`; everything else (`Sync`, `Async`,
+/// `Total`, etc.) is ignored to avoid double-counting (`Total = Read +
+/// Write`). On the warming-up sample we force both back to 0 — there's no
+/// per-second delta to derive on a first sample, matching `load == 0`.
 pub fn sample_from_response(resp: &ContainerStatsResponse) -> StatSample {
     let cur = raw_cpu_from(resp.cpu_stats.as_ref());
     let prev_storage = raw_cpu_from(resp.precpu_stats.as_ref());
@@ -418,7 +426,49 @@ pub fn sample_from_response(resp: &ContainerStatsResponse) -> StatSample {
     // both-zero counters as warming-up. We always pass Some(&prev) here so
     // every NON-first-frame sample gets a real delta computation; the
     // warming-up sentinel is the prev counters themselves, NOT a `None`.
-    normalize(&cur, Some(&prev_storage), &mem)
+    let mut sample = normalize(&cur, Some(&prev_storage), &mem);
+
+    // Block I/O: sum 'Read' rows -> blkio_r_bytes, 'Write' rows -> blkio_w_bytes.
+    // Case-insensitive on `op` because older Docker emitted `Read`/`Write` and
+    // newer emits the same — but we lowercase defensively so a daemon that
+    // ever drifts doesn't silently zero our counters. saturating_add to be
+    // bullet-proof against pathologically large values (overflow on counters
+    // running for years on a busy host).
+    let (r, w) = resp
+        .blkio_stats
+        .as_ref()
+        .and_then(|b| b.io_service_bytes_recursive.as_ref())
+        .map(|entries| {
+            let mut r: u64 = 0;
+            let mut w: u64 = 0;
+            for e in entries {
+                let op = e.op.as_deref().unwrap_or("").to_ascii_lowercase();
+                let v = e.value.unwrap_or(0);
+                if op == "read" {
+                    r = r.saturating_add(v);
+                } else if op == "write" {
+                    w = w.saturating_add(v);
+                }
+                // Sync/Async/Total/other -> ignored (Total == Read+Write, so
+                // counting it would double; Sync/Async are orthogonal axes).
+            }
+            (r, w)
+        })
+        .unwrap_or((0, 0));
+
+    // Warming-up rule: zero blkio bytes on the first sample. The renderer
+    // never uses these for sizing (only CPU/mem drive `load`), so the
+    // forcing is purely about consistency with StatSample's invariant —
+    // the panel display in 04-06b can trust that warming_up samples carry
+    // no derived data.
+    if sample.warming_up {
+        sample.blkio_r_bytes = 0;
+        sample.blkio_w_bytes = 0;
+    } else {
+        sample.blkio_r_bytes = r;
+        sample.blkio_w_bytes = w;
+    }
+    sample
 }
 
 /// Map bollard's `ContainerCpuStats` slot onto our `RawCpu` input.
@@ -584,6 +634,96 @@ mod tests {
         assert_eq!(r.usage, 1000);
         assert_eq!(r.cache, 200, "cgroup v1 cache key must be picked up");
         assert_eq!(r.limit, 2000);
+    }
+
+    // ---- 04-06a: block I/O sum from blkio_stats.io_service_bytes_recursive --
+
+    /// Build a `ContainerBlkioStatEntry` with `op` + `value` only.
+    fn blkio_entry(op: &str, value: u64) -> bollard::models::ContainerBlkioStatEntry {
+        bollard::models::ContainerBlkioStatEntry {
+            op: Some(op.to_string()),
+            value: Some(value),
+            ..Default::default()
+        }
+    }
+
+    /// Done criterion: `Read` rows sum into blkio_r_bytes, `Write` rows sum
+    /// into blkio_w_bytes; `Sync` / `Async` / `Total` rows are ignored (so we
+    /// never double-count by adding both `Read` and `Total = Read + Write`).
+    #[test]
+    fn sample_from_response_extracts_blkio_read_write() {
+        let mut resp = busy_response_fixture();
+        resp.blkio_stats = Some(bollard::models::ContainerBlkioStats {
+            io_service_bytes_recursive: Some(vec![
+                blkio_entry("Read", 1024),
+                blkio_entry("Write", 2048),
+                blkio_entry("Read", 256), // multi-row Read summed
+                blkio_entry("Sync", 9999),
+                blkio_entry("Async", 9999),
+                blkio_entry("Total", 9999),
+            ]),
+            ..Default::default()
+        });
+        let s = sample_from_response(&resp);
+        assert_eq!(s.blkio_r_bytes, 1024 + 256, "Read rows summed");
+        assert_eq!(s.blkio_w_bytes, 2048, "Write rows summed");
+        assert!(!s.warming_up, "fixture has non-zero precpu_stats");
+    }
+
+    /// Done criterion: no blkio_stats at all -> zero on both fields, no panic.
+    #[test]
+    fn sample_from_response_no_blkio_is_zero() {
+        let mut resp = busy_response_fixture();
+        resp.blkio_stats = None;
+        let s = sample_from_response(&resp);
+        assert_eq!(s.blkio_r_bytes, 0);
+        assert_eq!(s.blkio_w_bytes, 0);
+    }
+
+    /// Done criterion: a warming-up sample forces blkio bytes to 0 even when
+    /// the response carries non-zero Read/Write rows. Matches the `load == 0`
+    /// convention on the first sample.
+    #[test]
+    fn warming_up_sample_zeros_blkio() {
+        let mut resp = busy_response_fixture();
+        // Wipe precpu so the sample is flagged warming-up.
+        resp.precpu_stats = Some(ContainerCpuStats {
+            cpu_usage: Some(ContainerCpuUsage::default()),
+            system_cpu_usage: Some(0),
+            online_cpus: Some(4),
+            ..Default::default()
+        });
+        // Real Read/Write rows are nonetheless present.
+        resp.blkio_stats = Some(bollard::models::ContainerBlkioStats {
+            io_service_bytes_recursive: Some(vec![
+                blkio_entry("Read", 12345),
+                blkio_entry("Write", 67890),
+            ]),
+            ..Default::default()
+        });
+        let s = sample_from_response(&resp);
+        assert!(s.warming_up, "wiped precpu must flag warming-up");
+        assert_eq!(s.blkio_r_bytes, 0, "warming-up forces r to 0");
+        assert_eq!(s.blkio_w_bytes, 0, "warming-up forces w to 0");
+    }
+
+    /// Lowercase 'read' / 'write' (defensive) sums identically — older Moby
+    /// emitted capitalised, but a daemon variant could drift.
+    #[test]
+    fn sample_from_response_blkio_op_is_case_insensitive() {
+        let mut resp = busy_response_fixture();
+        resp.blkio_stats = Some(bollard::models::ContainerBlkioStats {
+            io_service_bytes_recursive: Some(vec![
+                blkio_entry("read", 100),
+                blkio_entry("write", 200),
+                blkio_entry("READ", 50),  // tolerated
+                blkio_entry("WRITE", 25), // tolerated
+            ]),
+            ..Default::default()
+        });
+        let s = sample_from_response(&resp);
+        assert_eq!(s.blkio_r_bytes, 150);
+        assert_eq!(s.blkio_w_bytes, 225);
     }
 
     /// `online_cpus` widens from u32 to u64 cleanly.

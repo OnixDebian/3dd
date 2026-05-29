@@ -151,6 +151,8 @@ async fn main() -> Result<()> {
                     mem_fraction: 0.0,
                     load,
                     warming_up: false,
+                    blkio_r_bytes: 0,
+                    blkio_w_bytes: 0,
                 };
                 let _ = tx.send(DockerMsg::Stat(id.clone(), sample));
             }
@@ -180,6 +182,8 @@ async fn main() -> Result<()> {
                         mem_fraction: 0.0,
                         load,
                         warming_up: false,
+                        blkio_r_bytes: 0,
+                        blkio_w_bytes: 0,
                     };
                     if tx.send(DockerMsg::Stat(id.clone(), sample)).is_err() {
                         return; // receiver dropped — app exiting

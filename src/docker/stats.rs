@@ -75,6 +75,15 @@ pub struct StatSample {
     /// NOT sized from this sample; `load` is forced to `0.0`. Per PITFALLS
     /// Pitfall 1: the first sample is garbage and must be skipped.
     pub warming_up: bool,
+    /// Cumulative bytes read from block devices since the container started
+    /// (sum of `blkio_stats.io_service_bytes_recursive` entries with
+    /// `op == "Read"`). Forced to `0` on the warming-up sample to match the
+    /// `load == 0` convention (no per-second delta to derive a rate from on
+    /// the first sample). 04-06b will display this in the detail panel.
+    pub blkio_r_bytes: u64,
+    /// Cumulative bytes written to block devices — same shape as
+    /// [`StatSample::blkio_r_bytes`] for the `Write` op rows.
+    pub blkio_w_bytes: u64,
 }
 
 /// Normalize one stats sample.
@@ -187,6 +196,12 @@ pub fn normalize(cur_cpu: &RawCpu, prev_cpu: Option<&RawCpu>, mem: &RawMem) -> S
         mem_fraction,
         load,
         warming_up,
+        // Block I/O is sourced at the producer (`sample_from_response` in
+        // `docker::streams`) and patched in AFTER `normalize` returns, so the
+        // pure normalizer here stays CPU/mem-only. The warming-up forced-zero
+        // rule is enforced one layer up (see `sample_from_response`).
+        blkio_r_bytes: 0,
+        blkio_w_bytes: 0,
     }
 }
 

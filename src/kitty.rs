@@ -1361,6 +1361,8 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
             mem_fraction: 0.0,
             load,
             warming_up: false,
+            blkio_r_bytes: 0,
+            blkio_w_bytes: 0,
         };
         if let Some(w) = live.apply(DockerMsg::Stat(id.clone(), sample)) {
             latest = Some(w);

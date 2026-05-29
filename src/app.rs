@@ -365,6 +365,8 @@ mod tests {
             mem_fraction: 0.1,
             load: 0.5,
             warming_up: false,
+            blkio_r_bytes: 0,
+            blkio_w_bytes: 0,
         };
         tx.send(DockerMsg::Stat("a".to_string(), sample)).unwrap();
         assert!(
