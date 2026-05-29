@@ -277,8 +277,18 @@ impl LiveWorld {
     pub fn image_stack_positions(&self) -> Vec<(Vec3, usize, String)> {
         use crate::world::layout::{IMAGE_REGION_X_OFFSET, IMAGE_STACK_SPACING_Z, MAX_RACK_X};
         let origin_x = MAX_RACK_X + IMAGE_REGION_X_OFFSET;
-        let mut out = Vec::with_capacity(self.images.len());
-        for (i, (_id, img)) in self.images.iter().enumerate() {
+        // Visual-verify cap (04-05 visual gate, applied after the first
+        // braille capture against the live daemon): a developer machine
+        // with 25+ images stretched the image region across the entire
+        // +Z axis and overwhelmed the container rack. Truncate to the
+        // first MAX_VISIBLE_IMAGE_STACKS by BTreeMap-by-id order so the
+        // side region stays scale-controlled. The cap fits comfortably
+        // beside the rack's Z extent (GROUP_DEPTH*~3 ≈ 30 units) so the
+        // image region reads as a sibling cluster rather than a wall.
+        const MAX_VISIBLE_IMAGE_STACKS: usize = 12;
+        let take = self.images.len().min(MAX_VISIBLE_IMAGE_STACKS);
+        let mut out = Vec::with_capacity(take);
+        for (i, (_id, img)) in self.images.iter().take(take).enumerate() {
             let z = i as f32 * IMAGE_STACK_SPACING_Z;
             // `base.y = 0` so the bottom of the lowest layer sits flush with
             // the rack floor row (row 0 in the layout grid is also at y=0).

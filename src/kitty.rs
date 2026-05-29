@@ -1254,7 +1254,7 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
             "-a",
             "--no-trunc",
             "--format",
-            "{{.ID}}|{{.Names}}|{{.State}}|{{.Networks}}",
+            "{{.ID}}|{{.Names}}|{{.State}}|{{.Networks}}|{{.Mounts}}",
         ])
         .output()
         .map_err(|e| color_eyre::eyre::eyre!("failed to run `docker ps -a`: {e}"))?;
@@ -1267,11 +1267,14 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
     // Parse + sort by NAME so the test frame is deterministic frame-to-frame
     // (the LiveWorld slot assignment is first-seen, so a stable input order
     // yields a stable layout). One record per non-empty line.
-    let mut records: Vec<(String, String, String, String)> = stdout
+    // Records: (id, name, state, networks, mounts_field). `mounts_field` is
+    // a comma-separated list from `{{.Mounts}}` — its element count is our
+    // proxy for ContainerSnapshot.mount_count (Phase 4 ENT-03).
+    let mut records: Vec<(String, String, String, String, String)> = stdout
         .lines()
         .filter_map(|line| {
-            let parts: Vec<&str> = line.splitn(4, '|').collect();
-            if parts.len() != 4 || parts[0].is_empty() {
+            let parts: Vec<&str> = line.splitn(5, '|').collect();
+            if parts.len() != 5 || parts[0].is_empty() {
                 return None;
             }
             Some((
@@ -1279,6 +1282,7 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
                 parts[1].to_string(),
                 parts[2].to_string(),
                 parts[3].to_string(),
+                parts[4].to_string(),
             ))
         })
         .collect();
@@ -1300,7 +1304,7 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
     // state after all messages, since `apply` rebuilds on every message that
     // actually changes the scene.
     let mut latest: Option<World> = None;
-    for (id, name, state, networks) in &records {
+    for (id, name, state, networks, mounts) in &records {
         let group_key = networks
             .split(',')
             .map(|s| s.trim())
@@ -1308,11 +1312,21 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
             .min() // alphabetically-first, mirrors `from_bollard_summary` in domain.rs
             .unwrap_or("none")
             .to_string();
+        // Real mount count from the {{.Mounts}} CLI field: comma-separated
+        // mount paths. Empty field => 0 mounts. This gives the offline
+        // dump path REAL cylinders for containers with bind mounts/volumes
+        // (ENT-03 visual gate without needing the bollard inspect path).
+        let mount_count = mounts
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .count();
         let snap = ContainerSnapshot {
             id: id.clone(),
             name: name.clone(),
             status: map_status(state, None, None),
             group_key,
+            mount_count,
             ..ContainerSnapshot::default()
         };
         if let Some(w) = live.apply(DockerMsg::Added(snap)) {
@@ -1328,7 +1342,7 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
     // carrying 1-3 fake ports, so the offline dump exercises the ENT-02
     // port glow path the same way the live `from_bollard_summary` seed
     // would (the dump_snapshot CLI doesn't have port info).
-    let forced: Vec<&(String, String, String, String)> =
+    let forced: Vec<&(String, String, String, String, String)> =
         records.iter().step_by(2).collect();
     let n = forced.len().max(1) as f32;
     for (i, rec) in forced.iter().enumerate() {
@@ -1379,6 +1393,24 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
             }
         }
     }
+    // Synthetic image set for the offline dump (ENT-04 visual gate without
+    // a live `list_images` call): a small varied set so the stack region
+    // shows different heights (1-7 layers). Real local images aren't
+    // available here without a bollard call; this keeps the dump path
+    // bollard-free while still exercising the rendering pipeline.
+    for (i, (id, _name, _state, _net, _mounts)) in records.iter().take(5).enumerate() {
+        let layers = 1 + (i * 2) % 7; // 1, 3, 5, 0, 2 -> all > 0
+        let layers = layers.max(1);
+        let synth = crate::docker::ImageSnapshot {
+            id: format!("img-{i}-{}", &id[..id.len().min(8)]),
+            repo_tag: format!("synthetic:tag-{i}"),
+            layer_count: layers,
+        };
+        if let Some(w) = live.apply(DockerMsg::ImageAdded(synth)) {
+            latest = Some(w);
+        }
+    }
+
     let world = latest.expect("non-empty record set must yield at least one rebuild");
 
     let palette = Palette::default();
