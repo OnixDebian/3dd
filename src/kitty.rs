@@ -893,6 +893,192 @@ fn build_image_stacks_kitty(
         .collect()
 }
 
+/// Compute the (col0, row0, w, h) cell-grid rectangle for the kitty popup.
+///
+/// `pct_w` / `pct_h` are in `0.0..=1.0`. Result is clamped so a tiny terminal
+/// still produces a 0..n rect with `n >= 3` (need at least one inner row for
+/// content). Cell coordinates are 0-indexed; the caller adds +1 when writing
+/// ANSI cursor moves (which are 1-indexed).
+fn centered_cell_rect(cols: usize, rows: usize, pct_w: f32, pct_h: f32) -> (usize, usize, usize, usize) {
+    // Target = pct of cols/rows; floor minimums (20w / 8h) so a popup stays
+    // legible; cap to the actual terminal so the rect never overflows.
+    let target_w = (cols as f32 * pct_w).round() as usize;
+    let target_h = (rows as f32 * pct_h).round() as usize;
+    let w = target_w.max(20).min(cols.max(1));
+    let h = target_h.max(8).min(rows.saturating_sub(1).max(1));
+    let col0 = cols.saturating_sub(w) / 2;
+    let row0 = rows.saturating_sub(h) / 2;
+    (col0, row0, w, h)
+}
+
+/// Draw a unicode-box-drawing border at the given cell rect onto `stdout`.
+///
+/// Uses U+250C / U+2500 / U+2510 / U+2502 / U+2514 / U+2518 (light box).
+/// Cursor positions are 1-indexed in ANSI; the caller passes 0-indexed
+/// `col0` / `row0` so this fn converts. After the border, the popup interior
+/// (rows `row0+1..row0+h-1`, cols `col0+1..col0+w-1`) is cleared with spaces
+/// so the underlying image bytes don't bleed through.
+fn draw_popup_box(
+    stdout: &mut impl Write,
+    col0: usize,
+    row0: usize,
+    w: usize,
+    h: usize,
+) -> io::Result<()> {
+    if w < 3 || h < 3 {
+        return Ok(());
+    }
+    // Top row: ┌─...─┐
+    write!(stdout, "\x1b[{};{}H", row0 + 1, col0 + 1)?;
+    write!(stdout, "\u{250C}")?;
+    for _ in 0..(w - 2) {
+        write!(stdout, "\u{2500}")?;
+    }
+    write!(stdout, "\u{2510}")?;
+    // Middle rows: │   spaces   │
+    for r in 1..(h - 1) {
+        write!(stdout, "\x1b[{};{}H", row0 + 1 + r, col0 + 1)?;
+        write!(stdout, "\u{2502}")?;
+        for _ in 0..(w - 2) {
+            write!(stdout, " ")?;
+        }
+        write!(stdout, "\u{2502}")?;
+    }
+    // Bottom row: └─...─┘
+    write!(stdout, "\x1b[{};{}H", row0 + h, col0 + 1)?;
+    write!(stdout, "\u{2514}")?;
+    for _ in 0..(w - 2) {
+        write!(stdout, "\u{2500}")?;
+    }
+    write!(stdout, "\u{2518}")?;
+    Ok(())
+}
+
+/// Produce the per-line text contents for the kitty popup body.
+///
+/// Mirrors the braille panel's field set (status, health, image, started,
+/// restarts, network, ports, mounts, block I/O, help) as plain strings. The
+/// renderer writes each line with a `MoveTo + Print` pair clipped to the
+/// popup's interior width. Mounts and ports are truncated to the first 3
+/// entries with a "…N more" tail to keep the popup height predictable.
+fn format_detail_lines(snap: &crate::docker::DetailSnapshot, blkio_r: u64, blkio_w: u64) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(20);
+    out.push(format!(" {} ", snap.name));
+    out.push(format!("Status:     {:?}", snap.status));
+    out.push(format!("Health:     {}", kitty_health_str(&snap.health)));
+    out.push(format!("Image:      {}", snap.image_human));
+    out.push(format!("Started:    {}", snap.started_at_iso));
+    out.push(format!(
+        "Restarts:   {} ({})",
+        snap.restart_count, snap.restart_policy
+    ));
+    out.push(format!("Network:    {}", snap.network_mode));
+    out.push(format!("Ports ({}):", snap.ports.len()));
+    out.push(format!("  {}", kitty_format_ports(&snap.ports)));
+    out.push(format!("Mounts ({}):", snap.mounts.len()));
+    for m in snap.mounts.iter().take(3) {
+        out.push(format!(
+            "  {} ({})",
+            kitty_format_mount(m),
+            if m.rw { "rw" } else { "ro" }
+        ));
+    }
+    if snap.mounts.len() > 3 {
+        out.push(format!("  …{} more", snap.mounts.len() - 3));
+    }
+    out.push(format!(
+        "Block I/O:  R {} / W {}",
+        kitty_human_bytes(blkio_r),
+        kitty_human_bytes(blkio_w)
+    ));
+    out.push(String::new());
+    out.push("Esc close · Enter refresh · q quit".to_string());
+    out
+}
+
+/// Map [`HealthSummary`] to a kitty-popup-friendly summary (mirrors the
+/// braille `health_str` but local so the kitty path doesn't need to import
+/// ui::detail_panel's pub-fn'd helpers).
+fn kitty_health_str(h: &crate::docker::HealthSummary) -> String {
+    use crate::docker::HealthSummary;
+    match h {
+        HealthSummary::None => "none".to_string(),
+        HealthSummary::Starting => "starting".to_string(),
+        HealthSummary::Healthy => "healthy".to_string(),
+        HealthSummary::Unhealthy {
+            failing_streak,
+            last_output,
+        } => {
+            if last_output.is_empty() {
+                format!("unhealthy (streak={failing_streak})")
+            } else {
+                let trimmed: String = last_output
+                    .replace(['\n', '\r'], " ")
+                    .chars()
+                    .take(40)
+                    .collect();
+                format!("unhealthy (streak={failing_streak}): {trimmed}")
+            }
+        }
+    }
+}
+
+/// Comma-join a port list — kitty-side mirror of detail_panel::format_ports.
+fn kitty_format_ports(ports: &[crate::docker::PortSummary]) -> String {
+    if ports.is_empty() {
+        return "(none)".to_string();
+    }
+    let mut parts: Vec<String> = ports
+        .iter()
+        .take(3)
+        .map(|p| match p.public {
+            Some(pub_port) => format!("{}/{} -> {}", p.private, p.proto.as_str(), pub_port),
+            None => format!("{}/{}", p.private, p.proto.as_str()),
+        })
+        .collect();
+    if ports.len() > 3 {
+        parts.push(format!("…{} more", ports.len() - 3));
+    }
+    parts.join(", ")
+}
+
+/// Render one mount — kitty-side mirror of detail_panel::format_mount.
+fn kitty_format_mount(m: &crate::docker::MountSummary) -> String {
+    let src = if m.source.is_empty() {
+        "(anon)"
+    } else {
+        m.source.as_str()
+    };
+    let body = format!("{src}:{}", m.destination);
+    if body.chars().count() > 60 {
+        let half = 28;
+        let head: String = body.chars().take(half).collect();
+        let tail: String = body.chars().rev().take(half).collect::<String>().chars().rev().collect();
+        format!("{head}…{tail}")
+    } else {
+        body
+    }
+}
+
+/// SI-byte formatter — kitty-side mirror of detail_panel::human_bytes.
+fn kitty_human_bytes(n: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB", "PB"];
+    if n == 0 {
+        return "0 B".to_string();
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} {}", n, UNITS[unit])
+    } else {
+        format!("{:.1} {}", value, UNITS[unit])
+    }
+}
+
 pub fn supports_kitty_graphics() -> bool {
     if std::env::var_os("KITTY_WINDOW_ID").is_some()
         || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
@@ -1192,6 +1378,58 @@ pub fn run_kitty(
                     selection.last_label_cell_kitty = None;
                 }
             }
+
+            // CAM-05 / 04-06b: kitty popup OVER the image surface.
+            //
+            // Drawn AFTER the image emit + label so the box-drawing chars
+            // and content lines land on terminal CELLS (not RGBA pixels) —
+            // sharp text, not braille-fuzzy. The next frame's `delete_all`
+            // + fresh `emit_kitty` re-paints the cells back to image
+            // content when the popup closes; no manual clear needed.
+            if selection.detail_open {
+                let (col0, row0, popup_w, popup_h) =
+                    centered_cell_rect(cols as usize, rows as usize, 0.6, 0.6);
+                if popup_w >= 3 && popup_h >= 3 {
+                    draw_popup_box(&mut stdout, col0, row0, popup_w, popup_h)?;
+
+                    // Live blkio from LiveWorld::last_sample so the popup
+                    // ticks even while open (CONT-04 / CAM-05 live data).
+                    let blkio = selection
+                        .selected_id
+                        .and_then(|eid| live.id_string_for_entity(eid).map(|s| s.to_string()))
+                        .and_then(|cid| live.last_sample(&cid).map(|s| (s.blkio_r_bytes, s.blkio_w_bytes)))
+                        .unwrap_or((0, 0));
+
+                    let lines: Vec<String> = if let Some(snap) = selection.pending_detail.as_ref() {
+                        format_detail_lines(snap, blkio.0, blkio.1)
+                    } else {
+                        vec!["Inspecting container…".to_string()]
+                    };
+
+                    // Write each line clipped to the popup's interior width.
+                    // Interior = `popup_w - 2` cells, starting at col `col0 + 1`
+                    // (1-indexed: col0 + 2). Interior rows start at row0 + 1
+                    // (1-indexed: row0 + 2) and end at row0 + h - 1 (excl).
+                    let inner_w = popup_w.saturating_sub(2);
+                    let inner_h = popup_h.saturating_sub(2);
+                    for (i, line) in lines.iter().take(inner_h).enumerate() {
+                        let term_row = row0 + 2 + i;
+                        let term_col = col0 + 2;
+                        // Truncate each line to inner_w chars (no wrap; cuts off).
+                        let truncated: String = line.chars().take(inner_w).collect();
+                        // Pad to inner_w so a shorter line clears stale chars from
+                        // the previous frame (the popup may shrink between frames
+                        // if e.g. the mount count drops).
+                        let pad = inner_w.saturating_sub(truncated.chars().count());
+                        write!(
+                            stdout,
+                            "\x1b[{term_row};{term_col}H{truncated}{}",
+                            " ".repeat(pad)
+                        )?;
+                    }
+                }
+            }
+
             // Status bar on the reserved bottom row (mirrors the braille HUD).
             // The box count is the live container count (or 0 in the empty state).
             // The mode field flips "auto" -> "manual" the moment the user
@@ -1871,6 +2109,88 @@ mod tests {
             compared += 1;
         }
         assert!(compared > 10, "no overlap to test; got {compared} pixels");
+    }
+
+    /// format_detail_lines (04-06b) produces the expected count of lines
+    /// for a fully-populated DetailSnapshot — title + 9 data rows + ports
+    /// section + mounts section + block I/O + spacer + help footer.
+    #[test]
+    fn format_detail_lines_produces_expected_field_count() {
+        use crate::docker::{DetailSnapshot, HealthSummary, MountSummary, PortProto, PortSummary};
+        use crate::theme::Status;
+        let snap = DetailSnapshot {
+            id: "x".to_string(),
+            name: "container-x".to_string(),
+            status: Status::Running,
+            health: HealthSummary::Healthy,
+            started_at_iso: "2026-05-29T00:00:00Z".to_string(),
+            restart_count: 0,
+            restart_policy: "no".to_string(),
+            image_human: "nginx".to_string(),
+            image_digest: "sha256:abc".to_string(),
+            network_mode: "bridge".to_string(),
+            networks: Vec::new(),
+            ports: vec![PortSummary {
+                private: 80,
+                public: Some(8080),
+                proto: PortProto::Tcp,
+            }],
+            mounts: vec![MountSummary {
+                kind: "bind".to_string(),
+                source: "/host".to_string(),
+                destination: "/data".to_string(),
+                rw: true,
+            }],
+        };
+        let lines = super::format_detail_lines(&snap, 1500, 3500);
+        // Expected layout (15 lines):
+        //   0: title
+        //   1: Status
+        //   2: Health
+        //   3: Image
+        //   4: Started
+        //   5: Restarts
+        //   6: Network
+        //   7: Ports (count):
+        //   8:   <ports line>
+        //   9: Mounts (count):
+        //  10:   <mount entry>
+        //  11: Block I/O
+        //  12: <blank>
+        //  13: help footer
+        assert_eq!(lines.len(), 14, "got {} lines: {lines:?}", lines.len());
+        assert!(lines[0].contains("container-x"));
+        assert!(lines[1].contains("Running"));
+        assert!(lines[2].contains("healthy"));
+        assert!(lines[3].contains("nginx"));
+        assert!(lines[5].contains("0 (no)"));
+        assert!(lines[6].contains("bridge"));
+        assert!(lines[8].contains("80/tcp -> 8080"));
+        assert!(lines[10].contains("/host:/data"));
+        assert!(lines[11].contains("1.5 KB"));
+        assert!(lines[11].contains("3.5 KB"));
+        assert!(lines[13].contains("Esc close"));
+    }
+
+    /// centered_cell_rect produces a centered rect with predictable dims.
+    #[test]
+    fn centered_cell_rect_centers() {
+        let (col0, row0, w, h) = super::centered_cell_rect(100, 50, 0.6, 0.6);
+        // 60% of 100 = 60 wide; 60% of 50 = 30 tall.
+        assert_eq!(w, 60);
+        assert_eq!(h, 30);
+        assert_eq!(col0, 20);
+        assert_eq!(row0, 10);
+    }
+
+    /// Small terminals still produce a usable rect (clamped, not panicking).
+    #[test]
+    fn centered_cell_rect_handles_tiny_terminal() {
+        let (_, _, w, h) = super::centered_cell_rect(10, 10, 0.6, 0.6);
+        // 10 * 0.6 = 6 width — below the clamp floor of 20; clamps UP-to floor.
+        // But the rect cannot be wider than the terminal; clamps DOWN to cols.
+        assert!(w <= 10);
+        assert!(h <= 10);
     }
 
     /// An empty scene renders all-background, no panic (degenerate bounds safe).
