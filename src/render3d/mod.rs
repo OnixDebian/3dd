@@ -11,6 +11,7 @@ pub mod plane;
 pub mod project;
 pub mod raster;
 pub mod scene_extras;
+pub mod stack;
 
 // Public API surface consumed by plan 05 (blit + orbiting camera).
 #[allow(unused_imports)]
