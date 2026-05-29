@@ -1,32 +1,35 @@
 //! Pure easing primitive — critically-damped spring step (CONT-03).
 //!
-//! [`critically_damped`] is the closed-form implicit-Euler step for a
-//! critically-damped (ζ=1) spring. Given a current position `x` and velocity
-//! `v`, it advances both toward `x_target` over a characteristic `half_life`
-//! at real elapsed `dt`. Framerate-independent; no overshoot; smooth velocity
-//! continuity across target reversals. Two independent canonical sources:
-//! Holden's "Spring-It-On" (theorangeduck.com) and Chou's "Precise Control
-//! over Numeric Springing" (allenchou.net).
+//! [`critically_damped`] is the analytical (exponential) one-step solution
+//! of the critically-damped (ζ=1) second-order spring ODE. Given a current
+//! position `x` and velocity `v`, it advances both toward `x_target` over a
+//! characteristic `half_life` at real elapsed `dt`. Framerate-independent
+//! (the result depends only on the total elapsed time, not on subdivision of
+//! `dt`); no overshoot; smooth velocity continuity across target reversals.
+//! Source: Holden's "Spring-It-On" (theorangeduck.com).
 //!
 //! Used by [`crate::world::live`] to ease each container's displayed
 //! half-extent toward the latest stat target — boxes BREATHE instead of
 //! snapping when a new sample lands.
 //!
-//! Half-life choice: `BREATHING_HALF_LIFE = 0.15s`. With stats arriving at
-//! ~1Hz, the canonical `4 * half_life` rule gives 0.6s to within 2% of the
-//! new steady-state — visible easing inside one stat interval, fully settled
-//! before the next sample lands.
+//! Half-life choice: `BREATHING_HALF_LIFE = 0.15s`. With `ω = 2·ln(2)/half_life`
+//! (Holden's `dampingFromHalflife`), the position response settles to within
+//! ~3% by `4·half_life` (≈0.6s) and within 2% by `~4.21·half_life` (≈0.63s) —
+//! visible easing inside one ~1Hz stat interval, fully settled before the
+//! next sample lands.
 //!
 //! Pure module: no I/O, no global state. The function is `&mut x, &mut v`
 //! only — no state outside its args.
 
 #![allow(dead_code)]
 
-/// Canonical breathing half-life (seconds). 4τ ≈ 0.6s to within 2% — visible
-/// easing inside one ~1Hz stat interval, fully settled before the next sample.
+/// Canonical breathing half-life (seconds). With `ω = 2·ln(2)/half_life`, the
+/// position response is within ~3% of target by `4·half_life` (≈0.6s) and
+/// within 2% by `~4.21·half_life` — visible easing inside one ~1Hz stat
+/// interval, fully settled before the next sample lands.
 pub const BREATHING_HALF_LIFE: f32 = 0.15;
 
-/// Critically-damped spring step (ζ=1, implicit Euler, closed form).
+/// Critically-damped spring step (ζ=1, analytical exponential closed-form).
 ///
 /// Eases `x` and its velocity `v` toward `x_target` over `half_life` seconds
 /// at real elapsed `dt`. Framerate-independent: doubling `dt` and halving the
