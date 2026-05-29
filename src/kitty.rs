@@ -14,13 +14,14 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{cursor, execute};
 use glam::Vec3;
 use ratatui::style::Color;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::action::{apply_input_action, Action, Effect};
 use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::render3d::cube::{unit_cube, CUBE_EDGES};
@@ -29,6 +30,7 @@ use crate::render3d::{rotate_y_about, ViewParams};
 use crate::theme::Palette;
 use crate::world::entity::Entity;
 use crate::world::scene::{synthetic_scene, SceneBounds};
+use crate::world::selection::Selection;
 use crate::world::{DockerMsg, LiveWorld, World};
 
 /// Internal supersampling factor per axis for anti-aliasing. Real pixels, so this
@@ -63,6 +65,7 @@ const WIRE_HALF_PX: f32 = 1.5;
 /// the motion is each box spinning in place. Each box's corners and face normals
 /// are rotated about that box's center before projection — the box stays a rigid
 /// convex solid so the shared z-buffer still resolves inter-box occlusion.
+#[allow(clippy::too_many_arguments)]
 pub fn render_rgba(
     entities: &[Entity],
     view: ViewParams,
@@ -71,6 +74,8 @@ pub fn render_rgba(
     w: usize,
     h: usize,
     spin: f32,
+    selected_id: Option<u32>,
+    selection_pulse_phase: f32,
 ) -> Vec<u8> {
     let (sw, sh) = (w * SS, h * SS);
     let bg = to_rgb(palette.background);
@@ -96,11 +101,23 @@ pub fn render_rgba(
     // every entity (transformed below), so build it once.
     let cube = unit_cube();
 
+    // Per-entity brightness pulse for the Tab-selected box (04-03 / CAM-04).
+    // Computed once per entity (constant across its faces / edges).
+    let pulse_mult_for = |entity_id: u32| -> f32 {
+        if Some(entity_id) == selected_id {
+            const AMPLITUDE: f32 = 0.18;
+            1.0 + AMPLITUDE * (selection_pulse_phase * std::f32::consts::TAU).sin()
+        } else {
+            1.0
+        }
+    };
+
     for entity in entities {
         // Per-axis scale = full extent (half_extents * 2); translate to position,
         // then spin the box about its OWN center around +Y by `spin`.
         let scale = entity.half_extents * 2.0;
         let world = |v: Vec3| rotate_y_about(entity.position + v * scale, entity.position, spin);
+        let pulse_mult = pulse_mult_for(entity.id);
 
         if entity.status.is_solid() {
             // SOLID PATH (Running): fill the 6 cube faces (existing logic).
@@ -118,6 +135,7 @@ pub fn render_rgba(
                     continue;
                 }
                 let shaded = face_shade(normal, centroid, &view, near, far, base, bg);
+                let shaded = scale_brightness_rgb(shaded, pulse_mult);
 
                 let mut pts = [(0.0f32, 0.0f32, 0.0f32); 4];
                 let mut clipped = false;
@@ -154,6 +172,7 @@ pub fn render_rgba(
                 let midpoint_dist = (view.eye - (a3 + b3) * 0.5).length();
                 let fog = fog_factor(midpoint_dist, near, far);
                 let shaded = shade(palette.edge, 1.0, bg, fog);
+                let shaded = scale_brightness_rgb(shaded, pulse_mult);
                 draw_line_z(&mut color, &mut depth, sw, sh, pa, pb, shaded, WIRE_HALF_PX);
             }
         }
@@ -375,6 +394,20 @@ fn to_rgb(c: Color) -> (u8, u8, u8) {
     }
 }
 
+/// Multiply a packed RGB triple by `mult` per channel, clamped to `[0, 255]`.
+/// `mult` near 1.0 leaves the color visually identical; the selection-pulse
+/// amplitude (0.18) keeps the swing readable without ever saturating.
+fn scale_brightness_rgb(rgb: (u8, u8, u8), mult: f32) -> (u8, u8, u8) {
+    if (mult - 1.0).abs() < 1e-6 {
+        return rgb;
+    }
+    let m = mult.max(0.0);
+    let r = ((rgb.0 as f32 * m).round()).clamp(0.0, 255.0) as u8;
+    let g = ((rgb.1 as f32 * m).round()).clamp(0.0, 255.0) as u8;
+    let b = ((rgb.2 as f32 * m).round()).clamp(0.0, 255.0) as u8;
+    (r, g, b)
+}
+
 /// Minimal standard base64 encoder (avoids a dependency).
 fn base64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -478,6 +511,11 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
         bounds: SceneBounds::from_entities(&[]),
     };
     let mut camera = Camera::new();
+    // Tab-cycle selection + brightness pulse + detail-panel toggle (04-03).
+    // Owned here mirrors App.selection in the braille backend. The same
+    // apply_input_action dispatch surface mutates both, so the user-facing
+    // behavior is identical across backends.
+    let mut selection = Selection::new();
     let mut last = Instant::now();
     let mut fps = 0.0f32;
     // Per-box self-spin angle, advanced by REAL dt (framerate-independent), since
@@ -494,16 +532,29 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
 
     let result = (|| -> Result<()> {
         loop {
-            // Input (non-blocking).
+            // Input (non-blocking). All key dispatch goes through the SAME
+            // apply_input_action surface as the braille backend (04-03 single
+            // dispatch invariant) — the Effect interpretation here interprets
+            // Quit -> break and SpawnInspect -> (04-06 plugs the off-thread
+            // inspect spawn here).
             if event::poll(Duration::from_millis(0))? {
                 if let Event::Key(k) = event::read()? {
-                    if k.kind == KeyEventKind::Press {
-                        let quit = matches!(k.code, KeyCode::Char('q') | KeyCode::Esc)
-                            || (k.code == KeyCode::Char('c')
-                                && k.modifiers.contains(KeyModifiers::CONTROL));
-                        if quit {
-                            break;
+                    let action = Action::from_key(k);
+                    let effect = apply_input_action(
+                        action,
+                        &mut camera,
+                        &mut selection,
+                        &world,
+                        &live,
+                    );
+                    match effect {
+                        Effect::Quit => break,
+                        Effect::SpawnInspect(_id) => {
+                            // 04-06 plugs the docker::inspect::fetch_detail
+                            // spawn here using Handle::current() (run_kitty is
+                            // sync but lives inside #[tokio::main]).
                         }
+                        Effect::None => {}
                     }
                 }
             }
@@ -527,10 +578,16 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
                 // (cell_aspect = 1.0), so the framing aspect must match,
                 // otherwise the scene fills only ~50% of the viewport (the
                 // ratio of kitty's wider horizontal NDC to braille's).
-                if !world.entities.is_empty() {
+                //
+                // GATED behind autopilot_active (04-03 CAM-03): a manual-mode
+                // user driving the camera must NOT be yanked back by every
+                // container add/remove.
+                if !world.entities.is_empty() && camera.autopilot_active {
                     camera.frame_scene_with_aspect(&world, 1.0);
                 }
                 last_count = world.entities.len();
+                // Drop a stale selection if the selected container disappeared.
+                selection.reconcile(&world);
             }
 
             // Terminal geometry: cells (cols/rows) for the status line + pixels for
@@ -562,6 +619,9 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
             // cadence (~30 FPS) drives smooth breathing independently of the
             // ~1Hz Stat sample arrival. Empty entity slice is a no-op.
             live.dress(dt, &mut world.entities);
+            // Advance the selection brightness-pulse phase by REAL dt — same
+            // framerate-independent path the breathing pass uses (04-03).
+            selection.tick(dt);
 
             if world.entities.is_empty() {
                 // Empty state: skip the image, write a centered banner. The
@@ -584,8 +644,17 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
                 write!(stdout, "\x1b[{banner_row};{banner_col}H{banner}")?;
             } else {
                 let view = camera.view_params(DEFAULT_FOV);
-                let rgba =
-                    render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
+                let rgba = render_rgba(
+                    &world.entities,
+                    view,
+                    &world.bounds,
+                    &palette,
+                    w,
+                    h,
+                    spin,
+                    selection.selected_id,
+                    selection.pulse_phase,
+                );
                 delete_all(&mut stdout)?;
                 write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
                 emit_kitty(&mut stdout, &rgba, w, h)?;
@@ -593,10 +662,13 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
             }
             // Status bar on the reserved bottom row (mirrors the braille HUD).
             // The box count is the live container count (or 0 in the empty state).
+            // The mode field flips "auto" -> "manual" the moment the user
+            // presses a camera-driving key (04-03 CAM-03).
             let boxes = world.entities.len();
+            let mode = if camera.autopilot_active { "auto" } else { "manual" };
             write!(
                 stdout,
-                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | boxes: {boxes} | kitty | q to quit"
+                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | boxes: {boxes} | mode: {mode} | kitty | arrows orbit, Tab select, q to quit"
             )?;
             stdout.flush()?;
 
@@ -626,7 +698,17 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
     // the dump shows boxes mid-rotation (not all axis-aligned/edge-on).
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
-    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
+    let rgba = render_rgba(
+        &world.entities,
+        view,
+        &world.bounds,
+        &palette,
+        w,
+        h,
+        spin,
+        None,
+        0.0,
+    );
     std::fs::write(path, &rgba)?;
     println!("{w} {h} {}", rgba.len());
     Ok(())
@@ -763,7 +845,17 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
     camera.frame_scene_with_aspect(&world, 1.0);
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
-    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
+    let rgba = render_rgba(
+        &world.entities,
+        view,
+        &world.bounds,
+        &palette,
+        w,
+        h,
+        spin,
+        None,
+        0.0,
+    );
     std::fs::write(path, &rgba)?;
     let solid = world
         .entities
@@ -825,7 +917,17 @@ pub fn dump_rgba_mixed(path: &str, w: usize, h: usize) -> Result<()> {
     camera.frame_scene_with_aspect(&world, 1.0);
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
-    let rgba = render_rgba(&world.entities, view, &world.bounds, &palette, w, h, spin);
+    let rgba = render_rgba(
+        &world.entities,
+        view,
+        &world.bounds,
+        &palette,
+        w,
+        h,
+        spin,
+        None,
+        0.0,
+    );
     std::fs::write(path, &rgba)?;
     println!("{w} {h} {}", rgba.len());
     Ok(())
@@ -918,8 +1020,8 @@ mod tests {
         };
 
         // Color A alone (drop B) to learn its exact rendered center pixel.
-        let only_a = render_rgba(&[near_box], view, &bounds, &palette, w, h, 0.0);
-        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
+        let only_a = render_rgba(&[near_box], view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
 
         let center = ((h / 2) * w + (w / 2)) * 4;
         let a_px = &only_a[center..center + 3];
@@ -972,7 +1074,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
+        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
 
         let mut colors: HashSet<(u8, u8, u8)> = HashSet::new();
         for px in rgba.chunks_exact(4) {
@@ -1012,7 +1114,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
+        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
         let bg = to_rgb(palette.background);
 
         // Pixels are lit (the 12 edges project to some screen pixels).
@@ -1084,8 +1186,8 @@ mod tests {
             fov: DEFAULT_FOV,
         };
         // Render the solid alone, then both, and compare the front-face region.
-        let solid_only = render_rgba(&[entities[0]], view, &bounds, &palette, w, h, 0.0);
-        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0);
+        let solid_only = render_rgba(&[entities[0]], view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
         // Sample a horizontal strip across the middle row — wherever the
         // solid box lit a pixel, the BOTH render must match exactly (the
         // wireframe behind was occluded, contributing nothing).
@@ -1120,7 +1222,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&[], view, &bounds, &palette, w, h, 0.0);
+        let rgba = render_rgba(&[], view, &bounds, &palette, w, h, 0.0, None, 0.0);
         let bg = to_rgb(palette.background);
         assert_eq!(rgba.len(), w * h * 4);
         for px in rgba.chunks_exact(4) {
