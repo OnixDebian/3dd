@@ -26,8 +26,9 @@ use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::render3d::cube::{unit_cube, CUBE_EDGES};
 use crate::render3d::project::Projector;
+use crate::render3d::scene_extras::SceneExtras;
 use crate::render3d::{rotate_y_about, ViewParams};
-use crate::theme::Palette;
+use crate::theme::{Palette, Status};
 use crate::world::entity::Entity;
 use crate::world::scene::{synthetic_scene, SceneBounds};
 use crate::world::selection::Selection;
@@ -76,6 +77,7 @@ pub fn render_rgba(
     spin: f32,
     selected_id: Option<u32>,
     selection_pulse_phase: f32,
+    extras: &SceneExtras<'_>,
 ) -> Vec<u8> {
     let (sw, sh) = (w * SS, h * SS);
     let bg = to_rgb(palette.background);
@@ -96,6 +98,50 @@ pub fn render_rgba(
     let cam_to_center = (view.eye - bounds.center).length();
     let near = cam_to_center - bounds.radius;
     let far = cam_to_center + bounds.radius;
+
+    // ENT-01 (04-04): floor-planes for each network group, drawn BEFORE the
+    // cube loop. The shared z-buffer in fill_tri/draw_line_z resolves
+    // overlap correctly: a near cube face naturally beats the floor at the
+    // pixels it overlaps because cubes sit ABOVE the floor in world Y, so
+    // their depth is closer to the camera at every shared screen pixel.
+    for floor in extras.floors {
+        let y = floor.center.y;
+        let hx = floor.half_size_xz.x;
+        let hz = floor.half_size_xz.y;
+        let corners = [
+            Vec3::new(floor.center.x - hx, y, floor.center.z - hz),
+            Vec3::new(floor.center.x + hx, y, floor.center.z - hz),
+            Vec3::new(floor.center.x + hx, y, floor.center.z + hz),
+            Vec3::new(floor.center.x - hx, y, floor.center.z + hz),
+        ];
+        let mut proj = [(0.0f32, 0.0f32, 0.0f32); 4];
+        let mut clipped = false;
+        for (slot, c) in proj.iter_mut().zip(corners.iter()) {
+            match projector.project(*c) {
+                Some((x, y, z)) => *slot = (x, y, z),
+                None => {
+                    clipped = true;
+                    break;
+                }
+            }
+        }
+        if clipped {
+            continue;
+        }
+        let line_rgb = to_rgb(floor.color);
+        for i in 0..4 {
+            draw_line_z(
+                &mut color,
+                &mut depth,
+                sw,
+                sh,
+                proj[i],
+                proj[(i + 1) % 4],
+                line_rgb,
+                WIRE_HALF_PX,
+            );
+        }
+    }
 
     // The unit cube is the per-box geometry template; faces/normals are reused for
     // every entity (transformed below), so build it once.
@@ -175,6 +221,110 @@ pub fn render_rgba(
                 let shaded = scale_brightness_rgb(shaded, pulse_mult);
                 draw_line_z(&mut color, &mut depth, sw, sh, pa, pb, shaded, WIRE_HALF_PX);
             }
+        }
+    }
+
+    // ENT-02 (04-04): port glow pass. Drawn AFTER the cube loop so it lands
+    // on TOP of cube faces — same emissive contract as the braille path: no
+    // fog, no Lambert. Each port's emissive quad sits at FACE_EPS outside
+    // the picked face, so its NDC z is fractionally smaller than the face
+    // it sits on; the shared z-buffer keeps it from being eaten by the
+    // cube fill that just landed there.
+    let glow_rgb = to_rgb(palette.status_color(Status::Running));
+    let port_face_axes: [(Vec3, Vec3, Vec3); 4] = [
+        (Vec3::Z, Vec3::X, Vec3::Y),         // +Z front (tie-break #1)
+        (Vec3::X, Vec3::NEG_Z, Vec3::Y),     // +X right
+        (Vec3::NEG_Z, Vec3::NEG_X, Vec3::Y), // -Z back
+        (Vec3::NEG_X, Vec3::Z, Vec3::Y),     // -X left
+    ];
+    for entity in entities {
+        let Some(ports) = extras.ports.get(&entity.id) else {
+            continue;
+        };
+        if ports.is_empty() {
+            continue;
+        }
+        // Pick camera-facing vertical face (deterministic tie-break order).
+        let to_eye = view.eye - entity.position;
+        let mut best: Option<(usize, f32)> = None;
+        for (i, (n, _, _)) in port_face_axes.iter().enumerate() {
+            let spun_n = rotate_y_about(*n, Vec3::ZERO, spin);
+            let d = spun_n.dot(to_eye);
+            if d <= 0.0 {
+                continue;
+            }
+            best = match best {
+                None => Some((i, d)),
+                Some((_, prev_d)) if d > prev_d => Some((i, d)),
+                _ => best,
+            };
+        }
+        let Some((face_idx, _)) = best else { continue };
+        let (normal, u_axis_local, v_axis_local) = port_face_axes[face_idx];
+        let spun_n = rotate_y_about(normal, Vec3::ZERO, spin);
+        let spun_u = rotate_y_about(u_axis_local, Vec3::ZERO, spin);
+        let spun_v = v_axis_local;
+        let h_u = if normal.x.abs() > 0.5 {
+            entity.half_extents.z
+        } else {
+            entity.half_extents.x
+        };
+        let h_v = entity.half_extents.y;
+        let h_n = if normal.x.abs() > 0.5 {
+            entity.half_extents.x
+        } else {
+            entity.half_extents.z
+        };
+        const FACE_EPS: f32 = 1e-3;
+        let face_center = entity.position + spun_n * (h_n + FACE_EPS);
+        let dot_half = 0.08 * h_u.min(h_v).max(0.05);
+        for (i, _port) in ports.iter().take(9).enumerate() {
+            let col = (i % 3) as f32;
+            let row = (i / 3) as f32;
+            let u_off = ((col + 1.0) / 4.0 - 0.5) * 2.0;
+            let v_off = ((row + 1.0) / 4.0 - 0.5) * 2.0;
+            let port_pos = face_center + spun_u * (u_off * h_u) + spun_v * (v_off * h_v);
+            let verts = [
+                port_pos - spun_u * dot_half - spun_v * dot_half,
+                port_pos + spun_u * dot_half - spun_v * dot_half,
+                port_pos + spun_u * dot_half + spun_v * dot_half,
+                port_pos - spun_u * dot_half + spun_v * dot_half,
+            ];
+            let mut proj_pts = [(0.0f32, 0.0f32, 0.0f32); 4];
+            let mut clipped = false;
+            for (slot, v) in proj_pts.iter_mut().zip(verts.iter()) {
+                match projector.project(*v) {
+                    Some((x, y, z)) => *slot = (x, y, z),
+                    None => {
+                        clipped = true;
+                        break;
+                    }
+                }
+            }
+            if clipped {
+                continue;
+            }
+            // Two triangles, FULL brightness emissive (no shade, no fog).
+            fill_tri(
+                &mut color,
+                &mut depth,
+                sw,
+                sh,
+                proj_pts[0],
+                proj_pts[1],
+                proj_pts[2],
+                glow_rgb,
+            );
+            fill_tri(
+                &mut color,
+                &mut depth,
+                sw,
+                sh,
+                proj_pts[0],
+                proj_pts[2],
+                proj_pts[3],
+                glow_rgb,
+            );
         }
     }
 
@@ -468,6 +618,57 @@ fn delete_all(out: &mut impl Write) -> io::Result<()> {
 /// inline graphics at all, so the app must fall back to the braille renderer there.
 /// This uses env hints (reliable for the common cases); a runtime query handshake
 /// would be the fully robust upgrade.
+/// Build floor-planes for the kitty path. Mirrors the braille builder in
+/// `ui::scene` — the selected entity's group_key gets the indigo
+/// status_color(Running) highlight, every other group gets palette.edge.
+fn build_floor_planes_kitty(
+    live: &LiveWorld,
+    selection: &Selection,
+    palette: &Palette,
+) -> Vec<crate::render3d::scene_extras::FloorPlane> {
+    let selected_group_key: Option<String> = selection
+        .selected_id
+        .and_then(|id| live.id_string_for_entity(id).map(|s| s.to_string()))
+        .and_then(|cid| live.snapshot(&cid).map(|s| s.group_key.clone()));
+
+    live.group_bounds_xz()
+        .into_iter()
+        .map(|(key, center, half_size_xz)| {
+            let color = if selected_group_key.as_deref() == Some(key.as_str()) {
+                palette.status_color(Status::Running)
+            } else {
+                palette.edge
+            };
+            crate::render3d::scene_extras::FloorPlane {
+                center,
+                half_size_xz,
+                color,
+            }
+        })
+        .collect()
+}
+
+/// Build the per-entity port lookup for the kitty path. Mirrors the braille
+/// path: borrows `ContainerSnapshot.ports` directly from LiveWorld entries,
+/// keyed by `Entity.id` so the renderer's port glow pass can do a direct
+/// `extras.ports.get(&entity.id)` lookup.
+fn build_port_lookup_kitty<'a>(
+    world: &World,
+    live: &'a LiveWorld,
+) -> crate::render3d::scene_extras::PortLookup<'a> {
+    let mut map = crate::render3d::scene_extras::PortLookup::new();
+    for entity in &world.entities {
+        if let Some(cid) = live.id_string_for_entity(entity.id) {
+            if let Some(snap) = live.snapshot(cid) {
+                if !snap.ports.is_empty() {
+                    map.insert(entity.id, snap.ports.as_slice());
+                }
+            }
+        }
+    }
+    map
+}
+
 pub fn supports_kitty_graphics() -> bool {
     if std::env::var_os("KITTY_WINDOW_ID").is_some()
         || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
@@ -529,6 +730,11 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
     // so we can clear the image surface exactly when transitioning empty ->
     // non-empty (and vice versa) without flickering on every banner-only loop.
     let mut last_was_empty = true;
+    // 04-04 label state: the (col, row, len) of the LAST cell-grid label the
+    // kitty path drew, so we can erase it with spaces BEFORE writing the new
+    // one. Avoids stale-label streaks when the selection moves or the box
+    // spins past the camera-facing position.
+    let mut last_label_print: Option<(u16, u16, usize)> = None;
 
     let result = (|| -> Result<()> {
         loop {
@@ -644,6 +850,13 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
                 write!(stdout, "\x1b[{banner_row};{banner_col}H{banner}")?;
             } else {
                 let view = camera.view_params(DEFAULT_FOV);
+                // 04-04 extras: build floor-planes + port lookup PER FRAME
+                // from the live world. No clones: PortLookup borrows ports
+                // from LiveWorld entries via `snapshot`.
+                let floors = build_floor_planes_kitty(&live, &selection, &palette);
+                let ports = build_port_lookup_kitty(&world, &live);
+                let extras = SceneExtras::new(floors.as_slice(), &ports);
+
                 let rgba = render_rgba(
                     &world.entities,
                     view,
@@ -654,11 +867,65 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
                     spin,
                     selection.selected_id,
                     selection.pulse_phase,
+                    &extras,
                 );
                 delete_all(&mut stdout)?;
                 write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
                 emit_kitty(&mut stdout, &rgba, w, h)?;
                 last_was_empty = false;
+
+                // 04-04 CONT-04: selected-only cell-grid label via
+                // execute!(MoveTo + Print). Pitfall C — we deliberately do
+                // NOT bake the text into the RGBA buffer; that would render
+                // at fuzzy braille resolution. Print on the terminal cell
+                // grid for terminal-font crispness.
+                //
+                // Clear the previous frame's label first so a moved
+                // selection doesn't leave a streak.
+                if let Some((pcol, prow, plen)) = last_label_print.take() {
+                    write!(stdout, "\x1b[{prow};{pcol}H{}", " ".repeat(plen))?;
+                }
+                if let Some(sel_entity) = selection.selected_entity(&world) {
+                    let cell_w_px = (px_w / cols as usize).max(1);
+                    let cell_h_px = cell_h;
+                    if let Some(anchor) = crate::ui::labels::project_label_anchor(
+                        &camera,
+                        sel_entity,
+                        (w as u32, h as u32),
+                        1.0, // kitty path is square-pixel
+                    ) {
+                        let (cell_col, cell_row) =
+                            crate::ui::labels::snap_anchor_with_hysteresis(
+                                anchor,
+                                &mut selection.last_label_cell_kitty,
+                                (cell_w_px as u32, cell_h_px as u32),
+                            );
+                        // Pull the container name; truncate for safety.
+                        let name = live
+                            .id_string_for_entity(sel_entity.id)
+                            .and_then(|cid| live.snapshot(cid))
+                            .map(|s| {
+                                crate::ui::labels::truncate_label(s.name.as_str())
+                                    .into_owned()
+                            })
+                            .unwrap_or_default();
+                        if !name.is_empty() {
+                            // 1-indexed terminal cells; one row above the box top.
+                            let term_col = (cell_col.max(0) as u16) + 1;
+                            let term_row = (cell_row.max(0) as u16).saturating_sub(1) + 1;
+                            // Clamp to terminal bounds: don't write past the
+                            // reserved status bar row (rows - 1).
+                            let term_row = term_row.clamp(1, rows.saturating_sub(1).max(1));
+                            let term_col = term_col.clamp(1, cols.max(1));
+                            write!(stdout, "\x1b[{term_row};{term_col}H{name}")?;
+                            last_label_print = Some((term_col, term_row, name.chars().count()));
+                        }
+                    }
+                } else {
+                    // No selection (or none-visible): reset hysteresis state
+                    // so the next selection snaps to its anchor immediately.
+                    selection.last_label_cell_kitty = None;
+                }
             }
             // Status bar on the reserved bottom row (mirrors the braille HUD).
             // The box count is the live container count (or 0 in the empty state).
@@ -698,6 +965,11 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
     // the dump shows boxes mid-rotation (not all axis-aligned/edge-on).
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
+    // Offline dump: no live selection, no live ports / floors. SceneExtras
+    // carries empty slices, so the renderer skips floor + port passes.
+    let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+    let ports = crate::render3d::scene_extras::PortLookup::new();
+    let extras = SceneExtras::new(&floors, &ports);
     let rgba = render_rgba(
         &world.entities,
         view,
@@ -708,6 +980,7 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
         spin,
         None,
         0.0,
+        &extras,
     );
     std::fs::write(path, &rgba)?;
     println!("{w} {h} {}", rgba.len());
@@ -845,6 +1118,13 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
     camera.frame_scene_with_aspect(&world, 1.0);
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
+    // Offline snapshot: build floor-planes from the live world so the dump
+    // exercises the ENT-01 wiring even when no graphics terminal is
+    // attached. Port lookup borrows live snapshot ports (often empty in
+    // dump_snapshot since seed snapshots may not have rich port data).
+    let floors = build_floor_planes_kitty(&live, &Selection::new(), &palette);
+    let ports = build_port_lookup_kitty(&world, &live);
+    let extras = SceneExtras::new(floors.as_slice(), &ports);
     let rgba = render_rgba(
         &world.entities,
         view,
@@ -855,6 +1135,7 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
         spin,
         None,
         0.0,
+        &extras,
     );
     std::fs::write(path, &rgba)?;
     let solid = world
@@ -917,6 +1198,9 @@ pub fn dump_rgba_mixed(path: &str, w: usize, h: usize) -> Result<()> {
     camera.frame_scene_with_aspect(&world, 1.0);
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
+    let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+    let ports = crate::render3d::scene_extras::PortLookup::new();
+    let extras = SceneExtras::new(&floors, &ports);
     let rgba = render_rgba(
         &world.entities,
         view,
@@ -927,6 +1211,7 @@ pub fn dump_rgba_mixed(path: &str, w: usize, h: usize) -> Result<()> {
         spin,
         None,
         0.0,
+        &extras,
     );
     std::fs::write(path, &rgba)?;
     println!("{w} {h} {}", rgba.len());
@@ -936,6 +1221,39 @@ pub fn dump_rgba_mixed(path: &str, w: usize, h: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: render_rgba with empty SceneExtras (no floor-planes, no
+    /// ports). Mirrors `crate::render3d::raster::tests::empty_extras`. Used
+    /// by every existing render_rgba test — none of them exercise floors or
+    /// ports (those have their own focused suites + the visual gate).
+    #[allow(clippy::too_many_arguments)]
+    fn rgba_empty_extras(
+        entities: &[Entity],
+        view: ViewParams,
+        bounds: &SceneBounds,
+        palette: &Palette,
+        w: usize,
+        h: usize,
+        spin: f32,
+        selected_id: Option<u32>,
+        pulse_phase: f32,
+    ) -> Vec<u8> {
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports = crate::render3d::scene_extras::PortLookup::new();
+        let extras = SceneExtras::new(&floors, &ports);
+        render_rgba(
+            entities,
+            view,
+            bounds,
+            palette,
+            w,
+            h,
+            spin,
+            selected_id,
+            pulse_phase,
+            &extras,
+        )
+    }
 
     /// The top face's shade must NOT change as the camera orbits in yaw (fixed
     /// pitch/radius). This pins the fix for the "top flickers brighter/darker"
@@ -1020,8 +1338,8 @@ mod tests {
         };
 
         // Color A alone (drop B) to learn its exact rendered center pixel.
-        let only_a = render_rgba(&[near_box], view, &bounds, &palette, w, h, 0.0, None, 0.0);
-        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let only_a = rgba_empty_extras(&[near_box], view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let both = rgba_empty_extras(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
 
         let center = ((h / 2) * w + (w / 2)) * 4;
         let a_px = &only_a[center..center + 3];
@@ -1074,7 +1392,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let rgba = rgba_empty_extras(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
 
         let mut colors: HashSet<(u8, u8, u8)> = HashSet::new();
         for px in rgba.chunks_exact(4) {
@@ -1114,7 +1432,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let rgba = rgba_empty_extras(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
         let bg = to_rgb(palette.background);
 
         // Pixels are lit (the 12 edges project to some screen pixels).
@@ -1186,8 +1504,8 @@ mod tests {
             fov: DEFAULT_FOV,
         };
         // Render the solid alone, then both, and compare the front-face region.
-        let solid_only = render_rgba(&[entities[0]], view, &bounds, &palette, w, h, 0.0, None, 0.0);
-        let both = render_rgba(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let solid_only = rgba_empty_extras(&[entities[0]], view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let both = rgba_empty_extras(&entities, view, &bounds, &palette, w, h, 0.0, None, 0.0);
         // Sample a horizontal strip across the middle row — wherever the
         // solid box lit a pixel, the BOTH render must match exactly (the
         // wireframe behind was occluded, contributing nothing).
@@ -1222,7 +1540,7 @@ mod tests {
             up: Vec3::Y,
             fov: DEFAULT_FOV,
         };
-        let rgba = render_rgba(&[], view, &bounds, &palette, w, h, 0.0, None, 0.0);
+        let rgba = rgba_empty_extras(&[], view, &bounds, &palette, w, h, 0.0, None, 0.0);
         let bg = to_rgb(palette.background);
         assert_eq!(rgba.len(), w * h * 4);
         for px in rgba.chunks_exact(4) {
