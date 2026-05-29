@@ -5,6 +5,7 @@
 //! rasterizer draws sits on top of.
 
 pub mod cube;
+pub mod cylinder;
 pub mod framebuffer;
 pub mod plane;
 pub mod project;

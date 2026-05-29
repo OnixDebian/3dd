@@ -691,7 +691,12 @@ fn fog_factor(distance: f32, near: f32, far: f32) -> f32 {
 /// indices) so per-box geometry reaches the fill in the multi-box path. If any
 /// corner clips off-screen the face is skipped (the scene-framing camera keeps
 /// boxes in-frustum, so this is rare).
-fn fill_face(fb: &mut Framebuffer, projector: &Projector, verts: &[Vec3; 4], color: Color) {
+///
+/// `pub(crate)` so the cylinder primitive (`render3d::cylinder`) and the stack
+/// primitive (`render3d::stack`, via cube reuse) can share the same fill path
+/// — keeps every braille surface going through the SAME triangle fill +
+/// fb.set so coverage / majority-color resolve stays unified.
+pub(crate) fn fill_face(fb: &mut Framebuffer, projector: &Projector, verts: &[Vec3; 4], color: Color) {
     let mut pts = [(0.0f32, 0.0f32); 4];
     for (slot, &v) in pts.iter_mut().zip(verts.iter()) {
         match projector.project(v) {
@@ -707,7 +712,11 @@ fn fill_face(fb: &mut Framebuffer, projector: &Projector, verts: &[Vec3; 4], col
 /// Barycentric triangle fill into the framebuffer. Iterates the integer pixel
 /// bounding box (clamped to the framebuffer) and lights pixels whose center lies
 /// inside the triangle. Degenerate (zero-area) triangles light nothing.
-fn fill_triangle(
+///
+/// `pub(crate)` so `render3d::cylinder` can use the same fill for its octagon
+/// cap fan-triangulation — keeps every braille surface going through the
+/// SAME edge-function rasterizer and EDGE_EPS seam tolerance.
+pub(crate) fn fill_triangle(
     fb: &mut Framebuffer,
     a: (f32, f32),
     b: (f32, f32),
