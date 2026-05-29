@@ -151,6 +151,12 @@ impl App {
         // Advance the per-box self-spin by REAL elapsed time, wrapped to [0, TAU).
         let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
         self.spin = (self.spin + SPIN_RATE * dt).rem_euclid(std::f32::consts::TAU);
+        // Per-frame size easing (CONT-03 / 04-01). Mutates `half_extents` in
+        // place on the live world's entity slice — no World reallocation per
+        // tick (RESEARCH Pitfall A). dt is REAL elapsed time; `on_tick` is
+        // the canonical place for framerate-independent motion. Empty world
+        // is a no-op (zero-length slice).
+        self.live.dress(dt, &mut self.world.entities);
     }
 
     /// Drain everything currently queued on the Docker channel (non-blocking)

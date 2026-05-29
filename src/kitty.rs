@@ -556,6 +556,12 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
             }
             camera.step(dt); // holds a fixed framing angle now (YAW_RATE == 0)
             spin = (spin + SPIN_RATE * dt).rem_euclid(std::f32::consts::TAU);
+            // Per-frame size easing (CONT-03 / 04-01). See
+            // `world::live::dress` rustdoc + RESEARCH Pitfall A: sizes are
+            // eased here, NOT via a Stat-driven World rebuild, so the frame
+            // cadence (~30 FPS) drives smooth breathing independently of the
+            // ~1Hz Stat sample arrival. Empty entity slice is a no-op.
+            live.dress(dt, &mut world.entities);
 
             if world.entities.is_empty() {
                 // Empty state: skip the image, write a centered banner. The

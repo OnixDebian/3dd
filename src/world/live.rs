@@ -68,9 +68,8 @@ use glam::Vec3;
 use crate::docker::stats::StatSample;
 use crate::docker::{ContainerSnapshot, EnrichedSnapshot};
 use crate::theme::Status;
-// Per-frame easing pass (CONT-03) — `dress(dt)` lands in 04-02 alongside
-// the Enriched handler.
-#[allow(unused_imports)]
+// Per-frame easing pass (CONT-03 / 04-01) — `dress(dt)` is the per-tick
+// size easing path defined below; both renderers call it once per frame.
 use crate::world::easing::{critically_damped, BREATHING_HALF_LIFE};
 use crate::world::entity::{load_to_half_extent, Entity};
 use crate::world::layout::layout;
@@ -356,14 +355,80 @@ impl LiveWorld {
         false
     }
 
-    /// Phase-4 04-02 placeholder. The Enriched variant carries inspect-time
-    /// fields (ports, mount_count, status_override, group_key migration) that
-    /// the off-thread `docker::inspect::enrich_snapshot_*` calls produce.
-    /// The full handler — including the slot-migration path when group_key
-    /// changes — lands with 04-02; 04-01 only wires the variant to keep the
-    /// build green for the in-flight 04-02 work. As a stub it's a no-op.
-    fn handle_enriched(&mut self, _enr: EnrichedSnapshot) -> bool {
-        false
+    /// Handle an [`EnrichedSnapshot`] from an off-thread `inspect_container`
+    /// call (04-02 / Phase 3 carryovers).
+    ///
+    /// Three effects, in order:
+    ///
+    /// 1. **In-place field updates.** `ports` and `mount_count` always update
+    ///    on the live entry's `ContainerSnapshot` — no slot migration, no
+    ///    position change. These feed Phase 4 ENT-02 / ENT-03.
+    /// 2. **status_override.** When set (currently only `Some(Crashed)` from
+    ///    `enrich_snapshot_on_seed` for exited-OOM / exited-nonzero
+    ///    containers), promote the entry's status — Phase 3 carryover (1).
+    /// 3. **Slot migration.** When `group_key` differs from what the entry
+    ///    currently has, MIGRATE the slot to the new group: free the old
+    ///    slot (same as Removed), allocate the lowest-free in the new group,
+    ///    update `id_to_addr`, refresh `snap.group_key`. Other containers in
+    ///    the OLD or NEW group keep their `(group, index)` — anti-teleport
+    ///    invariant preserved (CONT-05 still holds across network changes).
+    ///
+    /// Returns `true` whenever any topology-visible change happened (status
+    /// upgrade, slot migration, or ports/mounts refresh) — the renderer needs
+    /// the World rebuilt to see the new fields. Unknown ids (race window
+    /// where the container was removed between the inspect dispatch and the
+    /// inspect result) are silent no-ops, never panics.
+    fn handle_enriched(&mut self, enr: EnrichedSnapshot) -> bool {
+        // Lookup current address — `None` means the container was removed
+        // before the off-thread inspect could complete. Best-effort: drop it.
+        let Some(&(old_group, old_idx)) = self.id_to_addr.get(&enr.id) else {
+            return false;
+        };
+
+        // 1. In-place updates to fields that don't require slot migration.
+        if let Some(entry) = self.entries.get_mut(&enr.id) {
+            entry.snap.ports = enr.ports.clone();
+            entry.snap.mount_count = enr.mount_count;
+            // 2. status_override — currently only Stopped -> Crashed.
+            if let Some(s) = enr.status_override {
+                if entry.snap.status != s {
+                    entry.snap.status = s;
+                }
+            }
+        }
+
+        // 3. Slot migration when the group_key changed (Phase 3 carryover (3)).
+        let current_group_key = self.entries[&enr.id].snap.group_key.clone();
+        if current_group_key == enr.group_key {
+            // Same group — only ports/mounts/status may have changed, but
+            // those ARE topology-visible (the renderer needs the rebuild so
+            // ENT-02/ENT-03 see the new ports / mount_count, and any status
+            // override changes the wireframe/solid choice).
+            return true;
+        }
+
+        // Free the old slot — like handle_removed, only null this group's
+        // slot. Same-group neighbors keep their positions.
+        self.group_slots[old_group as usize][old_idx] = None;
+
+        // Allocate the new slot in the (possibly new) group.
+        let new_group = self.ensure_group(&enr.group_key);
+        let g = new_group as usize;
+        let new_idx = match self.group_slots[g].iter().position(|s| s.is_none()) {
+            Some(i) => {
+                self.group_slots[g][i] = Some(enr.id.clone());
+                i
+            }
+            None => {
+                self.group_slots[g].push(Some(enr.id.clone()));
+                self.group_slots[g].len() - 1
+            }
+        };
+        self.id_to_addr.insert(enr.id.clone(), (new_group, new_idx));
+        if let Some(entry) = self.entries.get_mut(&enr.id) {
+            entry.snap.group_key = enr.group_key.clone();
+        }
+        true
     }
 
     // --- Helpers --------------------------------------------------------------
