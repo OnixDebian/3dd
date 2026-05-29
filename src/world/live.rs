@@ -215,6 +215,7 @@ impl LiveWorld {
             DockerMsg::Removed(id) => self.handle_removed(&id),
             DockerMsg::StatusChanged(id, status) => self.handle_status(&id, status),
             DockerMsg::Stat(id, sample) => self.handle_stat(&id, sample),
+            DockerMsg::Enriched(enr) => self.handle_enriched(enr),
         };
 
         if changed {
@@ -222,6 +223,16 @@ impl LiveWorld {
         } else {
             None
         }
+    }
+
+    /// Read-only access to a live entry's [`ContainerSnapshot`] by container id.
+    ///
+    /// Used by Phase 4 ENT-02 (port glow) and ENT-03 (volume cylinders) to
+    /// read `ports` / `mount_count` directly from the live entry without
+    /// re-fetching from Docker — both fields are seeded by `from_bollard_summary`
+    /// and refreshed by [`DockerMsg::Enriched`].
+    pub fn snapshot(&self, id: &str) -> Option<&ContainerSnapshot> {
+        self.entries.get(id).map(|e| &e.snap)
     }
 
     // --- Message handlers (all return `true` iff the scene actually changed) -
@@ -342,6 +353,16 @@ impl LiveWorld {
         // 04-01: Stat sets a TARGET only — the per-frame dress() pass eases
         // the box size in place. Never rebuild the World on Stat (RESEARCH
         // Pitfall A: per-tick rebuild on continuous easing).
+        false
+    }
+
+    /// Phase-4 04-02 placeholder. The Enriched variant carries inspect-time
+    /// fields (ports, mount_count, status_override, group_key migration) that
+    /// the off-thread `docker::inspect::enrich_snapshot_*` calls produce.
+    /// The full handler — including the slot-migration path when group_key
+    /// changes — lands with 04-02; 04-01 only wires the variant to keep the
+    /// build green for the in-flight 04-02 work. As a stub it's a no-op.
+    fn handle_enriched(&mut self, _enr: EnrichedSnapshot) -> bool {
         false
     }
 
