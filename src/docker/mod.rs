@@ -32,6 +32,7 @@ pub mod stats;
 
 pub mod domain;
 pub mod connect;
+pub mod images;
 pub mod inspect;
 pub mod streams;
 
@@ -43,5 +44,6 @@ pub use domain::{
     from_bollard_summary, map_status, ContainerSnapshot, EnrichedSnapshot, PortProto, PortSummary,
 };
 pub use connect::{connect_and_probe, ProbeError};
+pub use images::{fetch_image_snapshots, ImageSnapshot};
 pub use inspect::{enrich_snapshot_on_seed, enrich_snapshot_on_start};
 pub use streams::spawn_docker_tasks;
