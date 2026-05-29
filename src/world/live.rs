@@ -1001,4 +1001,191 @@ mod tests {
             "non-Running with no stat must hold the baseline, got {h}"
         );
     }
+
+    // --- 04-02: Enriched / slot migration / Phase 3 carryovers ----------------
+
+    use crate::docker::{EnrichedSnapshot, PortProto, PortSummary as DomainPortSummary};
+
+    fn enriched(
+        id: &str,
+        group_key: &str,
+        ports: Vec<DomainPortSummary>,
+        mount_count: usize,
+        status_override: Option<Status>,
+    ) -> EnrichedSnapshot {
+        EnrichedSnapshot {
+            id: id.to_string(),
+            group_key: group_key.to_string(),
+            ports,
+            mount_count,
+            status_override,
+        }
+    }
+
+    /// Done criterion: Enriched for a never-Added id is a silent no-op
+    /// (race-window where the container was removed before the off-thread
+    /// inspect returned).
+    #[test]
+    fn enriched_unknown_id_is_noop() {
+        let mut lw = LiveWorld::new();
+        assert!(lw
+            .apply(DockerMsg::Enriched(enriched("ghost", "net0", vec![], 0, None)))
+            .is_none());
+        assert_eq!(lw.len(), 0);
+    }
+
+    /// Done criterion: Enriched with the SAME group_key updates ports +
+    /// mount_count in place and rebuilds the World. Slot/position unchanged.
+    #[test]
+    fn enriched_same_group_updates_in_place() {
+        let mut lw = LiveWorld::new();
+        let w0 = lw
+            .apply(DockerMsg::Added(snap("a", "net0", Status::Running)))
+            .expect("Added must produce a World");
+        let pos_before = position_of(&w0, eid(0, 0));
+
+        let ports = vec![
+            DomainPortSummary {
+                private: 80,
+                public: Some(8080),
+                proto: PortProto::Tcp,
+            },
+            DomainPortSummary {
+                private: 443,
+                public: None,
+                proto: PortProto::Tcp,
+            },
+        ];
+        let w1 = lw
+            .apply(DockerMsg::Enriched(enriched(
+                "a",
+                "net0",
+                ports.clone(),
+                3,
+                None,
+            )))
+            .expect("Enriched on same-group still triggers rebuild");
+
+        // Position unchanged.
+        assert_eq!(
+            position_of(&w1, eid(0, 0)),
+            pos_before,
+            "container moved despite same group_key"
+        );
+        // snapshot() surfaces ports + mount_count for ENT-02 / ENT-03.
+        let snap_now = lw.snapshot("a").expect("a is alive");
+        assert_eq!(snap_now.ports, ports);
+        assert_eq!(snap_now.mount_count, 3);
+    }
+
+    /// Done criterion: Enriched with a NEW group_key migrates the slot —
+    /// the migrating container moves to the new group's Z-band, OTHER
+    /// containers in the OLD group keep their positions (anti-teleport for
+    /// non-migrating neighbors, Phase 3 carryover (3)).
+    #[test]
+    fn enriched_new_group_migrates_slot() {
+        let mut lw = LiveWorld::new();
+        // Seed: a and b both in group "old". a took slot 0, b took slot 1.
+        lw.apply(DockerMsg::Added(snap("a", "old", Status::Running)));
+        let w0 = lw
+            .apply(DockerMsg::Added(snap("b", "old", Status::Running)))
+            .expect("Added must produce a World");
+        let pos_a_before = position_of(&w0, eid(0, 0));
+        let pos_b_before = position_of(&w0, eid(0, 1));
+
+        // Migrate "a" to group "new". b stays in "old".
+        let w1 = lw
+            .apply(DockerMsg::Enriched(enriched("a", "new", vec![], 0, None)))
+            .expect("group_key change must rebuild");
+
+        // a is now at (group=1, slot=0) — first slot in the new group.
+        let pos_a_after = w1
+            .entities
+            .iter()
+            .find(|e| e.id == eid(1, 0))
+            .map(|e| e.position)
+            .expect("a should now occupy group 1 / slot 0");
+        assert_ne!(
+            pos_a_after, pos_a_before,
+            "a's position didn't change despite group migration"
+        );
+        // b stayed at group-0/slot-1 (anti-teleport for neighbors).
+        assert_eq!(
+            position_of(&w1, eid(0, 1)),
+            pos_b_before,
+            "b teleported on a's migration"
+        );
+        // a's old slot (group-0/slot-0) is no longer in the world.
+        assert!(
+            w1.entities.iter().all(|e| e.id != eid(0, 0)),
+            "a's old slot (group-0/slot-0) leaked into world"
+        );
+        // The migrated container has the new group_key.
+        assert_eq!(lw.snapshot("a").unwrap().group_key, "new");
+    }
+
+    /// Done criterion: Enriched with `status_override: Some(Crashed)`
+    /// upgrades a Stopped entry to Crashed (Phase 3 carryover (1) — exited-
+    /// with-OOM containers that seeded as Stopped via list_containers).
+    #[test]
+    fn enriched_status_override_upgrades_stopped_to_crashed() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Stopped)));
+        assert_eq!(lw.snapshot("a").unwrap().status, Status::Stopped);
+
+        let w = lw
+            .apply(DockerMsg::Enriched(enriched(
+                "a",
+                "net0",
+                vec![],
+                0,
+                Some(Status::Crashed),
+            )))
+            .expect("status_override must trigger rebuild");
+        let entity = w
+            .entities
+            .iter()
+            .find(|e| e.id == eid(0, 0))
+            .expect("a is in world");
+        assert_eq!(entity.status, Status::Crashed);
+        assert_eq!(lw.snapshot("a").unwrap().status, Status::Crashed);
+    }
+
+    /// Done criterion: Enriched with `status_override: None` does NOT change
+    /// the entry's status — the override is opt-in. ports/mounts still update.
+    #[test]
+    fn enriched_status_override_none_does_not_change_status() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        let w = lw
+            .apply(DockerMsg::Enriched(enriched(
+                "a", "net0", vec![], 2, None,
+            )))
+            .expect("Enriched must rebuild");
+        let entity = w
+            .entities
+            .iter()
+            .find(|e| e.id == eid(0, 0))
+            .expect("a is in world");
+        assert_eq!(
+            entity.status,
+            Status::Running,
+            "status_override=None must NOT flip Running"
+        );
+        assert_eq!(lw.snapshot("a").unwrap().mount_count, 2);
+    }
+
+    /// Sanity: snapshot() surfaces the live ContainerSnapshot for reading;
+    /// unknown ids return None (used by ENT-02/ENT-03 to read ports /
+    /// mount_count without re-fetching).
+    #[test]
+    fn snapshot_returns_live_snapshot_or_none() {
+        let mut lw = LiveWorld::new();
+        assert!(lw.snapshot("nope").is_none());
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        let s = lw.snapshot("a").expect("a is alive");
+        assert_eq!(s.id, "a");
+        assert_eq!(s.group_key, "net0");
+        assert_eq!(s.status, Status::Running);
+    }
 }
