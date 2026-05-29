@@ -5,14 +5,14 @@
 See: .planning/PROJECT.md (updated 2026-05-26)
 
 **Core value:** A beautiful, legible 3D scene that lets you grasp the state of your Docker environment at a glance — what's alive, what's hot, what's connected to what.
-**Current focus:** Phase 3 (Docker Data Layer) — COMPLETE. All five Phase 3 criteria observably TRUE end-to-end. Next: Phase 4 (Networks / HUD) planning.
+**Current focus:** Phase 4 (Animation & Interaction) — IN PROGRESS. 04-01 (breathing easing) + 04-02 (Enriched inspect path) COMPLETE. Next: Phase 4 plans 03–06.
 
 ## Current Position
 
-Phase: 3 of 5 (Docker Data Layer) — COMPLETE
-Plan: 4 of 4 complete (03-01 + 03-02 + 03-03 + 03-04)
-Status: Phase complete; pre-TUI probe + DockerMsg drain wired into both backends; live add/remove verified against real daemon (0→14→15→14); empty-state banners on both backends; 121/121 tests pass, clippy clean, release build clean
-Last activity: 2026-05-28 — Completed 03-04 (renderer wire): probe-before-Tui, mpsc channel into both backends, App + run_kitty drain DockerMsg non-blocking, count-change camera re-frame, EMPTY_BANNER on both backends, live visual verify against real daemon
+Phase: 4 of 5 (Animation & Interaction) — IN PROGRESS
+Plan: 04-02 COMPLETE (2 of 6 in this phase)
+Status: 04-02 closes Phase 3 carryovers (1)/(2)/(3) end-to-end. Bollard-free EnrichedSnapshot + docker::inspect module + DockerMsg::Enriched + LiveWorld::handle_enriched (slot migration preserves anti-teleport for non-migrating neighbors) + off-thread inspect spawns wired into seed pass (unconditional) and start event arm. ContainerSnapshot extended additively with ports + mount_count for ENT-02/ENT-03. 151/151 tests pass; clippy --all-targets -D warnings clean; release build clean; bollard isolation invariant intact (grep -rn 'use bollard' src/ | grep -v src/docker/ returns NOTHING).
+Last activity: 2026-05-29 — Completed 04-02 (inspect enrich + slot migration): four atomic per-task commits (275ed9d Task 1 ContainerSnapshot extension, 803f778 Task 2 docker::inspect module, 1c8ec84 Task 3 Enriched handler + tests, ea25dea Task 4 streams.rs spawns).
 
 ## Phase 2 Notes (for Phase 3 planning)
 
@@ -21,24 +21,27 @@ Last activity: 2026-05-28 — Completed 03-04 (renderer wire): probe-before-Tui,
 - **DEVIATION / RECONCILE (CAM-01):** roadmap criterion #4 was "autopilot ORBIT camera". Human overrode it live → shipped PER-BOX self-spin (each box rotates about its own Y at SPIN_RATE 0.525) + STATIC scene-framed camera (YAW_RATE=0). Motion is framerate-independent (on logic tick). REVISIT in Phase 4 when manual explore (CAM-02/03) lands — decide whether orbit returns or per-box-spin stays.
 - **Roadmap deviation carried from Phase 1:** kitty backend front-runs part of Phase 5 ROB-02 (capability/degrade). Still open.
 
-Progress: █████████░ ~90% (Phase 1: 5/5, Phase 2: 4/4, Phase 3: 4/4 COMPLETE; Phase 4+5 plans not yet drafted)
+Progress: ██████████ ~92% (Phase 1: 5/5, Phase 2: 4/4, Phase 3: 4/4, Phase 4: 2/6; Phase 5 plans not yet drafted)
 
 ## Performance Metrics
 
 **Velocity:**
-- Total plans completed: 4
-- Average duration: ~3 min
-- Total execution time: ~0 hours
+- Total plans completed: 14 (5 Phase 1 + 4 Phase 2 + 4 Phase 3 + 1 Phase 4)
+- Average duration: ~6 min
+- Total execution time: ~1.5 hours
 
 **By Phase:**
 
 | Phase | Plans | Total | Avg/Plan |
 |-------|-------|-------|----------|
 | 1 (Render Core) | 5/5 ✅ | ~27 min | ~5 min |
+| 2 (Scene) | 4/4 ✅ | ~14 min | ~3.5 min |
+| 3 (Docker) | 4/4 ✅ | ~12 min | ~3 min |
+| 4 (Animation) | 1/6 🟡 | ~25 min | ~25 min |
 
 **Recent Trend:**
-- Last 5 plans: 01-01 (2 min), 01-04 (4 min), 01-05 (~15 min incl. human-verify + tuning)
-- Trend: steady, with 01-05 longer due to the legibility human-verify loop
+- Last 5 plans: 03-02 (~3 min), 03-03 (~3 min), 03-04 (~3 min incl. visual verify), 04-01 (~25 min incl. spring-formula corrections + self-verified screenshot loop)
+- Trend: 04-01 took longer due to (a) finding and fixing two bugs in the plan's literal RESEARCH Code Example #1, (b) the self-verified visual checkpoint loop, (c) navigating the host's auto-watcher restoring in-flight files
 
 ## Accumulated Context
 
@@ -97,6 +100,27 @@ Recent decisions affecting current work:
 - 03-04: 116 → 121 tests; `cargo build --release` clean; `cargo clippy --all-targets -- -D warnings` clean. Phase 3 COMPLETE — all five criteria observably TRUE.
 - For Phase 4 (carried over): mid-session daemon-loss UX is currently "freeze on last frame" (no panic, no void — hard requirement met); a full "daemon lost" banner with reconnect is Phase 5 ROB-02. `--dump-rgba` stays synthetic-only by design; if a live-data offline dump is ever needed it's a separate small tool.
 
+**Phase 4 (Animation & Interaction):**
+- 04-01: BREATHING BOXES (CONT-03) shipped — RESEARCH Pitfall A closed. New `src/world/easing.rs` is std-only and pure: `critically_damped(&mut x, &mut v, target, half_life, dt)` using Holden's EXPONENTIAL closed-form one-step solution `x_next = (d·(1+ωdt) + v·dt)·e^(-ωdt) + target` / `v_next = (v·(1-ωdt) - d·ω²·dt)·e^(-ωdt)`. Truly framerate-independent (pinned by `framerate_independent_within_tolerance` at 0.005 tolerance, dt=0.033 vs dt=0.0033 10× ratio); implicit Euler had a dt-dependent damping bias that failed that pin.
+- 04-01: NATURAL FREQUENCY ω = 2·ln(2)/half_life (Holden's `dampingFromHalflife`), NOT the plan's bare `ω = ln(2)/half_life`. The factor of 2 puts the 2% settle threshold at ~4.21·half_life (close to the canonical 4τ rule); bare `ln(2)/hl` gets only 76% at 4τ. The plan's literal Code Example #1 also had a velocity-update typo (`det_v = v + oo * (x - x_target)` missing the dt factor → `hoo`) — switching to the exponential form sidesteps it entirely.
+- 04-01: `BREATHING_HALF_LIFE = 0.15s` (NAMED knob in easing.rs). 4·hl ≈ 0.6s to ~97%; 5·hl ≈ 0.75s to ~2%. Inside the 1Hz stat cadence; visible easing without lag.
+- 04-01: CADENCE SPLIT in `src/world/live.rs`. `LiveEntry.{target_load, displayed_half, vel_half}` replaces the old `load`. `apply()` is TOPOLOGY (Added/Removed/StatusChanged still rebuild World; Stat returns `None` → no rebuild on Stat samples). `dress(dt, &mut [Entity])` is the per-FRAME size easing pass — walks entries, computes target_half from `(target_load, status)` exactly like the old build_world, calls `critically_damped`, mutates `Entity.half_extents` IN PLACE on the renderer's slice. O(n) `entity_id -> slice_idx` HashMap per call (microseconds at <1000 containers). Empty slice + dt non-finite/≤0 are no-ops.
+- 04-01: `handle_status` clears `target_load` on Running ↔ non-Running transitions so dress() switches buckets (load curve vs BASELINE_HALF_NO_LOAD) immediately — without this, a just-Stopped Running box would still ease toward MAX_HALF for the rest of its life (no Stat will ever arrive to override).
+- 04-01: `build_world` now reads `entry.displayed_half` directly (not derived per-rebuild from load+status). FIRST world after Added shows the seeded floor (Running→MIN_HALF, non-Running→BASELINE); the next tick begins easing toward the target — that's the visible breath. The renamed test `add_then_dress_sizes_box` pins this with `lw.dress(10.0, ...)` as a fast-forward.
+- 04-01: BOTH backends call `live.dress(dt, &mut world.entities)` once per frame from their render loops, using REAL elapsed dt. Braille: `App::on_tick` right after the spin update. Kitty: `run_kitty` main loop right after `spin = ...`, before the empty-vs-render branch.
+- 04-01: VISUAL VERIFY done under tmux against `--test` mode (real daemon). 11 captured braille frames at 0.5s and 2s spacings (`/tmp/v401-frame-{1..6}.png`, `/tmp/v401b-frame-{1..5}.png`) show clear sinusoidal size sweep on Running boxes (different phases per box via the `--test` mode's `phase = i * 0.6` offset) and stable BASELINE size on Stopped wireframes. No dribble specks; faces stay flat-shaded; no regression vs Phase 3 baseline.
+- 04-01: Tests 121 → 145 (+24: +7 easing.rs, +6 dress contract pins in live.rs, +concurrent 04-02 auto-commits brought ~+11). `cargo build --release` + `cargo clippy --all-targets -- -D warnings` clean.
+- For 04-02 (already auto-committed in-tree by host's sync system between Tasks 1 and 2): `feat(04-02): extend ContainerSnapshot with ports + mount_count` (`275ed9d`) and `feat(04-02): docker::inspect module for on-demand inspect_container` (`803f778`). The `DockerMsg::Enriched` variant + a full slot-migrating `handle_enriched` implementation are present in live.rs; my plan-01 work adds a stub that was subsequently filled in. `LiveWorld::snapshot(&str) -> Option<&ContainerSnapshot>` is the bollard-free read handle for the upcoming detail panel (CAM-05).
+
+- 04-02: BOLLARD-FREE EnrichedSnapshot + docker::inspect — Phase 3 carryovers (1)/(2)/(3) closed end-to-end. `EnrichedSnapshot { id, group_key, ports, mount_count, status_override: Option<Status> }` lives in `src/docker/domain.rs` alongside new bollard-free `PortSummary { private, public, proto }` and `PortProto { Tcp, Udp, Sctp }`. `ContainerSnapshot` extended additively with `ports: Vec<PortSummary>` (filled by seed path via `from_bollard_summary` from `ContainerSummary.ports`, sorted by `(private, proto)` for stability) + `mount_count: usize` (filled by enrich path via inspect's `mounts.len()`) + a `Default` impl so test fixtures and the create-event seed stay terse via `..ContainerSnapshot::default()`. Bollard's `bollard::models::PortSummary` is referenced ONLY via fully-qualified path inside the single `from_bollard_summary` fn — no clash with our domain `PortSummary`.
+- 04-02: `src/docker/inspect.rs` (NEW, 302 lines + 5 tests) is the bollard isolation point for `inspect_container` calls. Two entry points: `enrich_snapshot_on_start(docker, id) -> Option<EnrichedSnapshot>` backfills group_key + ports + mount_count; `enrich_snapshot_on_seed(docker, id) -> Option<EnrichedSnapshot>` does the same + a `status_override: Some(Crashed)` gate when `map_status(state, oom_killed, exit_code) == Crashed` (i.e. exited-OOM or exited-nonzero). Both explicitly pass `InspectContainerOptionsBuilder::new().size(false).build()` (Pitfall G — size(true) walks the overlay filesystem per call). Helpers `pick_primary_network` (sort networks-map keys, first wins — matches `from_bollard_summary`'s deterministic policy) and `extract_ports` (parses inspect's "PORT/PROTO" keys, drops malformed, sorts by `(private, proto)`).
+- 04-02: `DockerMsg::Enriched(EnrichedSnapshot)` routes through `LiveWorld::apply` to `handle_enriched`. Three effects: (1) IN-PLACE update of `entry.snap.ports` + `entry.snap.mount_count`; (2) when `status_override.is_some()`, promote `entry.snap.status` (currently only Stopped → Crashed used); (3) when `enr.group_key != entry.snap.group_key`, MIGRATE the slot — free old group's slot (handle_removed-style; only nulls one slot, neighbors keep their (group, index)) then allocate lowest-free in new group, update `id_to_addr`, refresh `snap.group_key`. Anti-teleport invariant preserved across migrations: OLD-group neighbors don't shift (we only null), NEW-group neighbors don't shift (we fill a hole or append). Unknown id → silent no-op (race window: container removed between inspect dispatch and inspect return).
+- 04-02: `LiveWorld::snapshot(id) -> Option<&ContainerSnapshot>` accessor surfaces ports + mount_count to ENT-02 / ENT-03 (04-04 / 04-05) without re-fetching from Docker.
+- 04-02: `docker::streams::spawn_docker_tasks` gains two `tokio::spawn` fire-and-forget paths: (a) SEED PASS — for EVERY seeded container (unconditional; bounded by container count once at startup; `enrich_snapshot_on_seed` returns status_override=None for Running, so noop for healthy seeds). (b) `start` EVENT ARM — after the existing `StatusChanged(Running)` + stats-spawn, also spawns `enrich_snapshot_on_start`. Both feed `DockerMsg::Enriched` back through the existing mpsc — events loop NEVER blocks on inspect (Pitfall 8); failure is silent (enrich returns None on bollard error; snapshot already on the wire stays as-is).
+- 04-02: SEED-PASS UNCONDITIONAL SPAWN rationale — (a) bounded by container count once at startup; (b) avoids fragile match on bollard's ContainerSummaryStateEnum string form (has shifted across bollard versions); (c) enrich_snapshot_on_seed returns status_override=None for Running, so noop for healthy seeds. Simpler than a state-string match for the same correctness.
+- 04-02: BOLLARD ISOLATION INVARIANT INTACT — `grep -rn 'use bollard' src/ | grep -v src/docker/` returns NOTHING. New bollard imports added in `src/docker/inspect.rs` only (`bollard::Docker` + `bollard::query_parameters::InspectContainerOptionsBuilder`); the fully-qualified `bollard::models::ContainerInspectResponse` is used in pick_primary_network / extract_ports signatures without `use`. The pre-existing 4 bollard import sites (`src/docker/{connect,domain,streams}.rs`) are unchanged.
+- 04-02: 4 atomic per-task commits — `275ed9d` (Task 1 ContainerSnapshot extension + 4 new tests) / `803f778` (Task 2 docker::inspect module + 5 new tests) / `1c8ec84` (Task 3 Enriched handler + 6 new tests) / `ea25dea` (Task 4 streams.rs spawns). All by OnixDebian; no Claude mentions; conventional-commit format. Tests 145 → 151 (15 docker::domain + 5 docker::inspect + 21 world::live).
+
 **Phase 2 (Scene Pipeline):**
 - 02-01: LAYOUT RESOLVED (rack-grid vs network-floors) → network-grouped rack grid. Groups = contiguous Z-bands (Phase 4 ENT-01 floor-planes drop in as the band's plane); within a group boxes fill columns/X and shelves/Y. Network grouping is the first-class placement axis.
 - 02-01: `src/world` is pure deterministic data — layout()/sizing are closed-form functions of stable id/group (NO clock, NO rand, NO global mutable state). synthetic_scene() = 50 boxes / 5 groups, deterministic per-id load (Knuth hash) + status variety (id%10).
@@ -118,10 +142,10 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 3 COMPLETE. Next up: Phase 4 (Networks / HUD) planning.
-- For Phase 4 (carried from 03-02): `from_bollard_summary` doesn't carry OOM/exit-code, so list_containers `exited` surfaces as `Stopped`. 03-03's events::oom upgrades to Crashed correctly for new transitions; the only gap is containers that were already exited-with-OOM when the app started.
-- For Phase 4 (carried from 03-03): `create` events seed `group_key: "none"` (bollard EventMessage actor attributes don't carry network attachments). A targeted `inspect_container` on `start` could backfill the group_key — Phase 4 will need it for network visualization.
-- For Phase 4 planning: `ContainerSnapshot.group_key` is the canonical layout group axis (used by LiveWorld now). The per-group slot scheme will need a "move container to new group" path when a container's network attachment changes mid-life — handle_added currently refreshes the snapshot but does NOT migrate the slot.
+- Phase 4 plans 03-06 (manual orbit + Tab + labels + ports glow + volume cylinders + detail panel) remaining.
+- ~~Phase 3 carryover (1): exited-with-OOM seed mis-mapped to Stopped~~ RESOLVED in 04-02 via `enrich_snapshot_on_seed` + `status_override: Some(Crashed)` gate in `handle_enriched`.
+- ~~Phase 3 carryover (2): `create` events seed `group_key: "none"`~~ RESOLVED in 04-02 via `enrich_snapshot_on_start` (off-thread inspect spawn in the `start` event arm; LiveWorld migrates the slot via `handle_enriched`).
+- ~~Phase 3 carryover (3): no slot migration when a container's network changes mid-life~~ RESOLVED in 04-02 via `LiveWorld::handle_enriched`'s slot-migration path (free old slot like Removed, allocate lowest-free in new group; anti-teleport preserved for non-migrating neighbors).
 - For Phase 4 planning: `events()` subscribes without filters; client-side filtering on `EventMessageTypeEnum::CONTAINER`. Switch to server-side `filters({"type": ["container"]})` if wire chatter becomes a problem.
 - For Phase 5 ROB-02 (carried from 03-04): mid-session daemon-loss UX currently "freezes on last World" (no panic, no void — hard requirement met). Phase 5 should add a "daemon lost" in-scene banner + reconnect attempt. The probe-before-TUI pattern from 03-04 is the template for any capability-degrade gate.
 - For Phase 5 (carried from 03-04): `--dump-rgba` stays daemon-free by design (renderer inspection tool). If a live-data offline dump is ever needed, build a small separate tool that seeds a `LiveWorld` from one-shot `list_containers` and dumps rgba.
@@ -137,7 +161,7 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-05-28
-Stopped at: 03-04 COMPLETE (Phase 3 of 5 DONE — Docker Data Layer fully wired into both renderers). cargo build --release / cargo test / cargo clippy --all-targets all clean; 121/121 tests pass.
+Last session: 2026-05-29
+Stopped at: 04-02 COMPLETE (Phase 4 of 5 IN PROGRESS — Phase 3 carryovers (1)/(2)/(3) closed end-to-end). cargo build --release / cargo test / cargo clippy --all-targets all clean; 151/151 tests pass.
 Resume file: None
-Resume note: Phase 3 COMPLETE. The live data path runs end-to-end on a real local daemon: (1) `main.rs::main` awaits `docker::connect_and_probe()` BEFORE any raw mode and shares the gate between braille (`Tui::enter`) and kitty (`enable_raw_mode` inside run_kitty); on `Err` it prints the actionable `ProbeError` Display to stderr + exits 1 on a clean terminal (verified). (2) `mpsc::unbounded_channel::<DockerMsg>()` is created in main; tx is moved into `spawn_docker_tasks(docker, tx) -> JoinHandle<()>` (held + `.abort()`-ed after backend returns); rx is threaded into the chosen backend. (3) `App::with_docker_rx(rx)` starts with EMPTY World; `drain_docker()` is a non-blocking once-per-outer-loop while-let `try_recv` that feeds `LiveWorld::apply` and swaps `app.world` on rebuild; camera re-frames ONLY on entity-count change (Add/Remove), never on Stat samples. (4) `run_kitty(rx)` stays SYNC, mirrors the same drain + count-change re-frame discipline, and on empty World skips `render_rgba` entirely to write a centered `ui::EMPTY_BANNER` via cell math. (5) Both backends show the same empty-state copy ("No containers running — start one and it'll appear here.") with chrome unchanged. Live visual verify against the real daemon: status-bar `boxes:` walked `0 → 14 → 15 → 14` during a single 6-second session as we `docker run` / `docker rm -f` a test container mid-flight — criterion #3 directly observed. Box count matches `docker ps -a`. `git diff src/render3d/` empty — render internals untouched. NEXT: Phase 4 planning (Networks / HUD). The live `Entity.group_key` is the canonical layout axis Phase 4 ENT-01 floor-planes will consume; the per-group slot scheme will need a slot-migration path when a container's network changes mid-life, and the `create`-event `group_key: "none"` carryover will likely be backfilled via a targeted `inspect_container` on `start`. All Phase-1/2/3 invariants intact: 121/121 tests, clippy clean on `--all-targets -- -D warnings`, no bollard import outside `src/docker/`, Pitfall 9 closed.
+Resume note: Phase 4 plan 02 done — Bollard-free `EnrichedSnapshot` { id, group_key, ports, mount_count, status_override } + `PortSummary`/`PortProto` + extended `ContainerSnapshot` (ports + mount_count, Default impl) all live in `src/docker/domain.rs`. New `src/docker/inspect.rs` is the bollard isolation point for `inspect_container` (size=false explicit per Pitfall G); exposes `enrich_snapshot_on_start` (group_key + ports + mount_count backfill on `start` events) and `enrich_snapshot_on_seed` (same + `status_override: Some(Crashed)` upgrade gate for exited-OOM / exited-nonzero seeds). `DockerMsg::Enriched(EnrichedSnapshot)` variant routed through `LiveWorld::apply` to `handle_enriched`: (1) in-place ports/mount_count update on the entry's snapshot; (2) `status_override` promotes status when set; (3) when `group_key` differs, MIGRATES the slot (free old group's slot — same as `handle_removed`, just nulls — then allocate lowest-free in new group) preserving anti-teleport for OLD-group and NEW-group neighbors. `LiveWorld::snapshot(id) -> Option<&ContainerSnapshot>` accessor surfaces ports + mount_count to ENT-02/ENT-03. `docker::streams::spawn_docker_tasks` spawns `enrich_snapshot_on_seed` UNCONDITIONALLY for every seeded container (bounded by container count once at startup; healthy-Running seeds emit status_override=None — noop) and `enrich_snapshot_on_start` after each `start` event; both are `tokio::spawn` fire-and-forget so the events loop NEVER blocks on inspect (Pitfall 8). Bollard imports confirmed CONFINED to `src/docker/{connect,domain,streams,inspect}.rs` (verified by `grep -rn 'use bollard' src/ | grep -v src/docker/` returning empty). Four atomic per-task commits (275ed9d / 803f778 / 1c8ec84 / ea25dea) all by OnixDebian, no Claude mentions. Tests: 151/151 (15 docker::domain incl. 4 new + 5 new docker::inspect + 21 world::live incl. 6 new for Enriched). NEXT: 04-03 (manual orbit + Tab selection + highlight) — `LiveWorld::snapshot(id)` is the read surface for the selected box's name/group. Plans 04 (port glow, reads `ContainerSnapshot.ports`), 05 (volume cylinders, reads `mount_count`), 06 (detail panel, will add `enrich_for_panel` returning a richer DetailSnapshot — pattern established).
