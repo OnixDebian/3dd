@@ -66,7 +66,7 @@ use std::collections::{BTreeMap, HashMap};
 use glam::Vec3;
 
 use crate::docker::stats::StatSample;
-use crate::docker::{ContainerSnapshot, EnrichedSnapshot, ImageSnapshot};
+use crate::docker::{ContainerSnapshot, DetailSnapshot, EnrichedSnapshot, ImageSnapshot};
 use crate::theme::Status;
 // Per-frame easing pass (CONT-03 / 04-01) — `dress(dt)` is the per-tick
 // size easing path defined below; both renderers call it once per frame.
@@ -111,6 +111,12 @@ pub enum DockerMsg {
     /// today. Kept on the enum so the apply() match is total + future-proof.
     #[allow(dead_code)]
     ImageRemoved(String),
+    /// A `fetch_detail` call returned a full [`DetailSnapshot`] for the
+    /// container the user pressed Enter on (CAM-05 / 04-06a). Cached on
+    /// [`LiveWorld::last_inspect`] keyed by container id; pure side data —
+    /// never rebuilds the World. 04-06b's panel consumer reads from
+    /// `last_inspect` and clears `Selection::inspect_in_flight`.
+    Inspected(DetailSnapshot),
 }
 
 /// Per-container live state — what we know about one container right now.
@@ -141,6 +147,14 @@ struct LiveEntry {
     /// Spring velocity for the eased half-extent. Crosses target reversals
     /// smoothly so a CPU spike-then-drop doesn't strobe the box size.
     vel_half: f32,
+    /// Latest NON-WARMING-UP [`StatSample`] received for this container
+    /// (04-06a). `None` until the first real sample arrives. The detail
+    /// panel (04-06b) reads `blkio_r_bytes` / `blkio_w_bytes` / `cpu_pct` /
+    /// `mem_used` from here without re-fetching from Docker — the StatSample
+    /// is already on the wire at ~1Hz per running container. Warming-up
+    /// samples are explicitly NOT cached so the panel never displays the
+    /// first-frame garbage values.
+    last_sample: Option<StatSample>,
 }
 
 /// Stride used to synthesize a stable `Entity.id: u32` from a
@@ -185,6 +199,12 @@ pub struct LiveWorld {
     /// (the index of every later image shifts down by 1 only on `ImageRemoved`,
     /// which is not subscribed in v1).
     images: BTreeMap<String, ImageSnapshot>,
+    /// Cache of the latest [`DetailSnapshot`] per container id (CAM-05 /
+    /// 04-06a). Populated by [`DockerMsg::Inspected`] arrivals; the popup in
+    /// 04-06b reads this via [`LiveWorld::last_inspect`]. Side data only —
+    /// never rebuilds the World. A `Removed` for an id drops its cached
+    /// entry so a re-created container with the same id starts fresh.
+    last_inspect: HashMap<String, DetailSnapshot>,
 }
 
 impl Default for LiveWorld {
@@ -202,6 +222,7 @@ impl LiveWorld {
             id_to_addr: HashMap::new(),
             entries: HashMap::new(),
             images: BTreeMap::new(),
+            last_inspect: HashMap::new(),
         }
     }
 
@@ -235,6 +256,7 @@ impl LiveWorld {
             DockerMsg::Enriched(enr) => self.handle_enriched(enr),
             DockerMsg::ImageAdded(img) => self.handle_image_added(img),
             DockerMsg::ImageRemoved(id) => self.handle_image_removed(&id),
+            DockerMsg::Inspected(snap) => self.handle_inspected(snap),
         };
 
         if changed {
@@ -252,6 +274,22 @@ impl LiveWorld {
     /// and refreshed by [`DockerMsg::Enriched`].
     pub fn snapshot(&self, id: &str) -> Option<&ContainerSnapshot> {
         self.entries.get(id).map(|e| &e.snap)
+    }
+
+    /// Read-only access to the cached [`DetailSnapshot`] for container `id`
+    /// (CAM-05 / 04-06a). `None` until a [`DockerMsg::Inspected`] for this
+    /// id arrives — the popup in 04-06b displays a "loading…" placeholder
+    /// during the spawn-and-wait window.
+    pub fn last_inspect(&self, id: &str) -> Option<&DetailSnapshot> {
+        self.last_inspect.get(id)
+    }
+
+    /// Read-only access to the latest NON-WARMING-UP [`StatSample`] for
+    /// container `id` (04-06a). `None` until the first real stat lands —
+    /// the popup in 04-06b reads `blkio_r_bytes` / `blkio_w_bytes` /
+    /// `cpu_pct` / `mem_used` from here without re-fetching.
+    pub fn last_sample(&self, id: &str) -> Option<&StatSample> {
+        self.entries.get(id).and_then(|e| e.last_sample.as_ref())
     }
 
     /// Number of images known to the LiveWorld (test introspection).
@@ -438,6 +476,7 @@ impl LiveWorld {
                 target_load: None,
                 displayed_half,
                 vel_half: 0.0,
+                last_sample: None,
             },
         );
         true
@@ -453,6 +492,10 @@ impl LiveWorld {
         // index_in_group, so their world-space position is unchanged.
         self.group_slots[group_id as usize][index_in_group] = None;
         self.entries.remove(id);
+        // Drop any cached DetailSnapshot — a re-created container reusing
+        // this id (rare but possible) must start fresh; the popup will
+        // re-spawn fetch_detail on the new container.
+        self.last_inspect.remove(id);
         true
     }
 
@@ -490,9 +533,19 @@ impl LiveWorld {
         // its floor size to anything at all. Per PITFALLS Pitfall 1, the
         // first sample is garbage — but `StatSample::warming_up` already
         // forces `load = 0.0` on the producer side, so we just skip it.
+        // Also: do NOT cache a warming-up sample on `last_sample` — the
+        // panel must never display first-frame garbage CPU/mem/blkio values
+        // (04-06a invariant: last_sample is the NEWEST NON-WARMING sample).
         if sample.warming_up {
             return false;
         }
+        // Cache the newest non-warming sample so the panel can read blkio
+        // bytes / cpu_pct / mem_used without an extra fetch. Done BEFORE
+        // the target-load dedup so a same-load Stat still refreshes
+        // last_sample (the user may have opened the panel between two
+        // identical-load frames and we want the freshest counters).
+        entry.last_sample = Some(sample);
+
         // The load field is already in [0, 1], non-finite-scrubbed by
         // normalize(). Hand it to the existing size map unchanged.
         let new = sample.load.clamp(0.0, 1.0);
@@ -505,6 +558,21 @@ impl LiveWorld {
         // 04-01: Stat sets a TARGET only — the per-frame dress() pass eases
         // the box size in place. Never rebuild the World on Stat (RESEARCH
         // Pitfall A: per-tick rebuild on continuous easing).
+        false
+    }
+
+    /// Cache a [`DetailSnapshot`] keyed by container id (CAM-05 / 04-06a).
+    ///
+    /// Always returns `false` (no World rebuild) — the panel reads from the
+    /// cache on the next frame and 04-06b clears
+    /// [`crate::world::Selection::inspect_in_flight`] on arrival. Unknown
+    /// container ids (the container was removed between the fetch dispatch
+    /// and the result) are still cached: 04-06b's reconcile pass drops any
+    /// cached detail for an id that no longer has a live entry — but if the
+    /// container reappears with the same id the cached snapshot is still
+    /// valid and the popup will read it without a new fetch.
+    fn handle_inspected(&mut self, snap: DetailSnapshot) -> bool {
+        self.last_inspect.insert(snap.id.clone(), snap);
         false
     }
 
@@ -1528,6 +1596,159 @@ mod tests {
         );
         // Identical X between the two regardless of container set.
         assert_eq!(pos_empty[0].0.x, pos_full[0].0.x);
+    }
+
+    // --- 04-06a: Inspected cache + last_sample ------------------------------
+
+    use crate::docker::{DetailSnapshot, HealthSummary};
+
+    fn detail(id: &str, name: &str) -> DetailSnapshot {
+        DetailSnapshot {
+            id: id.to_string(),
+            name: name.to_string(),
+            status: Status::Running,
+            health: HealthSummary::None,
+            started_at_iso: String::new(),
+            restart_count: 0,
+            restart_policy: "no".to_string(),
+            image_human: String::new(),
+            image_digest: String::new(),
+            network_mode: String::new(),
+            networks: Vec::new(),
+            ports: Vec::new(),
+            mounts: Vec::new(),
+        }
+    }
+
+    /// Done criterion: Inspected caches the snapshot in last_inspect keyed
+    /// by container id. Accessor returns Some(&DetailSnapshot).
+    #[test]
+    fn inspected_caches_in_last_inspect() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        assert!(lw.last_inspect("a").is_none(), "no inspect cached yet");
+
+        let res = lw.apply(DockerMsg::Inspected(detail("a", "alpha-name")));
+        assert!(
+            res.is_none(),
+            "Inspected must NOT rebuild the World (side data only)"
+        );
+        let cached = lw.last_inspect("a").expect("a is cached");
+        assert_eq!(cached.id, "a");
+        assert_eq!(cached.name, "alpha-name");
+    }
+
+    /// Inspected for an unknown id is still cached (the container may have
+    /// been removed between dispatch and result; if it reappears with the
+    /// same id, the cached snapshot is reused). The handler must not panic
+    /// and must not rebuild.
+    #[test]
+    fn inspected_unknown_id_is_cached_silently() {
+        let mut lw = LiveWorld::new();
+        let res = lw.apply(DockerMsg::Inspected(detail("ghost", "ghost-name")));
+        assert!(res.is_none());
+        assert!(lw.last_inspect("ghost").is_some());
+    }
+
+    /// Inspected for the same id refreshes the cache in place (no leak).
+    #[test]
+    fn inspected_refresh_replaces_cached_value() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        lw.apply(DockerMsg::Inspected(detail("a", "old-name")));
+        lw.apply(DockerMsg::Inspected(detail("a", "new-name")));
+        let cached = lw.last_inspect("a").expect("a is cached");
+        assert_eq!(cached.name, "new-name", "second Inspected must replace");
+    }
+
+    /// Removed clears the cached inspect for that id so a re-created
+    /// container with the same id doesn't see stale data.
+    #[test]
+    fn removed_drops_last_inspect_for_id() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        lw.apply(DockerMsg::Inspected(detail("a", "alpha")));
+        assert!(lw.last_inspect("a").is_some());
+        lw.apply(DockerMsg::Removed("a".to_string()));
+        assert!(
+            lw.last_inspect("a").is_none(),
+            "Removed must drop the cached inspect"
+        );
+    }
+
+    /// Done criterion: a non-warming Stat updates last_sample on the entry;
+    /// accessor returns Some(&StatSample) with the freshest load value.
+    #[test]
+    fn stat_updates_last_sample() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        assert!(lw.last_sample("a").is_none(), "no sample yet");
+
+        let sample = StatSample {
+            cpu_pct: 12.5,
+            mem_used: 1024,
+            mem_limit: 4096,
+            mem_fraction: 0.25,
+            load: 0.5,
+            warming_up: false,
+            blkio_r_bytes: 99,
+            blkio_w_bytes: 33,
+        };
+        lw.apply(DockerMsg::Stat("a".to_string(), sample));
+        let cached = lw.last_sample("a").expect("a has a sample");
+        assert_eq!(cached.load, 0.5);
+        assert_eq!(cached.blkio_r_bytes, 99);
+        assert_eq!(cached.blkio_w_bytes, 33);
+    }
+
+    /// Done criterion: a warming-up Stat must NOT overwrite the cached
+    /// last_sample. The contract is "newest NON-WARMING sample".
+    #[test]
+    fn stat_warming_up_does_not_overwrite_last_sample() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+
+        // First a real sample lands.
+        let real = StatSample {
+            cpu_pct: 50.0,
+            mem_used: 2048,
+            mem_limit: 4096,
+            mem_fraction: 0.5,
+            load: 0.7,
+            warming_up: false,
+            blkio_r_bytes: 100,
+            blkio_w_bytes: 200,
+        };
+        lw.apply(DockerMsg::Stat("a".to_string(), real));
+        assert_eq!(lw.last_sample("a").unwrap().load, 0.7);
+
+        // Now a warming-up sample arrives (it shouldn't normally — once a
+        // stream is past first-frame it stays past — but defensively the
+        // cache must not regress to the warming-up zero).
+        let warm = StatSample {
+            cpu_pct: 0.0,
+            mem_used: 0,
+            mem_limit: 0,
+            mem_fraction: 0.0,
+            load: 0.0,
+            warming_up: true,
+            blkio_r_bytes: 0,
+            blkio_w_bytes: 0,
+        };
+        lw.apply(DockerMsg::Stat("a".to_string(), warm));
+        let cached = lw.last_sample("a").expect("still has the earlier sample");
+        assert_eq!(
+            cached.load, 0.7,
+            "warming-up sample must NOT overwrite last_sample"
+        );
+        assert_eq!(cached.blkio_r_bytes, 100);
+    }
+
+    /// last_sample for an unknown id is None (defensive).
+    #[test]
+    fn last_sample_unknown_id_is_none() {
+        let lw = LiveWorld::new();
+        assert!(lw.last_sample("ghost").is_none());
     }
 
     /// ImageRemoved drops the image from the set; subsequent ImageAdded

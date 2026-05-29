@@ -23,6 +23,7 @@
 
 #![allow(dead_code)]
 
+use crate::docker::DetailSnapshot;
 use crate::world::entity::Entity;
 use crate::world::World;
 
@@ -60,6 +61,19 @@ pub struct Selection {
     pub pulse_phase: f32,
     /// Detail panel open flag (CAM-05). Toggled by Enter (open) / Esc (close).
     pub detail_open: bool,
+    /// The [`DetailSnapshot`] currently displayed in the popup (CAM-05 /
+    /// 04-06a slot, populated by 04-06b's spawn handler when a
+    /// [`crate::world::DockerMsg::Inspected`] arrives and the popup is
+    /// open). `None` when the popup is closed OR while waiting for the
+    /// fetch to come back. The renderer in 04-06b reads this to draw the
+    /// panel; 04-06a only ensures the slot exists.
+    pub pending_detail: Option<DetailSnapshot>,
+    /// `true` while a [`crate::docker::fetch_detail`] spawn is outstanding
+    /// for the current selection (04-06b sets on Enter, clears when
+    /// `DockerMsg::Inspected` arrives). Single bool prevents duplicate
+    /// spawns when Enter is pressed twice quickly. The popup may show a
+    /// "loading…" indicator while this is true.
+    pub inspect_in_flight: bool,
 }
 
 impl Selection {
@@ -79,13 +93,17 @@ impl Selection {
 
     /// Cycle the selection forward through ids-ascending. From None lands on
     /// the lowest id; from the highest wraps to the lowest. Resets the label
-    /// hysteresis so the new label snaps to its anchor on the next frame.
+    /// hysteresis so the new label snaps to its anchor on the next frame,
+    /// and clears any pending detail snapshot / in-flight inspect so the
+    /// popup doesn't show stale data for the new selection.
     pub fn next(&mut self, world: &World) {
         if world.entities.is_empty() {
             self.selected_id = None;
             self.detail_open = false;
             self.last_label_cell = None;
             self.last_label_cell_kitty = None;
+            self.pending_detail = None;
+            self.inspect_in_flight = false;
             return;
         }
         let mut ids: Vec<u32> = world.entities.iter().map(|e| e.id).collect();
@@ -99,6 +117,11 @@ impl Selection {
         });
         self.last_label_cell = None;
         self.last_label_cell_kitty = None;
+        // Selection moved — drop the previous container's detail snapshot
+        // so the popup (if open) doesn't briefly show the OLD data while
+        // 04-06b spawns a fresh fetch_detail.
+        self.pending_detail = None;
+        self.inspect_in_flight = false;
     }
 
     /// Cycle the selection backward through ids-ascending. From None lands on
@@ -109,6 +132,8 @@ impl Selection {
             self.detail_open = false;
             self.last_label_cell = None;
             self.last_label_cell_kitty = None;
+            self.pending_detail = None;
+            self.inspect_in_flight = false;
             return;
         }
         let mut ids: Vec<u32> = world.entities.iter().map(|e| e.id).collect();
@@ -122,6 +147,8 @@ impl Selection {
         });
         self.last_label_cell = None;
         self.last_label_cell_kitty = None;
+        self.pending_detail = None;
+        self.inspect_in_flight = false;
     }
 
     /// Drop a stale selection if the world no longer contains it.
@@ -137,6 +164,12 @@ impl Selection {
             self.detail_open = false;
             self.last_label_cell = None;
             self.last_label_cell_kitty = None;
+            // The disappeared container's detail is no longer relevant —
+            // drop it AND any outstanding fetch flag (04-06b will not see
+            // the Inspected for the dropped id and would otherwise leave
+            // `inspect_in_flight` stuck at true).
+            self.pending_detail = None;
+            self.inspect_in_flight = false;
         }
     }
 
@@ -334,5 +367,101 @@ mod tests {
         sel.next(&world);
         assert_eq!(sel.selected_id, None);
         assert!(!sel.detail_open);
+    }
+
+    // ---- 04-06a: pending_detail + inspect_in_flight slots ------------------
+
+    use crate::docker::{DetailSnapshot, HealthSummary};
+    use crate::theme::Status as DStatus;
+
+    fn make_detail(id: &str) -> DetailSnapshot {
+        DetailSnapshot {
+            id: id.to_string(),
+            name: id.to_string(),
+            status: DStatus::Running,
+            health: HealthSummary::None,
+            started_at_iso: String::new(),
+            restart_count: 0,
+            restart_policy: "no".to_string(),
+            image_human: String::new(),
+            image_digest: String::new(),
+            network_mode: String::new(),
+            networks: Vec::new(),
+            ports: Vec::new(),
+            mounts: Vec::new(),
+        }
+    }
+
+    /// Done criterion: pending_detail defaults to None on a fresh Selection.
+    #[test]
+    fn selection_pending_detail_defaults_to_none() {
+        let sel = Selection::new();
+        assert!(sel.pending_detail.is_none());
+    }
+
+    /// Done criterion: inspect_in_flight defaults to false on a fresh Selection.
+    #[test]
+    fn selection_inspect_in_flight_defaults_to_false() {
+        let sel = Selection::new();
+        assert!(!sel.inspect_in_flight);
+    }
+
+    /// next() clears pending_detail + inspect_in_flight when the selection
+    /// changes (so the popup doesn't show stale data for the previous
+    /// container while 04-06b spawns a fresh fetch).
+    #[test]
+    fn next_clears_pending_detail_and_in_flight() {
+        let world = world_with_ids(&[1, 2, 3]);
+        let mut sel = Selection::new();
+        sel.selected_id = Some(1);
+        sel.pending_detail = Some(make_detail("c1"));
+        sel.inspect_in_flight = true;
+        sel.next(&world);
+        assert_eq!(sel.selected_id, Some(2));
+        assert!(sel.pending_detail.is_none(), "pending_detail must clear on next");
+        assert!(!sel.inspect_in_flight, "in_flight must clear on next");
+    }
+
+    /// prev() also clears pending_detail + inspect_in_flight.
+    #[test]
+    fn prev_clears_pending_detail_and_in_flight() {
+        let world = world_with_ids(&[1, 2, 3]);
+        let mut sel = Selection::new();
+        sel.selected_id = Some(2);
+        sel.pending_detail = Some(make_detail("c2"));
+        sel.inspect_in_flight = true;
+        sel.prev(&world);
+        assert_eq!(sel.selected_id, Some(1));
+        assert!(sel.pending_detail.is_none());
+        assert!(!sel.inspect_in_flight);
+    }
+
+    /// reconcile() drops pending_detail + inspect_in_flight when the
+    /// selected container disappears (the dispatched fetch_detail's result
+    /// will not match the new selection — wedge prevention).
+    #[test]
+    fn reconcile_drops_pending_detail_on_stale_selection() {
+        let world = world_with_ids(&[5, 7, 9]);
+        let mut sel = Selection::new();
+        sel.selected_id = Some(99); // not in world
+        sel.pending_detail = Some(make_detail("ghost"));
+        sel.inspect_in_flight = true;
+        sel.reconcile(&world);
+        assert_ne!(sel.selected_id, Some(99));
+        assert!(sel.pending_detail.is_none(), "stale detail must drop");
+        assert!(!sel.inspect_in_flight, "stale in_flight must clear");
+    }
+
+    /// Empty-world next/prev also clears pending_detail + inspect_in_flight.
+    #[test]
+    fn empty_world_next_clears_pending_detail() {
+        let world = world_with_ids(&[]);
+        let mut sel = Selection::new();
+        sel.selected_id = Some(1);
+        sel.pending_detail = Some(make_detail("c1"));
+        sel.inspect_in_flight = true;
+        sel.next(&world);
+        assert!(sel.pending_detail.is_none());
+        assert!(!sel.inspect_in_flight);
     }
 }
