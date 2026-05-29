@@ -6,6 +6,7 @@
 //! a centered plain-text "no containers" banner (so an idle Docker host doesn't
 //! render a blank void, per Phase 3 criterion #5).
 
+pub mod detail_panel;
 pub mod labels;
 pub mod scene;
 pub mod status_bar;
@@ -68,6 +69,26 @@ pub fn view(frame: &mut Frame, app: &mut App) {
     }
 
     status_bar::render(frame, status_area, app);
+
+    // CAM-05 / 04-06b: popup overlay. Drawn LAST so the Clear + Block
+    // hides the scene underneath in the popup's footprint. Block I/O
+    // (`blkio_r` / `blkio_w`) is read from `LiveWorld::last_sample` EVERY
+    // frame — the popup reflects the freshest counters even while open
+    // (StatSample lands at ~1Hz per running container; DetailSnapshot is
+    // cached on Enter and stays static until the user closes/reopens).
+    if app.selection.detail_open {
+        let blkio = app
+            .selection
+            .selected_id
+            .and_then(|eid| app.live.id_string_for_entity(eid).map(|s| s.to_string()))
+            .and_then(|cid| app.live.last_sample(&cid).map(|s| (s.blkio_r_bytes, s.blkio_w_bytes)))
+            .unwrap_or((0, 0));
+        if let Some(snap) = app.selection.pending_detail.as_ref() {
+            detail_panel::render_detail_panel(frame, snap, blkio.0, blkio.1);
+        } else {
+            detail_panel::render_loading(frame);
+        }
+    }
 }
 
 /// Centered plain-text banner shown when the live World holds no entities.
