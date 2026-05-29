@@ -44,6 +44,15 @@ pub use domain::{
     from_bollard_summary, map_status, ContainerSnapshot, EnrichedSnapshot, PortProto, PortSummary,
 };
 pub use connect::{connect_and_probe, ProbeError};
+// Re-export bollard's `Docker` handle so call sites outside `src/docker/` can
+// hold/clone the handle WITHOUT a bare `use bollard::...` (bollard isolation
+// invariant: only `src/docker/*.rs` imports `bollard::` directly). `Docker`
+// itself is opaque from the outside — it's a cheap-clone Arc handle the
+// off-thread spawn path needs in 04-06b (`Effect::SpawnInspect` interpretation
+// in `App`/`run_kitty`). The actual bollard calls (`inspect_container` etc)
+// still live inside `src/docker/inspect.rs` — main.rs / app.rs / kitty.rs
+// touch `Docker` only as a passed-through Arc-clone token.
+pub use bollard::Docker;
 pub use images::{fetch_image_snapshots, ImageSnapshot};
 pub use inspect::{
     enrich_snapshot_on_seed, enrich_snapshot_on_start, fetch_detail, DetailSnapshot,

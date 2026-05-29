@@ -96,6 +96,12 @@ async fn main() -> Result<()> {
     // the natural list_containers seed has populated the world. The live
     // event/stats streams keep working normally on the original tx.
     let test_tx = test_mode.then(|| tx.clone());
+    // 04-06b: clone the docker handle + tx for the renderer's Effect::SpawnInspect
+    // path (off-thread `fetch_detail` on Enter, results piped back through the
+    // same mpsc). The producer task gets the ORIGINAL docker + tx, the renderer
+    // gets the clones — both backends accept (docker, tx, rx[, handle]).
+    let docker_for_render = docker.clone();
+    let tx_for_inspect = tx.clone();
     let docker_handle = docker::spawn_docker_tasks(docker, tx);
 
     // --test: read the user's containers via `docker ps -a`, force every
@@ -199,11 +205,16 @@ async fn main() -> Result<()> {
     let force_kitty = args.iter().any(|a| a == "--kitty");
     let force_braille = args.iter().any(|a| a == "--braille");
     let result: Result<()> = if force_kitty || (!force_braille && kitty::supports_kitty_graphics()) {
-        kitty::run_kitty(rx)
+        // run_kitty is sync but lives inside #[tokio::main] — Handle::current()
+        // captures the active runtime so its inline `handle.spawn(...)` calls
+        // (Effect::SpawnInspect) schedule onto the SAME runtime the producer
+        // task already runs on.
+        let handle = tokio::runtime::Handle::current();
+        kitty::run_kitty(docker_for_render, tx_for_inspect, rx, handle)
     } else {
         let mut tui = Tui::new()?;
         tui.enter()?;
-        let mut app = App::with_docker_rx(rx);
+        let mut app = App::with_docker(docker_for_render, tx_for_inspect, rx);
         let r = app.run(&mut tui).await;
         // Always restore on the clean-exit path too, regardless of run() result.
         tui.exit()?;

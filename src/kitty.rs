@@ -19,11 +19,13 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use crossterm::{cursor, execute};
 use glam::Vec3;
 use ratatui::style::Color;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::action::{apply_input_action, Action, Effect};
 use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
+use crate::docker::Docker;
 use crate::render3d::cube::{unit_cube, CUBE_EDGES};
 use crate::render3d::project::Projector;
 use crate::render3d::scene_extras::SceneExtras;
@@ -917,7 +919,12 @@ pub fn supports_kitty_graphics() -> bool {
 /// runtime (from `main.rs`), feeds the channel, and we read from it here
 /// without needing our own runtime. The 33ms pacing + raw-mode lifecycle +
 /// quit-key handling are untouched.
-pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
+pub fn run_kitty(
+    docker: Docker,
+    tx_for_inspect: UnboundedSender<DockerMsg>,
+    mut docker_rx: UnboundedReceiver<DockerMsg>,
+    handle: Handle,
+) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, cursor::Hide)?;
@@ -977,10 +984,28 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
                     );
                     match effect {
                         Effect::Quit => break,
-                        Effect::SpawnInspect(_id) => {
-                            // 04-06 plugs the docker::inspect::fetch_detail
-                            // spawn here using Handle::current() (run_kitty is
-                            // sync but lives inside #[tokio::main]).
+                        Effect::SpawnInspect(id) => {
+                            // 04-06b: off-thread inspect via the tokio runtime
+                            // Handle (run_kitty is sync but lives inside
+                            // #[tokio::main]; Handle::spawn schedules onto
+                            // that runtime). Idempotent: skip if already
+                            // in-flight. Pitfall 8: render loop never blocks
+                            // on the inspect.
+                            if !selection.inspect_in_flight {
+                                selection.inspect_in_flight = true;
+                                selection.pending_detail = None;
+                                let docker_c = docker.clone();
+                                let tx_c = tx_for_inspect.clone();
+                                handle.spawn(async move {
+                                    if let Ok(snap) =
+                                        crate::docker::fetch_detail(&docker_c, &id).await
+                                    {
+                                        let _ = tx_c.send(DockerMsg::Inspected(snap));
+                                    }
+                                    // On error: swallow. Popup stays "loading…"
+                                    // until user presses Esc or Enter again.
+                                });
+                            }
                         }
                         Effect::None => {}
                     }
@@ -994,6 +1019,13 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
             // Empty/Disconnected we just stop draining for this iteration.
             let mut rebuilt = false;
             while let Ok(msg) = docker_rx.try_recv() {
+                // 04-06b: demux Inspected into selection BEFORE live.apply
+                // — mirrors App::drain_docker in the braille backend so the
+                // popup-facing slot is the source of truth for the renderer.
+                if let DockerMsg::Inspected(snap) = &msg {
+                    selection.pending_detail = Some(snap.clone());
+                    selection.inspect_in_flight = false;
+                }
                 if let Some(w) = live.apply(msg) {
                     world = w;
                     rebuilt = true;

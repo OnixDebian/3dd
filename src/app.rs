@@ -22,11 +22,12 @@
 use std::time::Instant;
 
 use color_eyre::Result;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::action::{apply_input_action, Action, Effect};
 use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
+use crate::docker::Docker;
 use crate::tui::{Event, Tui};
 use crate::ui;
 use crate::world::scene::SceneBounds;
@@ -73,6 +74,18 @@ pub struct App {
     /// in `docker::streams`. `None` for the test/dump constructor (`App::new`)
     /// so unit tests don't need a producer.
     docker_rx: Option<UnboundedReceiver<DockerMsg>>,
+    /// Bollard Docker handle (Arc-clone, cheap) used by [`Self::spawn_detail_fetch`]
+    /// to fire `fetch_detail` off-thread on `Effect::SpawnInspect`. `None` in
+    /// tests / the dump path (no daemon connected) — OpenDetail then surfaces
+    /// `selection.detail_open=true` but the spawn handler is a noop, so the
+    /// popup stays in its "loading…" state forever (test path safety, not a
+    /// production code path).
+    docker: Option<Docker>,
+    /// Cloned sender for `DockerMsg::Inspected` results from the spawned
+    /// `fetch_detail` task — same channel the producer uses, so the existing
+    /// `drain_docker` loop demuxes Inspected into `selection.pending_detail`
+    /// alongside Stat / Added / Removed. `None` in tests.
+    tx_for_inspect: Option<UnboundedSender<DockerMsg>>,
 }
 
 impl App {
@@ -104,6 +117,8 @@ impl App {
             live: LiveWorld::new(),
             selection: Selection::new(),
             docker_rx: None,
+            docker: None,
+            tx_for_inspect: None,
         }
     }
 
@@ -133,7 +148,30 @@ impl App {
             live: LiveWorld::new(),
             selection: Selection::new(),
             docker_rx: Some(rx),
+            docker: None,
+            tx_for_inspect: None,
         }
+    }
+
+    /// Construct fresh app state with a live Docker receiver AND a docker
+    /// handle + sender for off-thread `fetch_detail` spawn on Enter (04-06b).
+    ///
+    /// `tx` is the SAME sender the producer task in `docker::streams` is
+    /// already using — `DockerMsg::Inspected` results flow back through the
+    /// existing mpsc and demux into `selection.pending_detail` inside
+    /// [`Self::drain_docker`]. `docker` is a cheap-clone Arc handle inside
+    /// bollard; the spawn handler clones it again before moving into the
+    /// `async move` block, so the App keeps its own handle for subsequent
+    /// Enters.
+    pub fn with_docker(
+        docker: Docker,
+        tx: UnboundedSender<DockerMsg>,
+        rx: UnboundedReceiver<DockerMsg>,
+    ) -> Self {
+        let mut app = Self::with_docker_rx(rx);
+        app.docker = Some(docker);
+        app.tx_for_inspect = Some(tx);
+        app
     }
 
     /// Dispatch a high-level intent to a state mutation.
@@ -152,12 +190,60 @@ impl App {
         );
         match effect {
             Effect::Quit => self.should_quit = true,
-            Effect::SpawnInspect(_id) => {
-                // 04-06 plugs the docker::inspect::fetch_detail spawn here.
-                // `selection.detail_open` is already set by apply_input_action.
-            }
+            Effect::SpawnInspect(id) => self.spawn_detail_fetch(id),
             Effect::None => {}
         }
+    }
+
+    /// Off-thread inspect-and-deliver for the detail panel (04-06b, CAM-05).
+    ///
+    /// Called by [`Self::update`] when [`apply_input_action`] surfaces
+    /// `Effect::SpawnInspect(container_id)` (i.e. user pressed Enter on a
+    /// selected box). Fires `docker::fetch_detail` on the tokio runtime and
+    /// pipes the result back through the existing mpsc as
+    /// `DockerMsg::Inspected(snap)` — [`Self::drain_docker`] then demuxes it
+    /// into `selection.pending_detail` and clears `inspect_in_flight`.
+    ///
+    /// Pitfall 8 closure: the render loop NEVER blocks on the inspect call —
+    /// `tokio::spawn` returns immediately. A slow daemon shows the
+    /// "loading…" popup state for as long as the call takes (typically
+    /// <50ms for a healthy local socket).
+    ///
+    /// Idempotent: if `inspect_in_flight` is already true (Enter pressed
+    /// twice quickly), the second call is a noop — the first spawn's result
+    /// will land regardless of the second press.
+    ///
+    /// Test-path safety: when `self.docker` is `None` (the `App::new` /
+    /// `with_docker_rx` constructors used in unit tests), this is a noop —
+    /// the popup stays in "loading…" state, which is the right test-time
+    /// behavior (no real daemon to inspect against).
+    ///
+    /// On bollard error inside `fetch_detail`: the spawned future swallows
+    /// the error and does NOT send a message. The popup stays in "loading…"
+    /// — better than wedging the render loop on an unhandled `ProbeError`.
+    /// Future work (Phase 5 ROB-02) may add an error banner channel.
+    fn spawn_detail_fetch(&mut self, id: String) {
+        if self.selection.inspect_in_flight {
+            return;
+        }
+        let (Some(docker), Some(tx)) = (self.docker.as_ref(), self.tx_for_inspect.as_ref()) else {
+            // Test path: no real daemon connected. The selection.detail_open
+            // flag was already set by apply_input_action; the popup will show
+            // "loading…" forever (or until Esc closes it). Production always
+            // goes through `with_docker`, so this branch is test-only.
+            return;
+        };
+        self.selection.inspect_in_flight = true;
+        self.selection.pending_detail = None;
+        let docker = docker.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            if let Ok(snap) = crate::docker::fetch_detail(&docker, &id).await {
+                let _ = tx.send(DockerMsg::Inspected(snap));
+            }
+            // On error: don't send. The popup stays "loading…" until the
+            // user presses Esc or Enter again. See doc comment above.
+        });
     }
 
     /// Handle a terminal resize. Later plans recompute the 3D viewport here.
@@ -201,6 +287,15 @@ impl App {
         let before = self.world.entities.len();
         let mut rebuilt = false;
         while let Ok(msg) = rx.try_recv() {
+            // 04-06b: demux Inspected into selection BEFORE `live.apply`.
+            // The cache write in `LiveWorld::handle_inspected` still runs
+            // (apply takes the msg by value below), but the popup-facing
+            // slot is the source of truth for the renderer — Selection
+            // owns `pending_detail`, LiveWorld owns the by-id cache.
+            if let DockerMsg::Inspected(snap) = &msg {
+                self.selection.pending_detail = Some(snap.clone());
+                self.selection.inspect_in_flight = false;
+            }
             if let Some(w) = self.live.apply(msg) {
                 self.world = w;
                 rebuilt = true;
@@ -465,6 +560,117 @@ mod tests {
         assert!(
             app.should_quit,
             "Esc with no panel must surface Effect::Quit through update()"
+        );
+    }
+
+    // ---- 04-06b: Effect::SpawnInspect handling + Inspected demux -----------
+
+    use crate::docker::{DetailSnapshot, HealthSummary};
+
+    fn detail_for(id: &str) -> DetailSnapshot {
+        DetailSnapshot {
+            id: id.to_string(),
+            name: id.to_string(),
+            status: Status::Running,
+            health: HealthSummary::None,
+            started_at_iso: String::new(),
+            restart_count: 0,
+            restart_policy: "no".to_string(),
+            image_human: String::new(),
+            image_digest: String::new(),
+            network_mode: String::new(),
+            networks: Vec::new(),
+            ports: Vec::new(),
+            mounts: Vec::new(),
+        }
+    }
+
+    /// App::new() has no docker handle — OpenDetail must NOT panic on the
+    /// missing `self.docker`. The spawn handler returns early as a noop and
+    /// the selection.detail_open flag stays as apply_input_action set it.
+    #[test]
+    fn app_open_detail_with_no_docker_handle_does_not_panic() {
+        // App::new() seeds the synthetic scene + None docker / tx.
+        let mut app = App::new();
+        // Manually arm the selection so OpenDetail surfaces SpawnInspect (the
+        // synthetic scene has entities with ids; pick the first one and we
+        // need a corresponding LiveWorld id to resolve — easier to just call
+        // spawn_detail_fetch directly to exercise the early-return branch).
+        // The doc contract: with docker=None, spawn_detail_fetch is a noop.
+        app.spawn_detail_fetch("any-id".to_string());
+        // The flag may have been false going in; the noop branch should NOT
+        // mutate it (the production path sets it to true before spawning).
+        assert!(
+            !app.selection.inspect_in_flight,
+            "no-docker spawn must NOT set inspect_in_flight (noop branch)"
+        );
+        assert!(app.selection.pending_detail.is_none());
+    }
+
+    /// A synthetic `DockerMsg::Inspected` fed through drain_docker populates
+    /// `selection.pending_detail` and clears `inspect_in_flight`. This is the
+    /// other half of the Effect::SpawnInspect round-trip — the spawn fires
+    /// fetch_detail, the producer sends back Inspected, drain_docker demuxes.
+    #[test]
+    fn app_inspected_message_populates_pending_detail() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        assert!(app.selection.pending_detail.is_none());
+        app.selection.inspect_in_flight = true;
+
+        tx.send(DockerMsg::Inspected(detail_for("c1"))).unwrap();
+        app.drain_docker();
+
+        assert!(
+            app.selection.pending_detail.is_some(),
+            "Inspected msg must populate pending_detail"
+        );
+        assert_eq!(app.selection.pending_detail.as_ref().unwrap().id, "c1");
+        assert!(
+            !app.selection.inspect_in_flight,
+            "Inspected msg must clear inspect_in_flight"
+        );
+    }
+
+    /// Even when nothing else changes (no Added / Removed in the same drain),
+    /// the in_flight flag must still clear — the Inspected demux is BEFORE
+    /// the `live.apply` call.
+    #[test]
+    fn app_inspected_clears_in_flight_flag_with_no_other_msgs() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        app.selection.inspect_in_flight = true;
+
+        tx.send(DockerMsg::Inspected(detail_for("alpha"))).unwrap();
+        app.drain_docker();
+
+        assert!(!app.selection.inspect_in_flight);
+        assert!(app.selection.pending_detail.is_some());
+    }
+
+    /// A second spawn_detail_fetch call while one is in-flight must be a
+    /// noop — prevents Enter-mashing from queueing duplicate fetches against
+    /// the daemon. The first spawn's result lands regardless.
+    #[test]
+    fn app_duplicate_open_detail_does_not_double_spawn() {
+        let mut app = App::new();
+        // Manually set the in-flight flag as if a previous spawn already ran.
+        app.selection.inspect_in_flight = true;
+        // Without a real docker handle, both calls hit the early-return.
+        // With a real handle, the in_flight gate is what stops the second
+        // call. Pin both paths: spawn handler must NOT clear in_flight.
+        app.spawn_detail_fetch("c1".to_string());
+        assert!(
+            app.selection.inspect_in_flight,
+            "second spawn while in-flight must not flip the flag off"
+        );
+        // pending_detail must NOT be touched by a duplicate spawn either —
+        // a partially-populated popup would lose its data on a double-press.
+        app.selection.pending_detail = Some(detail_for("preexisting"));
+        app.spawn_detail_fetch("c1".to_string());
+        assert!(
+            app.selection.pending_detail.is_some(),
+            "duplicate spawn must not clear pending_detail"
         );
     }
 }
