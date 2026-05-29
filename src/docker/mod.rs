@@ -32,12 +32,16 @@ pub mod stats;
 
 pub mod domain;
 pub mod connect;
+pub mod inspect;
 pub mod streams;
 
 // Re-export the normalizer surface so call sites can write `crate::docker::normalize`
 // without reaching into the submodule path. Keep this list in sync with the
 // items the rest of the app speaks.
 pub use stats::{normalize, RawCpu, RawMem, StatSample};
-pub use domain::{from_bollard_summary, map_status, ContainerSnapshot};
+pub use domain::{
+    from_bollard_summary, map_status, ContainerSnapshot, EnrichedSnapshot, PortProto, PortSummary,
+};
 pub use connect::{connect_and_probe, ProbeError};
+pub use inspect::{enrich_snapshot_on_seed, enrich_snapshot_on_start};
 pub use streams::spawn_docker_tasks;
