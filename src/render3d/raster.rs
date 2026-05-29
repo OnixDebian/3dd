@@ -329,7 +329,11 @@ impl Fragment {
 /// [`resolve_supersampled`] and lights one column/row of dots along the edge.
 /// Picked empirically to read as a clean ~1-dot-wide outline without ballooning
 /// into a thick blob at scale.
-const EDGE_HALF_PX_SS: f32 = 1.6;
+///
+/// Crate-visible so [`crate::render3d::plane`] can reuse the same edge
+/// thickness for floor-plane wireframes (ENT-01) — keeps the floor edges
+/// visually consistent with cube wireframe edges at the same resolution.
+pub(crate) const EDGE_HALF_PX_SS: f32 = 1.6;
 
 /// Scene-wide near/far across both face and edge fragments — the fog range.
 fn fragment_distance_range(frags: &[Fragment]) -> (f32, f32) {
@@ -419,7 +423,10 @@ fn fill_edge(fb: &mut Framebuffer, projector: &Projector, a: Vec3, b: Vec3, colo
 /// to the segment ≤ `half_px`, with `t` clamped to `[0,1]` so caps are flat
 /// rather than rounded). Out-of-range writes pass silently through
 /// [`Framebuffer::set`] — the resize/clip safety carries through.
-fn draw_thick_line(fb: &mut Framebuffer, a: (f32, f32), b: (f32, f32), half_px: f32, color: Color) {
+///
+/// Crate-visible so [`crate::render3d::plane::rasterize_floor_plane`] can
+/// share the same band-rasterizer for its 4 wireframe edges.
+pub(crate) fn draw_thick_line(fb: &mut Framebuffer, a: (f32, f32), b: (f32, f32), half_px: f32, color: Color) {
     let (ax, ay) = a;
     let (bx, by) = b;
     let dx = bx - ax;

@@ -234,6 +234,75 @@ impl LiveWorld {
         self.entries.get(id).map(|e| &e.snap)
     }
 
+    /// Per-group XZ bounding rect for ENT-01 floor-planes (04-04).
+    ///
+    /// Returns one entry per non-empty group: `(group_key, center, half_size_xz)`.
+    /// `center.y` is the FLOOR Y — placed below the maximum-extent box bottom
+    /// (`-MAX_HALF - 0.2`) so a fully-loaded row-0 box (`y_center = 0`, half-extent
+    /// `MAX_HALF = 1.2`) still sits cleanly above the floor. `half_size_xz`
+    /// bounds the group's occupied slots in world XZ plus `FLOOR_PAD` padding
+    /// on each axis so the floor extends past the boxes' AABBs.
+    ///
+    /// Walked in group INSERTION ORDER (sorted by `group_id`), so the
+    /// returned `Vec` order is deterministic across frames and the renderer
+    /// can pair entries with a stable index if it ever needs to.
+    ///
+    /// Used at the call site (`ui/scene.rs` braille, `run_kitty` for kitty)
+    /// to build a `Vec<FloorPlane>` per frame — no allocation inside the
+    /// renderer.
+    pub fn group_bounds_xz(&self) -> Vec<(String, Vec3, glam::Vec2)> {
+        /// Floor Y. Sits below the lowest possible box bottom: with row 0
+        /// `position.y = 0` and `MAX_HALF = 1.2`, the bottom of a maxed-out
+        /// row-0 box is at `y = -1.2`. A floor at `-MAX_HALF - 0.2 = -1.4`
+        /// stays cleanly under every box at every load.
+        const FLOOR_Y: f32 = -(crate::world::entity::MAX_HALF + 0.2);
+        /// Padding (world units) around the group's slot AABB on each XZ axis.
+        const FLOOR_PAD: f32 = 1.0;
+
+        let mut out = Vec::with_capacity(self.groups.len());
+        // Walk groups in registration order (group_id ascending) so the
+        // returned Vec order is deterministic across rebuilds.
+        let mut group_entries: Vec<(&String, u16)> =
+            self.groups.iter().map(|(k, &v)| (k, v)).collect();
+        group_entries.sort_by_key(|&(_, v)| v);
+
+        for (key, gid) in group_entries {
+            let g = gid as usize;
+            let slots = &self.group_slots[g];
+            // Skip groups whose every slot has been freed (Removed wiped them
+            // all out) — drawing a floor under nobody is just visual noise.
+            let mut min_x = f32::INFINITY;
+            let mut max_x = f32::NEG_INFINITY;
+            let mut min_z = f32::INFINITY;
+            let mut max_z = f32::NEG_INFINITY;
+            let mut any_occupied = false;
+            for (idx, slot) in slots.iter().enumerate() {
+                if slot.is_none() {
+                    continue;
+                }
+                let pos = crate::world::layout::layout(gid, idx as u32);
+                min_x = min_x.min(pos.x);
+                max_x = max_x.max(pos.x);
+                min_z = min_z.min(pos.z);
+                max_z = max_z.max(pos.z);
+                any_occupied = true;
+            }
+            if !any_occupied {
+                continue;
+            }
+            let cx = 0.5 * (min_x + max_x);
+            let cz = 0.5 * (min_z + max_z);
+            let hx = 0.5 * (max_x - min_x) + FLOOR_PAD;
+            let hz = 0.5 * (max_z - min_z) + FLOOR_PAD;
+            out.push((
+                key.clone(),
+                Vec3::new(cx, FLOOR_Y, cz),
+                glam::Vec2::new(hx, hz),
+            ));
+        }
+        out
+    }
+
     /// Reverse lookup: given an [`Entity::id`](crate::world::entity::Entity::id)
     /// (`group << 16 | index_in_group`), return the live container id string,
     /// or `None` if no entity has that slot right now.
@@ -1207,5 +1276,72 @@ mod tests {
         assert_eq!(s.id, "a");
         assert_eq!(s.group_key, "net0");
         assert_eq!(s.status, Status::Running);
+    }
+
+    // --- 04-04: group_bounds_xz (ENT-01 floor-plane source) ------------------
+
+    /// Empty world has no floor-planes.
+    #[test]
+    fn group_bounds_xz_empty_world_returns_empty() {
+        let lw = LiveWorld::new();
+        assert!(lw.group_bounds_xz().is_empty());
+    }
+
+    /// One container -> one floor-plane entry, finite center + non-zero
+    /// half-extents around the PAD.
+    #[test]
+    fn group_bounds_xz_single_container_has_finite_bounds() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        let bounds = lw.group_bounds_xz();
+        assert_eq!(bounds.len(), 1);
+        let (key, center, half) = &bounds[0];
+        assert_eq!(key, "net0");
+        // A single slot has min == max in both X and Z, so half = 0 + PAD = 1.0.
+        assert!((half.x - 1.0).abs() < 1e-5, "half_size_xz.x = {} (expected ~1.0)", half.x);
+        assert!((half.y - 1.0).abs() < 1e-5, "half_size_xz.y = {} (expected ~1.0)", half.y);
+        // Center.y is the floor Y, below the max-extent box bottom.
+        assert!(center.y < 0.0, "floor Y must be below the box floor, got {}", center.y);
+        assert!(center.x.is_finite() && center.z.is_finite());
+    }
+
+    /// Multiple non-empty groups all show up, in registration order.
+    #[test]
+    fn group_bounds_xz_multi_groups_returns_all() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        lw.apply(DockerMsg::Added(snap("b", "net1", Status::Running)));
+        let bounds = lw.group_bounds_xz();
+        assert_eq!(bounds.len(), 2);
+        assert_eq!(bounds[0].0, "net0", "first group must be net0 (registration order)");
+        assert_eq!(bounds[1].0, "net1");
+    }
+
+    /// A group whose every container was Removed is dropped from the floor list
+    /// — drawing a floor under nobody is visual noise.
+    #[test]
+    fn group_bounds_xz_skips_emptied_groups() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::Added(snap("a", "net0", Status::Running)));
+        lw.apply(DockerMsg::Added(snap("b", "net1", Status::Running)));
+        lw.apply(DockerMsg::Removed("a".to_string()));
+        let bounds = lw.group_bounds_xz();
+        assert_eq!(bounds.len(), 1, "emptied net0 must not produce a floor");
+        assert_eq!(bounds[0].0, "net1");
+    }
+
+    /// id_string_for_entity round-trips: ask the LiveWorld for the container
+    /// id behind an Entity.id, get it back (04-03 reverse lookup; pinned again
+    /// here so 04-04's reuse from `Effect::SpawnInspect` stays alive).
+    #[test]
+    fn id_string_for_entity_round_trips() {
+        let mut lw = LiveWorld::new();
+        let w = lw
+            .apply(DockerMsg::Added(snap("a", "net0", Status::Running)))
+            .expect("Added must produce a World");
+        let entity_id = w.entities[0].id;
+        assert_eq!(lw.id_string_for_entity(entity_id), Some("a"));
+        // Unknown entity id (e.g. an old selection on a since-removed container).
+        assert_eq!(lw.id_string_for_entity(0xDEAD_BEEF), None);
     }
 }

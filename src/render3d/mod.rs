@@ -6,8 +6,10 @@
 
 pub mod cube;
 pub mod framebuffer;
+pub mod plane;
 pub mod project;
 pub mod raster;
+pub mod scene_extras;
 
 // Public API surface consumed by plan 05 (blit + orbiting camera).
 #[allow(unused_imports)]
@@ -18,6 +20,8 @@ pub use framebuffer::Framebuffer;
 pub use project::Projector;
 #[allow(unused_imports)]
 pub use raster::{render, render_scene};
+#[allow(unused_imports)]
+pub use scene_extras::{FloorPlane, PortLookup, SceneExtras};
 
 #[allow(unused_imports)]
 pub use self::rotate_y_about as rotate_y;
