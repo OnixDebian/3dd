@@ -41,6 +41,29 @@ pub const GROUP_DEPTH: f32 = 10.0;
 /// `index_in_group` fills column-major within a group.
 pub const GRID_COLS: u32 = 4;
 
+/// Deterministic upper bound on the +X extent of the rack (W9 closure for 04-05).
+///
+/// `GRID_COLS * SLOT_SPACING` is the maximum possible +X coordinate any rack
+/// slot can reach (a slot in the rightmost column of any group). Computed once
+/// at compile time; does NOT depend on which containers are currently live so:
+///   - Synthetic-only paths (`--dump-rgba`) render image stacks at the same X
+///     position as live paths (W9 closure).
+///   - The image region position is stable across runs (containers come and
+///     go; the image region's X anchor does not).
+///   - Call sites never pass `max_rack_x` as an argument; `image_stack_positions`
+///     uses this constant directly.
+pub const MAX_RACK_X: f32 = GRID_COLS as f32 * SLOT_SPACING;
+
+/// X offset of the image-stack region beyond the rack's max +X extent.
+/// Picked so a typical orbit-out reveals the image region without a "the
+/// images are inside the rack" perceptual collision (W9 closure).
+pub const IMAGE_REGION_X_OFFSET: f32 = 4.0;
+
+/// Z spacing between adjacent image stacks along the +Z axis. Matches
+/// `SLOT_SPACING` so the image region's pitch reads as consistent with the
+/// container rack's pitch.
+pub const IMAGE_STACK_SPACING_Z: f32 = 2.6;
+
 /// World slot center for the entity at `index_in_group` within `group`.
 ///
 /// Deterministic and pure. Columns run along +X, rows (shelves) stack along +Y,

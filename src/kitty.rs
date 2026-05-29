@@ -677,6 +677,69 @@ fn build_port_lookup_kitty<'a>(
     map
 }
 
+/// Build per-frame volume cylinders for the kitty path (ENT-03 / 04-05).
+///
+/// One cylinder per entity with `mount_count >= 1`. Cylinder height comes
+/// from `proxy_volume_height(mount_count)` (the sqrt-compressive mount-count
+/// proxy from `world::volume`); the cylinder sits on top of the cube
+/// (`center.y = entity.top_y`), with radius scaled to the cube's XZ half-
+/// extent. Color is `palette.volume` (muted teal — distinct from running
+/// green / glow indigo).
+///
+/// I12 closure: uses the existing `LiveWorld::snapshot(id).mount_count`
+/// accessor — no `LiveWorld::mount_count(id)` helper added.
+fn build_volume_cylinders_kitty(
+    world: &World,
+    live: &LiveWorld,
+    palette: &Palette,
+) -> Vec<crate::render3d::scene_extras::Cylinder> {
+    let mut out: Vec<crate::render3d::scene_extras::Cylinder> = Vec::new();
+    for entity in &world.entities {
+        let mc = live
+            .id_string_for_entity(entity.id)
+            .and_then(|cid| live.snapshot(cid))
+            .map(|s| s.mount_count)
+            .unwrap_or(0);
+        if mc == 0 {
+            continue;
+        }
+        let height = crate::world::volume::proxy_volume_height(mc);
+        // Sit on TOP of the cube: cube center.y + half_extent.y.
+        let center = Vec3::new(
+            entity.position.x,
+            entity.position.y + entity.half_extents.y,
+            entity.position.z,
+        );
+        let radius = entity.half_extents.x * 0.4;
+        out.push(crate::render3d::scene_extras::Cylinder {
+            center,
+            radius,
+            height,
+            color: palette.volume,
+        });
+    }
+    out
+}
+
+/// Build per-frame image stacks for the kitty path (ENT-04 / 04-05).
+///
+/// One stack per image in `LiveWorld::image_stack_positions()`. Positions
+/// are deterministic (BTreeMap-by-id order + MAX_RACK_X constant — W9
+/// closure). The kitty path drops the repo_tag (the third tuple element):
+/// labels aren't part of the image stack visual yet — Phase 5 may add a
+/// label tier for selected stacks.
+fn build_image_stacks_kitty(
+    live: &LiveWorld,
+) -> Vec<crate::render3d::scene_extras::ImageStack> {
+    live.image_stack_positions()
+        .into_iter()
+        .map(|(base, layer_count, _tag)| crate::render3d::scene_extras::ImageStack {
+            base,
+            layer_count,
+        })
+        .collect()
+}
+
 pub fn supports_kitty_graphics() -> bool {
     if std::env::var_os("KITTY_WINDOW_ID").is_some()
         || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
@@ -863,7 +926,18 @@ pub fn run_kitty(mut docker_rx: UnboundedReceiver<DockerMsg>) -> Result<()> {
                 // from LiveWorld entries via `snapshot`.
                 let floors = build_floor_planes_kitty(&live, &selection, &palette);
                 let ports = build_port_lookup_kitty(&world, &live);
-                let extras = SceneExtras::new(floors.as_slice(), &ports);
+                // 04-05 ENT-03 / ENT-04: volume cylinders + image stacks
+                // built per-frame from the live world. Builders are local
+                // to this file so all kitty-path extras assembly stays in
+                // one place.
+                let cylinders = build_volume_cylinders_kitty(&world, &live, &palette);
+                let image_stacks = build_image_stacks_kitty(&live);
+                let extras = SceneExtras::new(
+                    floors.as_slice(),
+                    &ports,
+                    cylinders.as_slice(),
+                    image_stacks.as_slice(),
+                );
 
                 let rgba = render_rgba(
                     &world.entities,
@@ -973,11 +1047,14 @@ pub fn dump_rgba(path: &str, w: usize, h: usize) -> Result<()> {
     // the dump shows boxes mid-rotation (not all axis-aligned/edge-on).
     let spin = SPIN_RATE * 2.0;
     let view = camera.view_params(DEFAULT_FOV);
-    // Offline dump: no live selection, no live ports / floors. SceneExtras
-    // carries empty slices, so the renderer skips floor + port passes.
+    // Offline dump: no live selection, no live ports / floors / cylinders /
+    // image_stacks. SceneExtras carries empty slices, so the renderer skips
+    // every extras pass — pure synthetic cubes.
     let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
     let ports = crate::render3d::scene_extras::PortLookup::new();
-    let extras = SceneExtras::new(&floors, &ports);
+    let cylinders: Vec<crate::render3d::scene_extras::Cylinder> = Vec::new();
+    let image_stacks: Vec<crate::render3d::scene_extras::ImageStack> = Vec::new();
+    let extras = SceneExtras::new(&floors, &ports, &cylinders, &image_stacks);
     let rgba = render_rgba(
         &world.entities,
         view,
@@ -1164,7 +1241,14 @@ pub fn dump_snapshot(path: &str, w: usize, h: usize) -> Result<()> {
     // dump_snapshot since seed snapshots may not have rich port data).
     let floors = build_floor_planes_kitty(&live, &Selection::new(), &palette);
     let ports = build_port_lookup_kitty(&world, &live);
-    let extras = SceneExtras::new(floors.as_slice(), &ports);
+    let cylinders = build_volume_cylinders_kitty(&world, &live, &palette);
+    let image_stacks = build_image_stacks_kitty(&live);
+    let extras = SceneExtras::new(
+        floors.as_slice(),
+        &ports,
+        cylinders.as_slice(),
+        image_stacks.as_slice(),
+    );
     let rgba = render_rgba(
         &world.entities,
         view,
@@ -1240,7 +1324,9 @@ pub fn dump_rgba_mixed(path: &str, w: usize, h: usize) -> Result<()> {
     let view = camera.view_params(DEFAULT_FOV);
     let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
     let ports = crate::render3d::scene_extras::PortLookup::new();
-    let extras = SceneExtras::new(&floors, &ports);
+    let cylinders: Vec<crate::render3d::scene_extras::Cylinder> = Vec::new();
+    let image_stacks: Vec<crate::render3d::scene_extras::ImageStack> = Vec::new();
+    let extras = SceneExtras::new(&floors, &ports, &cylinders, &image_stacks);
     let rgba = render_rgba(
         &world.entities,
         view,
@@ -1280,7 +1366,9 @@ mod tests {
     ) -> Vec<u8> {
         let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
         let ports = crate::render3d::scene_extras::PortLookup::new();
-        let extras = SceneExtras::new(&floors, &ports);
+        let cylinders: Vec<crate::render3d::scene_extras::Cylinder> = Vec::new();
+        let image_stacks: Vec<crate::render3d::scene_extras::ImageStack> = Vec::new();
+        let extras = SceneExtras::new(&floors, &ports, &cylinders, &image_stacks);
         render_rgba(
             entities,
             view,

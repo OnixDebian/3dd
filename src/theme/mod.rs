@@ -55,6 +55,9 @@ pub struct Palette {
     pub edge: Color,
     /// Accent used for glow / highlights / "alive" emphasis.
     pub glow: Color,
+    /// Volume cylinder color (ENT-03). A muted teal that reads as "data"
+    /// without competing with status colors (running green / crashed red).
+    pub volume: Color,
     /// Status: running.
     pub running: Color,
     /// Status: paused.
@@ -77,6 +80,7 @@ impl Default for Palette {
             background: Color::Rgb(0x1A, 0x1A, 0x22), // muted near-black with a faint indigo tint
             edge: Color::Rgb(0x9A, 0x9A, 0xA8),       // soft gray — wireframe color for non-Running
             glow: Color::Rgb(0x8A, 0x8A, 0xF0),       // bright indigo accent
+            volume: Color::Rgb(0x50, 0x8C, 0x8C),     // muted teal — volume cylinders (ENT-03)
             running: Color::Rgb(0x7F, 0xE0, 0x8A),    // light green — alive (vivid faces)
             paused: Color::Rgb(0xE2, 0xB1, 0x4F),     // amber — held
             stopped: Color::Rgb(0x6B, 0x6B, 0x78),    // gray — dormant

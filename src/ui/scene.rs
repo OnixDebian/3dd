@@ -255,7 +255,7 @@ pub fn render_scene(
         spin,
         selected_id: selection.selected_id,
         selection_pulse_phase: selection.pulse_phase,
-        extras: SceneExtras::new(floors.as_slice(), &ports),
+        extras: SceneExtras::new(floors.as_slice(), &ports, &[], &[]),
     };
 
     // Canvas X bounds are in DOT coordinates (top-left origin); ctx.print

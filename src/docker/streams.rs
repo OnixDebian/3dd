@@ -134,6 +134,18 @@ pub fn spawn_docker_tasks(docker: Docker, tx: UnboundedSender<DockerMsg>) -> Joi
                     });
                 }
 
+                // ENT-04 (04-05): seed images ONCE on startup, BEFORE the
+                // events loop takes over. `fetch_image_snapshots` is
+                // best-effort (returns empty on list_images failure, skips
+                // per-image inspect failures) so this never panics and
+                // never blocks beyond the bollard request roundtrips.
+                let imgs = crate::docker::images::fetch_image_snapshots(&docker).await;
+                for img in imgs {
+                    if tx.send(DockerMsg::ImageAdded(img)).is_err() {
+                        return;
+                    }
+                }
+
                 // Hand off to the events loop, passing the live stats-task
                 // table so die/destroy can abort the right one.
                 run_events_loop(docker, tx, stats_tasks).await;

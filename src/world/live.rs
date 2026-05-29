@@ -61,12 +61,12 @@
 
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use glam::Vec3;
 
 use crate::docker::stats::StatSample;
-use crate::docker::{ContainerSnapshot, EnrichedSnapshot};
+use crate::docker::{ContainerSnapshot, EnrichedSnapshot, ImageSnapshot};
 use crate::theme::Status;
 // Per-frame easing pass (CONT-03 / 04-01) — `dress(dt)` is the per-tick
 // size easing path defined below; both renderers call it once per frame.
@@ -101,6 +101,16 @@ pub enum DockerMsg {
     /// mount_count in place; optionally upgrades the entry's status via
     /// `status_override` (Phase 3 carryover (1)).
     Enriched(EnrichedSnapshot),
+    /// One image (from the startup `list_images` + `inspect_image` pass via
+    /// `docker::images::fetch_image_snapshots`, 04-05). Inserted into the
+    /// LiveWorld `images: BTreeMap` keyed by image id (BTreeMap = stable
+    /// iteration order across runs — W9 closure). Idempotent on duplicate id.
+    ImageAdded(ImageSnapshot),
+    /// Remove an image from the LiveWorld set. Reserved for v2 — Phase 4
+    /// only seeds images once on startup, so no events drive this path
+    /// today. Kept on the enum so the apply() match is total + future-proof.
+    #[allow(dead_code)]
+    ImageRemoved(String),
 }
 
 /// Per-container live state — what we know about one container right now.
@@ -168,6 +178,13 @@ pub struct LiveWorld {
     id_to_addr: HashMap<String, (u16, usize)>,
     /// Per-id live state (status + latest load).
     entries: HashMap<String, LiveEntry>,
+    /// Image set seeded once on startup by `docker::images::fetch_image_snapshots`
+    /// (04-05 / ENT-04). `BTreeMap` so the walk order is stable by image id —
+    /// W9 closure: image stack positions are deterministic across runs.
+    /// New images APPEND in id-sorted position; removed images leave a gap
+    /// (the index of every later image shifts down by 1 only on `ImageRemoved`,
+    /// which is not subscribed in v1).
+    images: BTreeMap<String, ImageSnapshot>,
 }
 
 impl Default for LiveWorld {
@@ -177,13 +194,14 @@ impl Default for LiveWorld {
 }
 
 impl LiveWorld {
-    /// Empty live world — no entities, no slots, no groups.
+    /// Empty live world — no entities, no slots, no groups, no images.
     pub fn new() -> Self {
         Self {
             groups: HashMap::new(),
             group_slots: Vec::new(),
             id_to_addr: HashMap::new(),
             entries: HashMap::new(),
+            images: BTreeMap::new(),
         }
     }
 
@@ -215,6 +233,8 @@ impl LiveWorld {
             DockerMsg::StatusChanged(id, status) => self.handle_status(&id, status),
             DockerMsg::Stat(id, sample) => self.handle_stat(&id, sample),
             DockerMsg::Enriched(enr) => self.handle_enriched(enr),
+            DockerMsg::ImageAdded(img) => self.handle_image_added(img),
+            DockerMsg::ImageRemoved(id) => self.handle_image_removed(&id),
         };
 
         if changed {
@@ -232,6 +252,40 @@ impl LiveWorld {
     /// and refreshed by [`DockerMsg::Enriched`].
     pub fn snapshot(&self, id: &str) -> Option<&ContainerSnapshot> {
         self.entries.get(id).map(|e| &e.snap)
+    }
+
+    /// Number of images known to the LiveWorld (test introspection).
+    pub fn image_count(&self) -> usize {
+        self.images.len()
+    }
+
+    /// World positions for every image stack (ENT-04 / 04-05).
+    ///
+    /// Returns `(base, layer_count, repo_tag)` per image, walked in
+    /// `BTreeMap`-by-id order so the index `i` of every image is stable
+    /// across runs (W9 closure: image stack geometry independent of live
+    /// container set).
+    ///
+    /// Positions use the deterministic [`MAX_RACK_X`] constant — **no
+    /// `max_rack_x` argument**. Synthetic-only paths (`--dump-rgba`) can
+    /// build the same positions without a live entity set.
+    ///
+    /// The owned `String` for `repo_tag` is a clone of the live entry's
+    /// tag — the caller can render it without holding a borrow into the
+    /// live entries map (which would conflict with mutations on the same
+    /// frame).
+    pub fn image_stack_positions(&self) -> Vec<(Vec3, usize, String)> {
+        use crate::world::layout::{IMAGE_REGION_X_OFFSET, IMAGE_STACK_SPACING_Z, MAX_RACK_X};
+        let origin_x = MAX_RACK_X + IMAGE_REGION_X_OFFSET;
+        let mut out = Vec::with_capacity(self.images.len());
+        for (i, (_id, img)) in self.images.iter().enumerate() {
+            let z = i as f32 * IMAGE_STACK_SPACING_Z;
+            // `base.y = 0` so the bottom of the lowest layer sits flush with
+            // the rack floor row (row 0 in the layout grid is also at y=0).
+            let base = Vec3::new(origin_x, 0.0, z);
+            out.push((base, img.layer_count, img.repo_tag.clone()));
+        }
+        out
     }
 
     /// Per-group XZ bounding rect for ENT-01 floor-planes (04-04).
@@ -518,6 +572,40 @@ impl LiveWorld {
             entry.snap.group_key = enr.group_key.clone();
         }
         true
+    }
+
+    /// Insert / refresh one image (04-05 / ENT-04).
+    ///
+    /// Returns `true` only on first-insert for a given id; an idempotent
+    /// re-add (same id seen twice during startup seed, or a v2 re-seed)
+    /// returns `false` so the World rebuild on apply() is skipped. The
+    /// stored `ImageSnapshot` value IS refreshed (repo_tag / layer_count
+    /// may have changed) — this matches `handle_added`'s "refresh in
+    /// place, keep slot" idempotency contract.
+    fn handle_image_added(&mut self, img: ImageSnapshot) -> bool {
+        use std::collections::btree_map::Entry;
+        match self.images.entry(img.id.clone()) {
+            Entry::Occupied(mut e) => {
+                // Idempotent refresh: update the value but DO NOT report a
+                // change. The renderer doesn't need a World rebuild for a
+                // repo_tag refresh — image_stack_positions reads the value
+                // directly on the next frame.
+                e.insert(img);
+                false
+            }
+            Entry::Vacant(e) => {
+                e.insert(img);
+                true
+            }
+        }
+    }
+
+    /// Remove one image from the LiveWorld set (04-05 / ENT-04). Reserved
+    /// for v2 — Phase 4 never sends this today, but the handler is wired
+    /// so the apply() match stays total + an out-of-tree caller can drive
+    /// it from a test.
+    fn handle_image_removed(&mut self, id: &str) -> bool {
+        self.images.remove(id).is_some()
     }
 
     // --- Helpers --------------------------------------------------------------
@@ -1343,5 +1431,106 @@ mod tests {
         assert_eq!(lw.id_string_for_entity(entity_id), Some("a"));
         // Unknown entity id (e.g. an old selection on a since-removed container).
         assert_eq!(lw.id_string_for_entity(0xDEAD_BEEF), None);
+    }
+
+    fn image(id: &str, tag: &str, layers: usize) -> ImageSnapshot {
+        ImageSnapshot {
+            id: id.to_string(),
+            repo_tag: tag.to_string(),
+            layer_count: layers,
+        }
+    }
+
+    /// First ImageAdded for an id triggers a World rebuild (apply returns
+    /// Some); a duplicate id is an idempotent refresh and returns None.
+    #[test]
+    fn image_added_inserts_and_rebuilds_once_per_id() {
+        let mut lw = LiveWorld::new();
+        // First insert -> Some (rebuild).
+        let res = lw.apply(DockerMsg::ImageAdded(image("sha:a", "alpine:3", 1)));
+        assert!(res.is_some(), "first ImageAdded must produce a World rebuild");
+        assert_eq!(lw.image_count(), 1);
+        // Duplicate id -> None (idempotent refresh).
+        let res2 = lw.apply(DockerMsg::ImageAdded(image("sha:a", "alpine:3.20", 1)));
+        assert!(res2.is_none(), "duplicate ImageAdded must NOT rebuild");
+        assert_eq!(lw.image_count(), 1);
+        // The value was refreshed (repo_tag should be the newer one).
+        let positions = lw.image_stack_positions();
+        assert_eq!(positions[0].2, "alpine:3.20");
+    }
+
+    /// image_stack_positions walks the images BTreeMap in id-sorted order so
+    /// the position assigned to a given image id is deterministic across runs.
+    /// Inserting "ba", "ab", "ca" must produce positions at i=0("ab"),
+    /// i=1("ba"), i=2("ca") — BTreeMap order pinned.
+    #[test]
+    fn image_stack_positions_walks_in_id_order() {
+        use crate::world::layout::{IMAGE_REGION_X_OFFSET, IMAGE_STACK_SPACING_Z, MAX_RACK_X};
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::ImageAdded(image("ba", "tag-ba", 2)));
+        lw.apply(DockerMsg::ImageAdded(image("ab", "tag-ab", 3)));
+        lw.apply(DockerMsg::ImageAdded(image("ca", "tag-ca", 1)));
+        let positions = lw.image_stack_positions();
+        assert_eq!(positions.len(), 3);
+        // BTreeMap order: "ab" < "ba" < "ca".
+        assert_eq!(positions[0].2, "tag-ab");
+        assert_eq!(positions[1].2, "tag-ba");
+        assert_eq!(positions[2].2, "tag-ca");
+        // X is the constant origin; Z is i * SPACING_Z.
+        let origin_x = MAX_RACK_X + IMAGE_REGION_X_OFFSET;
+        for (i, (base, _layers, _tag)) in positions.iter().enumerate() {
+            assert!((base.x - origin_x).abs() < 1e-5);
+            assert!((base.z - i as f32 * IMAGE_STACK_SPACING_Z).abs() < 1e-5);
+            assert_eq!(base.y, 0.0);
+        }
+    }
+
+    /// W9 closure pin: image_stack_positions' X coordinate is the deterministic
+    /// MAX_RACK_X constant + IMAGE_REGION_X_OFFSET. The value MUST be identical
+    /// whether LiveWorld has 0 or 30 containers — image stacks live in a region
+    /// decoupled from the live entity set so synthetic-only (--dump-rgba) paths
+    /// can render the same stack geometry without rebuilding a World.
+    #[test]
+    fn image_stack_positions_uses_deterministic_max_rack_x() {
+        use crate::world::layout::{IMAGE_REGION_X_OFFSET, MAX_RACK_X};
+        let expected_x = MAX_RACK_X + IMAGE_REGION_X_OFFSET;
+
+        // Empty world.
+        let mut empty = LiveWorld::new();
+        empty.apply(DockerMsg::ImageAdded(image("img:0", "a:1", 1)));
+        let pos_empty = empty.image_stack_positions();
+        assert!((pos_empty[0].0.x - expected_x).abs() < 1e-5);
+
+        // World with many containers (simulate 30-box synthetic).
+        let mut full = LiveWorld::new();
+        for i in 0..30 {
+            full.apply(DockerMsg::Added(snap(&format!("c{i}"), "net0", Status::Running)));
+        }
+        full.apply(DockerMsg::ImageAdded(image("img:0", "a:1", 1)));
+        let pos_full = full.image_stack_positions();
+        assert!(
+            (pos_full[0].0.x - expected_x).abs() < 1e-5,
+            "image stack X must be MAX_RACK_X + OFFSET regardless of container count"
+        );
+        // Identical X between the two regardless of container set.
+        assert_eq!(pos_empty[0].0.x, pos_full[0].0.x);
+    }
+
+    /// ImageRemoved drops the image from the set; subsequent ImageAdded
+    /// re-inserts it (idempotency the other direction).
+    #[test]
+    fn image_removed_drops_then_re_added() {
+        let mut lw = LiveWorld::new();
+        lw.apply(DockerMsg::ImageAdded(image("img:0", "a:1", 1)));
+        assert_eq!(lw.image_count(), 1);
+        let res = lw.apply(DockerMsg::ImageRemoved("img:0".to_string()));
+        assert!(res.is_some(), "ImageRemoved on a known id must rebuild");
+        assert_eq!(lw.image_count(), 0);
+        // Unknown id is a silent no-op.
+        let res2 = lw.apply(DockerMsg::ImageRemoved("img:0".to_string()));
+        assert!(res2.is_none());
+        // Re-adding works.
+        lw.apply(DockerMsg::ImageAdded(image("img:0", "a:1", 1)));
+        assert_eq!(lw.image_count(), 1);
     }
 }

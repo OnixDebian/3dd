@@ -22,6 +22,7 @@ pub mod layout;
 pub mod live;
 pub mod scene;
 pub mod selection;
+pub mod volume;
 
 // Re-exported for the rasterizer plans (02-02 braille, 02-03 kitty); not all
 // consumed within the crate yet, so silence the until-then unused warning

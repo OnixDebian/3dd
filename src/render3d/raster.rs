@@ -796,13 +796,15 @@ mod tests {
     }
 
     /// Empty SceneExtras factory: borrows of empty slices/maps. The cube tests
-    /// don't exercise floor-planes or port glow — those have their own focused
-    /// suites in `render3d::plane` and the per-backend visual gates.
+    /// don't exercise floor-planes, port glow, volume cylinders, or image
+    /// stacks — those have their own focused suites in `render3d::plane`,
+    /// `render3d::cylinder`, `render3d::stack`, and the per-backend visual
+    /// gates.
     fn empty_extras<'a>(
         floors: &'a [crate::render3d::scene_extras::FloorPlane],
         ports: &'a crate::render3d::scene_extras::PortLookup<'a>,
     ) -> SceneExtras<'a> {
-        SceneExtras::new(floors, ports)
+        SceneExtras::new(floors, ports, &[], &[])
     }
 
     #[test]

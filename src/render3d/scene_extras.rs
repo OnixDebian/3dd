@@ -45,32 +45,78 @@ pub struct FloorPlane {
 /// renderer can do a direct `extras.ports.get(&entity.id)` per entity.
 pub type PortLookup<'a> = HashMap<u32, &'a [PortSummary]>;
 
+/// One volume cylinder (ENT-03 / 04-05): a passive teal disk that sits on
+/// top of a container with at least one mount. `center` is the BOTTOM of
+/// the cylinder (the cube's top face); `radius` is the XZ extent;
+/// `height` extends UPWARD from `center.y` by the
+/// `proxy_volume_height(mount_count)` mapping (RESEARCH Code Example —
+/// sqrt-compressive, MIN_H..MAX_H over mount_count 0..REF).
+///
+/// `color` is the palette-resolved teal (`palette.volume`) so the renderer
+/// reads it from the palette, not from an inline RGB. Containers with
+/// zero mounts are FILTERED at build time so this list never includes
+/// "phantom" cylinders.
+#[derive(Debug, Clone, Copy)]
+pub struct Cylinder {
+    pub center: Vec3,
+    pub radius: f32,
+    pub height: f32,
+    pub color: Color,
+}
+
+/// One image stack (ENT-04 / 04-05): a column of short cubes in the +X
+/// side region beyond the rack. `base` is the world position of the bottom
+/// of the lowest layer (`x` = `MAX_RACK_X + IMAGE_REGION_X_OFFSET`, `z` =
+/// `i * IMAGE_STACK_SPACING_Z` where `i` is the image's BTreeMap-id index
+/// — deterministic / stable across runs, W9 closure); `layer_count` is
+/// the image's `root_fs.layers.len()` value (the renderer caps it at
+/// `stack::MAX_LAYERS` so a busy image doesn't tower).
+#[derive(Debug, Clone, Copy)]
+pub struct ImageStack {
+    pub base: Vec3,
+    pub layer_count: usize,
+}
+
 /// Optional-primitives container — the W7 closure: a single struct that
 /// carries every Phase-4-and-later non-cube primitive into both backends.
 ///
-/// Fields here today (04-04):
-/// - `floors`: one [`FloorPlane`] per non-empty network group.
-/// - `ports`: per-entity port-summary borrow lookup (driven by
+/// Fields (post-04-05):
+/// - `floors`: one [`FloorPlane`] per non-empty network group (04-04).
+/// - `ports`: per-entity port-summary borrow lookup (04-04, driven by
 ///   `LiveWorld::snapshot`).
-///
-/// Fields 04-05 will ADD:
-/// - `cylinders: &[Cylinder]` — ENT-03 volume cylinders.
-/// - `image_stacks: &[ImageStack]` — ENT-04 image stack columns.
+/// - `cylinders`: per-frame volume cylinders for containers with
+///   `mount_count >= 1` (04-05, ENT-03).
+/// - `image_stacks`: per-frame image stacks, one per [`ImageSnapshot`] in
+///   the LiveWorld's `images` BTreeMap (04-05, ENT-04).
 ///
 /// Both renderers take `&SceneExtras` (one parameter) and pattern-match
 /// internally on which extras to draw, so adding a field never changes the
-/// entry-point signatures. The lifetime parameter ties the borrows to the
+/// entry-point signatures (W7 closure: the struct grows in place; no
+/// signature growth). The lifetime parameter ties the borrows to the
 /// per-frame slices the caller built — no clones inside the renderer.
 pub struct SceneExtras<'a> {
     pub floors: &'a [FloorPlane],
     pub ports: &'a PortLookup<'a>,
+    pub cylinders: &'a [Cylinder],
+    pub image_stacks: &'a [ImageStack],
 }
 
 impl<'a> SceneExtras<'a> {
-    /// Construct extras from explicit borrows. The `floors` and `ports` slices
-    /// must outlive the renderer call but never the next frame — both backends
-    /// build fresh per frame from the live world.
-    pub fn new(floors: &'a [FloorPlane], ports: &'a PortLookup<'a>) -> Self {
-        Self { floors, ports }
+    /// Construct extras from explicit borrows. The `floors` / `ports` /
+    /// `cylinders` / `image_stacks` slices must outlive the renderer call
+    /// but never the next frame — both backends build fresh per frame from
+    /// the live world.
+    pub fn new(
+        floors: &'a [FloorPlane],
+        ports: &'a PortLookup<'a>,
+        cylinders: &'a [Cylinder],
+        image_stacks: &'a [ImageStack],
+    ) -> Self {
+        Self {
+            floors,
+            ports,
+            cylinders,
+            image_stacks,
+        }
     }
 }

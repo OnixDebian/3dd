@@ -23,7 +23,7 @@ pub use project::Projector;
 #[allow(unused_imports)]
 pub use raster::{render, render_scene};
 #[allow(unused_imports)]
-pub use scene_extras::{FloorPlane, PortLookup, SceneExtras};
+pub use scene_extras::{Cylinder, FloorPlane, ImageStack, PortLookup, SceneExtras};
 
 #[allow(unused_imports)]
 pub use self::rotate_y_about as rotate_y;
