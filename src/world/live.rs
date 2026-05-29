@@ -234,6 +234,26 @@ impl LiveWorld {
         self.entries.get(id).map(|e| &e.snap)
     }
 
+    /// Reverse lookup: given an [`Entity::id`](crate::world::entity::Entity::id)
+    /// (`group << 16 | index_in_group`), return the live container id string,
+    /// or `None` if no entity has that slot right now.
+    ///
+    /// Used by 04-03's `apply_input_action` to turn a `Selection::selected_id`
+    /// (an entity id) into the docker container id that 04-06's
+    /// `Effect::SpawnInspect` carries to `docker::inspect::fetch_detail`.
+    /// O(n) walk over `id_to_addr` — bounded by the live container count,
+    /// microseconds at the scales we render.
+    pub fn id_string_for_entity(&self, entity_id: u32) -> Option<&str> {
+        let group_id = (entity_id / GROUP_STRIDE) as u16;
+        let index_in_group = (entity_id % GROUP_STRIDE) as usize;
+        for (id, &(g, i)) in self.id_to_addr.iter() {
+            if g == group_id && i == index_in_group {
+                return Some(id.as_str());
+            }
+        }
+        None
+    }
+
     // --- Message handlers (all return `true` iff the scene actually changed) -
 
     fn handle_added(&mut self, snap: ContainerSnapshot) -> bool {

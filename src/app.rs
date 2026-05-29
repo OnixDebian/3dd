@@ -24,12 +24,13 @@ use std::time::Instant;
 use color_eyre::Result;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::action::Action;
+use crate::action::{apply_input_action, Action, Effect};
 use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::tui::{Event, Tui};
 use crate::ui;
 use crate::world::scene::SceneBounds;
+use crate::world::selection::Selection;
 use crate::world::{self, DockerMsg, LiveWorld, World};
 
 /// All application state. Mutated only by the main loop.
@@ -64,6 +65,10 @@ pub struct App {
     /// Live reconciler that turns DockerMsg into the World shape the renderer
     /// already consumes. Owns the stable per-id slot scheme (CONT-05).
     live: LiveWorld,
+    /// Tab-cycle selection + brightness pulse + detail-panel toggle (04-03).
+    /// Mutated by `update()` (via `apply_input_action`) and by
+    /// `on_tick`/`drain_docker` (pulse advance + reconcile-on-remove).
+    pub selection: Selection,
     /// Non-blocking receiver for typed DockerMsg events from the producer task
     /// in `docker::streams`. `None` for the test/dump constructor (`App::new`)
     /// so unit tests don't need a producer.
@@ -97,6 +102,7 @@ impl App {
             render_config: RenderConfig::default(),
             world,
             live: LiveWorld::new(),
+            selection: Selection::new(),
             docker_rx: None,
         }
     }
@@ -125,15 +131,32 @@ impl App {
                 bounds: SceneBounds::from_entities(&[]),
             },
             live: LiveWorld::new(),
+            selection: Selection::new(),
             docker_rx: Some(rx),
         }
     }
 
     /// Dispatch a high-level intent to a state mutation.
+    ///
+    /// Routes through [`apply_input_action`] — the SINGLE dispatch surface
+    /// both backends use (04-03). The returned [`Effect`] tells `update` what
+    /// the dispatch surface couldn't do itself: Quit sets `should_quit`,
+    /// SpawnInspect would fire the off-thread inspect (04-06 plugs that in).
     pub fn update(&mut self, action: Action) {
-        match action {
-            Action::Quit => self.should_quit = true,
-            Action::None => {}
+        let effect = apply_input_action(
+            action,
+            &mut self.camera,
+            &mut self.selection,
+            &self.world,
+            &self.live,
+        );
+        match effect {
+            Effect::Quit => self.should_quit = true,
+            Effect::SpawnInspect(_id) => {
+                // 04-06 plugs the docker::inspect::fetch_detail spawn here.
+                // `selection.detail_open` is already set by apply_input_action.
+            }
+            Effect::None => {}
         }
     }
 
@@ -157,6 +180,9 @@ impl App {
         // the canonical place for framerate-independent motion. Empty world
         // is a no-op (zero-length slice).
         self.live.dress(dt, &mut self.world.entities);
+        // Brightness-pulse phase advance for the selected box (04-03 CAM-04).
+        // Same dt source as dress() so the pulse is framerate-independent.
+        self.selection.tick(dt);
     }
 
     /// Drain everything currently queued on the Docker channel (non-blocking)
@@ -180,7 +206,14 @@ impl App {
                 rebuilt = true;
             }
         }
-        rebuilt && self.world.entities.len() != before
+        let count_changed = rebuilt && self.world.entities.len() != before;
+        if count_changed {
+            // A container disappeared — if it was the selected one, fall back
+            // to the first remaining (or None when empty). Other state on
+            // Selection is unchanged.
+            self.selection.reconcile(&self.world);
+        }
+        count_changed
     }
 
     /// Run the main event loop until `should_quit`.
@@ -219,7 +252,13 @@ impl App {
             // the entity COUNT changed, re-frame the camera so the new rack
             // (post-add/remove) is fully in view; pure stat updates do not
             // re-frame (avoids per-sample camera jitter).
-            if self.drain_docker() && !self.world.entities.is_empty() {
+            if self.drain_docker()
+                && !self.world.entities.is_empty()
+                && self.camera.autopilot_active
+            {
+                // Manual-mode driver must NOT be yanked back by every container
+                // add/remove — only auto-reframe while the user hasn't taken
+                // over yet (04-03 CAM-03).
                 self.camera.frame_scene(&self.world);
             }
 

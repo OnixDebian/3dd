@@ -21,6 +21,7 @@ pub mod entity;
 pub mod layout;
 pub mod live;
 pub mod scene;
+pub mod selection;
 
 // Re-exported for the rasterizer plans (02-02 braille, 02-03 kitty); not all
 // consumed within the crate yet, so silence the until-then unused warning
@@ -35,6 +36,8 @@ pub use layout::layout;
 pub use live::{DockerMsg, LiveWorld};
 #[allow(unused_imports)]
 pub use scene::{synthetic_scene, SceneBounds};
+#[allow(unused_imports)]
+pub use selection::Selection;
 
 /// A fully-populated synthetic scene: every box as data plus the enclosing
 /// [`SceneBounds`] the camera frames.
