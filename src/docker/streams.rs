@@ -104,8 +104,34 @@ pub fn spawn_docker_tasks(docker: Docker, tx: UnboundedSender<DockerMsg>) -> Joi
                     }
                     if is_running {
                         let handle = spawn_stats_task(docker.clone(), id.clone(), tx.clone());
-                        stats_tasks.insert(id, handle);
+                        stats_tasks.insert(id.clone(), handle);
                     }
+                    // Phase 3 carryover (1): list_containers `exited`
+                    // summaries land as Stopped even when the container OOM'd
+                    // or exited non-zero (the summary doesn't carry exit_code
+                    // / oom_killed). Fire an off-thread inspect to upgrade
+                    // Stopped -> Crashed when warranted. We spawn
+                    // unconditionally for every seeded container because:
+                    //   (a) the seed pass runs ONCE at startup; the inspect
+                    //       count is bounded by the container count
+                    //       (typically ~30) — negligible Docker traffic.
+                    //   (b) avoids a fragile match on bollard's state-string
+                    //       enum, which has shifted across versions.
+                    //   (c) enrich_snapshot_on_seed returns status_override
+                    //       =None for Running containers, so the path is a
+                    //       noop for healthy seeds.
+                    // Best-effort; failure is silent (enrich returns None on
+                    // bollard error).
+                    let docker_seed = docker.clone();
+                    let tx_seed = tx.clone();
+                    let id_seed = id.clone();
+                    tokio::spawn(async move {
+                        if let Some(enr) =
+                            crate::docker::enrich_snapshot_on_seed(&docker_seed, &id_seed).await
+                        {
+                            let _ = tx_seed.send(DockerMsg::Enriched(enr));
+                        }
+                    });
                 }
 
                 // Hand off to the events loop, passing the live stats-task
@@ -198,6 +224,22 @@ async fn run_events_loop(
                 let closed = send(DockerMsg::StatusChanged(id.to_string(), Status::Running));
                 if !closed {
                     spawn_stats_for_id_if_absent(&docker, &tx, &mut stats_tasks, id);
+                    // Phase 3 carryovers (2)/(3): backfill group_key + ports +
+                    // mount_count from an off-thread inspect. If the
+                    // group_key differs from what `create` seeded ("none"),
+                    // LiveWorld will migrate the slot to the real network's
+                    // Z-band. Producer never blocks on inspect — this is
+                    // tokio::spawn fire-and-forget (Pitfall 8).
+                    let docker_start = docker.clone();
+                    let tx_start = tx.clone();
+                    let id_owned = id.to_string();
+                    tokio::spawn(async move {
+                        if let Some(enr) =
+                            crate::docker::enrich_snapshot_on_start(&docker_start, &id_owned).await
+                        {
+                            let _ = tx_start.send(DockerMsg::Enriched(enr));
+                        }
+                    });
                 }
                 closed
             }
