@@ -34,6 +34,7 @@
 //! | Enter                               | OpenDetail                      |
 //! | Esc (when detail_open)              | CloseDetail (close popup)       |
 //! | Esc (no popup) / 'q' / Ctrl-C       | Quit                            |
+//! | 'p' / 'P'                           | CyclePalette                    |
 //!
 //! Pitfall D: `'a'` and `Left` (and the other WASD/arrow pairs) coexist so
 //! AZERTY/Dvorak users still get layout-independent input via arrows.
@@ -71,6 +72,8 @@ pub enum Action {
     /// Close the detail panel — OR quit, depending on whether one is open
     /// (Esc with no panel = quit; resolved by [`apply_input_action`]).
     CloseDetail,
+    /// Cycle the active palette to the next preset (P key). THEME-04.
+    CyclePalette,
 }
 
 /// Effects an [`Action`] produces that the dispatch surface cannot itself
@@ -89,6 +92,10 @@ pub enum Effect {
     /// off-thread and forward the result through `DockerMsg::Inspected`
     /// (04-06). Carries the docker CONTAINER id (NOT the entity id).
     SpawnInspect(String),
+    /// Caller cycles its `palette` field to the next preset. The order is
+    /// owned by the caller (App / run_kitty) — kept out of `apply_input_action`
+    /// so the dispatch surface stays pure (no Palette dep). THEME-04.
+    CyclePalette,
 }
 
 impl Action {
@@ -121,6 +128,7 @@ impl Action {
             KeyCode::Tab => Action::SelectNext,
             KeyCode::BackTab => Action::SelectPrev,
             KeyCode::Enter => Action::OpenDetail,
+            KeyCode::Char('p') | KeyCode::Char('P') => Action::CyclePalette,
             _ => Action::None,
         }
     }
@@ -194,6 +202,12 @@ pub fn apply_input_action(
                 // Esc with no popup open = quit, matches PROJECT.md's quit set.
                 Effect::Quit
             }
+        }
+        Action::CyclePalette => {
+            // Palette cycling is a pure visual swap — does NOT count as
+            // "user is driving the camera". Do NOT flip autopilot off, unlike
+            // SelectNext/Nudge*. Theme is meta-state, not scene state.
+            Effect::CyclePalette
         }
     }
 }
@@ -489,5 +503,56 @@ mod tests {
         assert_eq!(effect, Effect::None);
         assert!(!cam.autopilot_active);
         assert_eq!(sel.selected_id, Some(42));
+    }
+
+    // ---- THEME-04 (05-04) CyclePalette key + dispatch -----------------------
+
+    /// 'p' and 'P' both map to Action::CyclePalette (shift-forgiveness,
+    /// consistent with Tab / BackTab style coverage).
+    #[test]
+    fn p_key_maps_to_cycle_palette() {
+        assert_eq!(
+            Action::from_key(key_press(KeyCode::Char('p'))),
+            Action::CyclePalette
+        );
+        assert_eq!(
+            Action::from_key(key_press(KeyCode::Char('P'))),
+            Action::CyclePalette
+        );
+    }
+
+    /// CyclePalette dispatches to Effect::CyclePalette — the caller
+    /// (App / run_kitty) owns the cycle order and the actual palette swap.
+    #[test]
+    fn apply_cycle_palette_returns_effect_cycle_palette() {
+        let mut cam = Camera::new();
+        let mut sel = Selection::new();
+        let world = World {
+            entities: vec![],
+            bounds: SceneBounds::from_entities(&[]),
+        };
+        let live = LiveWorld::new();
+        let effect =
+            apply_input_action(Action::CyclePalette, &mut cam, &mut sel, &world, &live);
+        assert_eq!(effect, Effect::CyclePalette);
+    }
+
+    /// Palette cycling is meta-state, NOT scene state — unlike Nudge* /
+    /// Select*, it must NOT flip the camera out of autopilot mode.
+    #[test]
+    fn apply_cycle_palette_does_not_flip_autopilot() {
+        let mut cam = Camera::new();
+        let mut sel = Selection::new();
+        let world = World {
+            entities: vec![],
+            bounds: SceneBounds::from_entities(&[]),
+        };
+        let live = LiveWorld::new();
+        assert!(cam.autopilot_active);
+        let _ = apply_input_action(Action::CyclePalette, &mut cam, &mut sel, &world, &live);
+        assert!(
+            cam.autopilot_active,
+            "CyclePalette is meta-state and must NOT disturb autopilot mode"
+        );
     }
 }
