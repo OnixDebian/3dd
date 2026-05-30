@@ -150,6 +150,49 @@ pub fn emit_legend_kitty(
     Ok(())
 }
 
+/// One-shot clearing pass: write spaces over the cells the legend last
+/// occupied so the kitty image (or terminal background) shows through
+/// cleanly.
+///
+/// 05-05-RV1 (Bug A — "L doesn't work in kitty"): the original
+/// Option (c) cleanup strategy ("next `emit_kitty` re-blits over the
+/// stale legend cells") was wrong. The kitty graphics protocol places
+/// an IMAGE; terminal cell text is rendered ON TOP of images and
+/// persists until explicitly written-over with spaces. Pressing L to
+/// hide the HUD therefore left a stuck "phantom" legend on screen
+/// (cells unchanged, image redrawn behind them). RV1 wires this
+/// function to fire ONCE when `hud_visible` transitions true → false
+/// (tracked via `last_hud_visible` in `run_kitty`), writing solid-bg
+/// spaces over every cell the legend last occupied — so the image
+/// surface is the only thing visible there on the next frame.
+///
+/// Uses `palette.background` for the cleared cells so they blend with
+/// the kitty image edge tone (this matches the bg the legend itself
+/// uses post-RV3). On tiny terminals (below the legend's minimum) this
+/// is a noop — mirrors `emit_legend_kitty`'s graceful skip.
+pub fn emit_legend_clear_kitty(
+    out: &mut impl std::io::Write,
+    cols: u16,
+    rows: u16,
+    palette: &Palette,
+) -> std::io::Result<()> {
+    if cols < LEGEND_W + 2 || rows < LEGEND_H + 2 {
+        return Ok(());
+    }
+    let x = cols - LEGEND_W - 1; // 0-indexed column (matches emit_legend_kitty)
+    let y = 1u16;
+    let (br, bg_, bb) = rgb_of(palette.background);
+    let pos = |col: u16, row: u16| format!("\x1b[{};{}H", row + 1, col + 1);
+    let bg_sgr = format!("\x1b[48;2;{br};{bg_};{bb}m");
+    let reset = "\x1b[0m";
+    let blanks = " ".repeat(LEGEND_W as usize);
+    for r in 0..LEGEND_H {
+        let row = y + r;
+        write!(out, "{}{bg_sgr}{blanks}{reset}", pos(x, row))?;
+    }
+    Ok(())
+}
+
 /// Best-effort Color → (r,g,b) for the kitty emitter. Non-Rgb colors
 /// (palette quantization edge case) collapse to gray.
 fn rgb_of(c: Color) -> (u8, u8, u8) {
@@ -250,5 +293,50 @@ mod tests {
         let mut buf: Vec<u8> = Vec::new();
         emit_legend_kitty(&mut buf, 10, 5, &palette, "notion-soft").unwrap();
         assert!(buf.is_empty(), "emit must be a noop on tiny terminals");
+    }
+
+    /// RV1 (Bug A — "L doesn't work in kitty"): emit_legend_clear_kitty
+    /// writes exactly LEGEND_H rows of LEGEND_W spaces with the
+    /// palette.background bg SGR — wiping the cell text the previous
+    /// frame's emit_legend_kitty left behind. Without this, pressing
+    /// L to hide the HUD leaves a phantom legend stuck on screen
+    /// because the kitty graphics image redraw does NOT clear cell
+    /// text (cells render ON TOP of images and persist).
+    #[test]
+    fn emit_legend_clear_kitty_writes_blank_rows_with_solid_bg() {
+        let palette = Palette::notion_soft();
+        let mut buf: Vec<u8> = Vec::new();
+        emit_legend_clear_kitty(&mut buf, 100, 40, &palette).unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        // The clear pass writes LEGEND_H cursor-positioning escapes.
+        let cursor_moves = s.matches("\x1b[").count();
+        assert!(
+            cursor_moves >= LEGEND_H as usize,
+            "expected >= {} cursor moves, got {cursor_moves}",
+            LEGEND_H
+        );
+        // The bg SGR is present so the cleared cells are SOLID — using
+        // default-reset would leave the cells transparent over the
+        // kitty image and re-introduce the ghost-legend look.
+        let (br, bg_, bb) = match palette.background {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => panic!("notion-soft background must be Color::Rgb"),
+        };
+        let needle = format!("48;2;{br};{bg_};{bb}");
+        assert!(s.contains(&needle), "clear pass must use solid bg SGR");
+        // The buffer contains a run of LEGEND_W spaces (the blanking
+        // content for each row).
+        let space_run = " ".repeat(LEGEND_W as usize);
+        assert!(s.contains(&space_run), "must write space runs of LEGEND_W width");
+    }
+
+    /// emit_legend_clear_kitty is a noop on tiny terminals (matches
+    /// emit_legend_kitty's gate so the two functions degrade together).
+    #[test]
+    fn emit_legend_clear_kitty_noop_on_tiny_terminal() {
+        let palette = Palette::notion_soft();
+        let mut buf: Vec<u8> = Vec::new();
+        emit_legend_clear_kitty(&mut buf, 10, 5, &palette).unwrap();
+        assert!(buf.is_empty(), "clear must be a noop on tiny terminals");
     }
 }

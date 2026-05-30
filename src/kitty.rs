@@ -1260,7 +1260,17 @@ pub fn run_kitty(
     // value so the kitty backend honors the same `hud_visible` setting
     // App reads. Flipped at runtime by `Effect::ToggleLegend` (L key)
     // below.
+    //
+    // 05-05-RV1 (Bug A — "L doesn't work"): the original Option (c)
+    // cleanup ("next `emit_kitty` re-blits over stale legend cells")
+    // was wrong — `emit_kitty` places a graphics-protocol IMAGE; cell
+    // text is rendered ON TOP of images and persists until written-
+    // over with spaces. RV1 tracks `last_hud_visible` alongside
+    // `hud_visible` and fires `emit_legend_clear_kitty` exactly once
+    // when the user toggles the HUD off, so the phantom legend cells
+    // get wiped on the transition frame.
     let mut hud_visible = config.hud_visible;
+    let mut last_hud_visible = hud_visible;
     // `config` is otherwise unused in this plan (05-06 will read
     // `auto_degrade`, `degraded_fps_cap`, `force_mode` from it).
     let _config = config;
@@ -1698,11 +1708,17 @@ pub fn run_kitty(
             // legend's footprint if/when they overlap (mirrors the
             // braille view: scene → status_bar → legend → popup).
             //
-            // Toggle-off strategy: Option (c). When the user presses L to
-            // hide the HUD we DO NOT emit clearing spaces here; the next
-            // `emit_kitty` (or screen clear in the Banner/ChromeOnly
-            // paths) re-paints over the legend cells naturally. One
-            // stale frame is acceptable for an explicit user action.
+            // 05-05-RV1 toggle-off cleanup (replaces the original Option
+            // (c) "let emit_kitty re-blit naturally" strategy which was
+            // wrong — cells render ON TOP of the kitty graphics image
+            // and persist until written-over with spaces). When
+            // `hud_visible` transitions true → false (user pressed L),
+            // emit a one-shot `emit_legend_clear_kitty` so the cell-text
+            // legend is wiped from the terminal cell buffer. The
+            // Banner/ChromeOnly branches already issue `\x1b[2J\x1b[H`
+            // which clears everything, but LiveWorld/CachedWorld
+            // branches do NOT — those are the load-bearing paths for
+            // this fix.
             if hud_visible {
                 crate::ui::legend::emit_legend_kitty(
                     &mut stdout,
@@ -1711,7 +1727,17 @@ pub fn run_kitty(
                     &palette,
                     &palette_name,
                 )?;
+            } else if last_hud_visible {
+                // Transition frame: clear the cells the legend last
+                // painted so the user actually sees the HUD disappear.
+                crate::ui::legend::emit_legend_clear_kitty(
+                    &mut stdout,
+                    cols,
+                    rows,
+                    &palette,
+                )?;
             }
+            last_hud_visible = hud_visible;
 
             // CAM-05 / 04-06b: kitty popup OVER the image surface.
             //
