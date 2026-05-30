@@ -13,7 +13,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     let (w, h) = app.size;
     let mode = if app.camera.autopilot_active { "auto" } else { "manual" };
     let text = format!(
-        "3dd | fps: {:.0} | size: {}x{} | boxes: {} | mode: {mode} | palette: {pname} | P palette, Tab select, q quit",
+        "3dd | fps: {:.0} | size: {}x{} | boxes: {} | mode: {mode} | palette: {pname} | P palette, L legend, Tab select, q quit",
         app.fps,
         w,
         h,

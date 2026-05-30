@@ -8,6 +8,7 @@
 
 pub mod detail_panel;
 pub mod labels;
+pub mod legend;
 pub mod scene;
 pub mod status_bar;
 
@@ -116,6 +117,26 @@ pub fn view(frame: &mut Frame, app: &mut App) {
     }
 
     status_bar::render(frame, status_area, app);
+
+    // Legend HUD (THEME-05). Rendered AFTER the scene + status bar BUT
+    // BEFORE the detail-panel popup so a (centered, large) popup overlays
+    // a (top-right, small) legend when both are open. `legend_rect`
+    // auto-skips on tiny terminals (returns None), so a 40-col window
+    // simply omits the overlay rather than panicking.
+    //
+    // The legend reads `app.palette` + `app.palette_name` directly, the
+    // same fields THEME-04's `Effect::CyclePalette` swaps — so cycling
+    // the palette with P updates the legend's swatches AND title on the
+    // next frame (no separate notification path).
+    //
+    // Visible across ALL view branches (empty + cached + populated) by
+    // virtue of running here, AFTER the body of view picks its branch:
+    // there's no fourth bypass path that skips the overlay.
+    if app.hud_visible {
+        if let Some(legend_area) = legend::legend_rect(scene_area) {
+            legend::render_legend(frame, legend_area, &app.palette, &app.palette_name);
+        }
+    }
 
     // CAM-05 / 04-06b: popup overlay. Drawn LAST so the Clear + Block
     // hides the scene underneath in the popup's footprint. Block I/O

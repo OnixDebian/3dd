@@ -136,6 +136,12 @@ pub struct App {
     /// (auto_degrade, degraded_fps_cap, force_mode, hud_visible) that
     /// 05-05 / 05-06 read from.
     pub config: crate::config::AppConfig,
+    /// Whether the legend HUD overlay is currently visible (THEME-05).
+    /// Initialised from `AppConfig.hud_visible` (default true) at
+    /// construction. Toggled at runtime by `Effect::ToggleLegend` (L key).
+    /// `ui::view` reads this each frame to decide whether to draw the
+    /// legend overlay on top of the scene.
+    pub hud_visible: bool,
     /// True once we've observed at least one non-empty World since launch.
     /// Sticky: never flips back to `false` after the first container appears.
     /// Used by the empty-banner debounce: at startup (no containers ever
@@ -213,6 +219,10 @@ impl App {
             palette: crate::theme::Palette::notion_soft(),
             palette_name: "notion-soft".to_string(),
             config: crate::config::AppConfig::default(),
+            // THEME-05: legend HUD visible by default (mirrors AppConfig
+            // default). The test/dump path inherits the same default as
+            // production so tests can exercise the overlay path.
+            hud_visible: crate::config::AppConfig::default().hud_visible,
             // App::new seeds a synthetic non-empty world, so mark non-empty
             // as seen once already — there's no first-launch banner state to
             // preserve in the test path. The debounce counters are inert
@@ -259,6 +269,10 @@ impl App {
             palette: crate::theme::Palette::notion_soft(),
             palette_name: "notion-soft".to_string(),
             config: crate::config::AppConfig::default(),
+            // THEME-05: legend HUD visible by default (mirrors AppConfig
+            // default). `with_docker` overwrites this from the real config
+            // file value; this path is the test/no-config seed only.
+            hud_visible: crate::config::AppConfig::default().hud_visible,
             // Live path: world starts empty. non_empty_seen_once is false
             // until the first Added lands — the banner shows IMMEDIATELY on
             // startup (no debounce wait at first launch). After the first
@@ -313,6 +327,11 @@ impl App {
         };
         app.palette = palette;
         app.palette_name = palette_name;
+        // THEME-05: honor the config-file `hud_visible` setting. Without
+        // this assignment App::with_docker would always start with the
+        // AppConfig::default() value from `with_docker_rx`, ignoring the
+        // user's TOML choice.
+        app.hud_visible = config.hud_visible;
         app.config = config;
         app
     }
@@ -361,6 +380,11 @@ impl App {
                 let (name, palette) = self.next_palette();
                 self.palette = palette;
                 self.palette_name = name;
+            }
+            Effect::ToggleLegend => {
+                // THEME-05: flip HUD visibility. Pure meta-state — does
+                // not touch the camera, world, or selection.
+                self.hud_visible = !self.hud_visible;
             }
             Effect::None => {}
         }
@@ -1679,5 +1703,35 @@ mod tests {
         // for the bug this rewrite prevents):
         let (n1, _) = app.next_palette();
         assert_eq!(n1, "cyberpunk-neon");
+    }
+
+    // ---- THEME-05 (05-05) legend HUD visibility -----------------------------
+
+    /// `Effect::ToggleLegend` flips the App.hud_visible bit. Two toggles
+    /// return to the starting state — pin both the flip and idempotence-
+    /// under-pairs invariants.
+    #[test]
+    fn toggle_legend_flips_hud_visible() {
+        let mut app = App::new();
+        // App::new defaults hud_visible from AppConfig::default() = true.
+        assert!(app.hud_visible, "default hud_visible must be true");
+        app.update(Action::ToggleLegend);
+        assert!(!app.hud_visible, "first toggle must hide the HUD");
+        app.update(Action::ToggleLegend);
+        assert!(app.hud_visible, "second toggle must restore the HUD");
+    }
+
+    /// Toggling the legend is meta-state — it must NOT flip autopilot off,
+    /// the same rule that palette cycling follows. Pins behaviour through
+    /// the App dispatch path.
+    #[test]
+    fn toggle_legend_does_not_flip_autopilot() {
+        let mut app = App::new();
+        assert!(app.camera.autopilot_active);
+        app.update(Action::ToggleLegend);
+        assert!(
+            app.camera.autopilot_active,
+            "ToggleLegend through App::update must NOT disturb autopilot"
+        );
     }
 }

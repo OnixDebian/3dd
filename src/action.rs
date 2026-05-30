@@ -35,6 +35,7 @@
 //! | Esc (when detail_open)              | CloseDetail (close popup)       |
 //! | Esc (no popup) / 'q' / Ctrl-C       | Quit                            |
 //! | 'p' / 'P'                           | CyclePalette                    |
+//! | 'l' / 'L'                           | ToggleLegend                    |
 //!
 //! Pitfall D: `'a'` and `Left` (and the other WASD/arrow pairs) coexist so
 //! AZERTY/Dvorak users still get layout-independent input via arrows.
@@ -74,6 +75,8 @@ pub enum Action {
     CloseDetail,
     /// Cycle the active palette to the next preset (P key). THEME-04.
     CyclePalette,
+    /// Toggle the legend HUD overlay on/off (L key). THEME-05.
+    ToggleLegend,
 }
 
 /// Effects an [`Action`] produces that the dispatch surface cannot itself
@@ -96,6 +99,10 @@ pub enum Effect {
     /// owned by the caller (App / run_kitty) — kept out of `apply_input_action`
     /// so the dispatch surface stays pure (no Palette dep). THEME-04.
     CyclePalette,
+    /// Caller flips its `hud_visible` field — the legend HUD overlay
+    /// toggles on/off. Like `CyclePalette`, this is meta-state, not scene
+    /// state — does NOT flip autopilot. THEME-05.
+    ToggleLegend,
 }
 
 impl Action {
@@ -129,6 +136,7 @@ impl Action {
             KeyCode::BackTab => Action::SelectPrev,
             KeyCode::Enter => Action::OpenDetail,
             KeyCode::Char('p') | KeyCode::Char('P') => Action::CyclePalette,
+            KeyCode::Char('l') | KeyCode::Char('L') => Action::ToggleLegend,
             _ => Action::None,
         }
     }
@@ -159,10 +167,12 @@ impl Action {
 ///   tapped both keys in the same frame. Clamps inside `Camera::nudge_*`
 ///   handle large summed deltas safely (radius/pitch hard-clamp; yaw wraps).
 ///
-/// - `CyclePalette`, `SelectNext`, `SelectPrev`, `OpenDetail`, `CloseDetail`,
-///   `Quit`: kept at most ONCE in the output. These are discrete state-
-///   change intents — pressing P 30 times in a single drain pass clearly
-///   means "cycle the palette once", not "cycle 30 times".
+/// - `CyclePalette`, `ToggleLegend`, `SelectNext`, `SelectPrev`,
+///   `OpenDetail`, `CloseDetail`, `Quit`: kept at most ONCE in the output.
+///   These are discrete state-change intents — pressing P 30 times in a
+///   single drain pass clearly means "cycle the palette once", not "cycle
+///   30 times". Same logic applies to holding L: one toggle per drain,
+///   never N toggles that net to the wrong parity.
 ///
 /// - `Action::None` is dropped (carries no intent).
 ///
@@ -226,7 +236,8 @@ pub fn coalesce_actions(actions: &[Action]) -> Vec<Action> {
             | Action::SelectPrev
             | Action::OpenDetail
             | Action::CloseDetail
-            | Action::CyclePalette => {
+            | Action::CyclePalette
+            | Action::ToggleLegend => {
                 if seen_discrete.insert(discriminant(&a)) {
                     out.push(a);
                 }
@@ -310,6 +321,11 @@ pub fn apply_input_action(
             // "user is driving the camera". Do NOT flip autopilot off, unlike
             // SelectNext/Nudge*. Theme is meta-state, not scene state.
             Effect::CyclePalette
+        }
+        Action::ToggleLegend => {
+            // Same rule as CyclePalette: HUD toggle is meta-state, does NOT
+            // flip autopilot. THEME-05.
+            Effect::ToggleLegend
         }
     }
 }
@@ -785,5 +801,70 @@ mod tests {
     fn coalesce_collapses_quit_repeats() {
         let backlog = vec![Action::Quit, Action::Quit, Action::Quit];
         assert_eq!(coalesce_actions(&backlog), vec![Action::Quit]);
+    }
+
+    // ---- THEME-05 (05-05) ToggleLegend key + dispatch -----------------------
+
+    /// 'l' and 'L' both map to Action::ToggleLegend (shift-forgiveness,
+    /// matches the 'p'/'P' CyclePalette pattern).
+    #[test]
+    fn l_key_maps_to_toggle_legend() {
+        assert_eq!(
+            Action::from_key(key_press(KeyCode::Char('l'))),
+            Action::ToggleLegend
+        );
+        assert_eq!(
+            Action::from_key(key_press(KeyCode::Char('L'))),
+            Action::ToggleLegend
+        );
+    }
+
+    /// ToggleLegend dispatches to Effect::ToggleLegend — the caller
+    /// (App / run_kitty) owns the actual `hud_visible` flip.
+    #[test]
+    fn apply_toggle_legend_returns_effect_toggle_legend() {
+        let mut cam = Camera::new();
+        let mut sel = Selection::new();
+        let world = World {
+            entities: vec![],
+            bounds: SceneBounds::from_entities(&[]),
+        };
+        let live = LiveWorld::new();
+        let effect =
+            apply_input_action(Action::ToggleLegend, &mut cam, &mut sel, &world, &live);
+        assert_eq!(effect, Effect::ToggleLegend);
+    }
+
+    /// HUD toggle is meta-state, NOT scene state — it must NOT flip the
+    /// camera out of autopilot mode. Mirrors the CyclePalette pin.
+    #[test]
+    fn apply_toggle_legend_does_not_flip_autopilot() {
+        let mut cam = Camera::new();
+        let mut sel = Selection::new();
+        let world = World {
+            entities: vec![],
+            bounds: SceneBounds::from_entities(&[]),
+        };
+        let live = LiveWorld::new();
+        assert!(cam.autopilot_active);
+        let _ = apply_input_action(Action::ToggleLegend, &mut cam, &mut sel, &world, &live);
+        assert!(
+            cam.autopilot_active,
+            "ToggleLegend is meta-state and must NOT disturb autopilot mode"
+        );
+    }
+
+    /// 30 queued ToggleLegend repeats (OS auto-repeat backlog while holding L)
+    /// coalesce to exactly ONE — so a brief hold doesn't toggle the HUD off
+    /// and on N/2 times. Same contract as CyclePalette.
+    #[test]
+    fn coalesce_collapses_n_toggle_legend_into_one() {
+        let backlog: Vec<Action> = std::iter::repeat_n(Action::ToggleLegend, 30).collect();
+        let collapsed = coalesce_actions(&backlog);
+        assert_eq!(
+            collapsed,
+            vec![Action::ToggleLegend],
+            "30 queued L repeats must collapse to exactly one ToggleLegend"
+        );
     }
 }
