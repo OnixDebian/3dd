@@ -1164,6 +1164,17 @@ pub fn run_kitty(
     // so we can clear the image surface exactly when transitioning empty ->
     // non-empty (and vice versa) without flickering on every banner-only loop.
     let mut last_was_empty = true;
+    // Empty-banner debounce state (05-04-RV2 — mirrors the braille App fields).
+    // `non_empty_seen_once` is sticky after the first non-empty world; until
+    // then the banner shows immediately (first-launch UX preserved).
+    // `empty_streak_frames` counts consecutive renders the world has been
+    // empty AFTER having been non-empty — only once it crosses the debounce
+    // threshold do we actually re-show the banner. The threshold is in FRAME
+    // units here (~30 FPS) to match the kitty backend's render-driven cadence;
+    // 6 frames ≈ 200 ms of stable emptiness.
+    let mut non_empty_seen_once = false;
+    let mut empty_streak_frames: u32 = 0;
+    const KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES: u32 = 6;
     // 04-04 label state: the (col, row, len) of the LAST cell-grid label the
     // kitty path drew, so we can erase it with spaces BEFORE writing the new
     // one. Avoids stale-label streaks when the selection moves or the box
@@ -1326,10 +1337,38 @@ pub fn run_kitty(
             // framerate-independent path the breathing pass uses (04-03).
             selection.tick(dt);
 
-            if world.entities.is_empty() {
-                // Empty state: skip the image, write a centered banner. The
-                // image surface is cleared once on the empty->non-empty edge
-                // so a stale frame doesn't linger underneath.
+            // Empty-banner debounce bookkeeping (05-04-RV2). Update the
+            // streak BEFORE deciding whether to paint banner-vs-image so the
+            // first non-empty world after launch immediately drops the
+            // debounce window for any future transient empties.
+            let world_empty_now = world.entities.is_empty();
+            if world_empty_now {
+                empty_streak_frames = empty_streak_frames.saturating_add(1);
+            } else {
+                non_empty_seen_once = true;
+                empty_streak_frames = 0;
+            }
+            let show_banner =
+                world_empty_now
+                    && (!non_empty_seen_once
+                        || empty_streak_frames >= KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES);
+
+            if world_empty_now && !show_banner {
+                // MID-DEBOUNCE EMPTY: the world just emptied but we haven't
+                // crossed the stability threshold yet — keep the previous
+                // image mounted (kitty image protocol persists the last
+                // emitted image until we delete_all). DO NOT call delete_all
+                // here; DO NOT paint a banner. Only update the status bar
+                // (still done below). This is the no-flicker path: a brief
+                // docker rm/run churn shows the old 3D scene retained for
+                // ~200 ms instead of flashing the banner.
+                //
+                // Status-bar `boxes` still reads 0 — the user sees the
+                // ground truth in the HUD; only the SCENE chrome is held
+                // steady.
+            } else if world_empty_now {
+                // Stable empty (debounce satisfied OR first launch never
+                // had containers) — same banner path as before.
                 if !last_was_empty {
                     delete_all(&mut stdout)?;
                     last_was_empty = true;

@@ -45,9 +45,27 @@ pub fn view(frame: &mut Frame, app: &mut App) {
     let palette = app.palette;
 
     if app.world.entities.is_empty() {
-        // Zero containers: render a centered banner instead of an empty scene.
-        // The status bar still draws below so fps/size/help stay visible.
-        render_empty_banner(frame, scene_area, &palette);
+        // Zero containers right now. The DEBOUNCED decision lives on App:
+        // `should_show_empty_banner` returns true only after the world has
+        // been stably empty for ~200 ms (or at first launch when no
+        // container has ever been observed). During the debounce window we
+        // keep painting the last 3D scene chrome — visually a retained
+        // frame, NOT a banner flash. This kills the user-reported flicker
+        // during `docker rm -f` + `docker run` churn while preserving the
+        // Phase 3 criterion #5 banner for a truly-empty daemon.
+        if app.should_show_empty_banner() {
+            render_empty_banner(frame, scene_area, &palette);
+        } else {
+            // Mid-debounce empty: paint the bordered "scene" block without
+            // content so the chrome stays consistent (no jump between
+            // banner and 3D scene chrome). The scene's previous content is
+            // already cleared by ratatui between frames — we just don't
+            // paint anything inside the block.
+            let block = ratatui::widgets::Block::default()
+                .title("scene")
+                .borders(ratatui::widgets::Borders::ALL);
+            frame.render_widget(block, scene_area);
+        }
     } else {
         // The orbiting World of boxes renders into the braille Canvas in the
         // scene area. Palette is the single color source; the camera (framed

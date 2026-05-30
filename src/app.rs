@@ -25,6 +25,21 @@ use color_eyre::Result;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use crate::action::{apply_input_action, coalesce_actions, Action, Effect};
+/// How many consecutive logic ticks the World must stay empty AFTER having
+/// previously been non-empty before the empty-state banner re-appears. At
+/// `crate::tui::TICK_HZ = 60` this is ~200 ms of stable emptiness.
+///
+/// User feedback after 05-04: rapid `docker rm -f` + `docker run` flashed
+/// the "No containers running" banner during the gap between Removed and
+/// Added — visually a 3D-scene-then-banner-then-3D-scene flicker. Holding
+/// the banner off until emptiness sustains 200 ms suppresses that without
+/// hiding a legitimate empty state (300 ms of stable empty still shows the
+/// banner — the user just sees a brief retained-frame instead of a flash).
+///
+/// First-launch (banner-while-waiting-for-the-first-container) is preserved
+/// via the `non_empty_seen_once` sticky bit — the debounce only kicks in
+/// after the first container has been observed.
+pub(crate) const EMPTY_BANNER_DEBOUNCE_TICKS: u32 = 12;
 use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::docker::Docker;
@@ -84,6 +99,20 @@ pub struct App {
     /// (auto_degrade, degraded_fps_cap, force_mode, hud_visible) that
     /// 05-05 / 05-06 read from.
     pub config: crate::config::AppConfig,
+    /// True once we've observed at least one non-empty World since launch.
+    /// Sticky: never flips back to `false` after the first container appears.
+    /// Used by the empty-banner debounce: at startup (no containers ever
+    /// observed) the banner shows immediately; after the first container has
+    /// appeared, a transient empty state during rapid container churn
+    /// (e.g. `docker rm -f` followed instantly by `docker run`) is suppressed
+    /// for [`EMPTY_BANNER_DEBOUNCE_TICKS`] ticks (~200 ms at TICK_HZ=60), so
+    /// the banner doesn't flash on/off during normal-life daemon activity.
+    pub(crate) non_empty_seen_once: bool,
+    /// Number of consecutive logic ticks the World has been empty. Reset to
+    /// 0 every tick the World is non-empty. Read by `ui::view` (via
+    /// [`Self::should_show_empty_banner`]) to gate the banner on stable
+    /// emptiness rather than instantaneous emptiness.
+    pub(crate) empty_streak_ticks: u32,
     /// Non-blocking receiver for typed DockerMsg events from the producer task
     /// in `docker::streams`. `None` for the test/dump constructor (`App::new`)
     /// so unit tests don't need a producer.
@@ -133,6 +162,12 @@ impl App {
             palette: crate::theme::Palette::notion_soft(),
             palette_name: "notion-soft".to_string(),
             config: crate::config::AppConfig::default(),
+            // App::new seeds a synthetic non-empty world, so mark non-empty
+            // as seen once already — there's no first-launch banner state to
+            // preserve in the test path. The debounce counters are inert
+            // because the world stays non-empty.
+            non_empty_seen_once: true,
+            empty_streak_ticks: 0,
             docker_rx: None,
             docker: None,
             tx_for_inspect: None,
@@ -167,6 +202,13 @@ impl App {
             palette: crate::theme::Palette::notion_soft(),
             palette_name: "notion-soft".to_string(),
             config: crate::config::AppConfig::default(),
+            // Live path: world starts empty. non_empty_seen_once is false
+            // until the first Added lands — the banner shows IMMEDIATELY on
+            // startup (no debounce wait at first launch). After the first
+            // container appears, the sticky flag flips true and the debounce
+            // kicks in for subsequent transient-empty states.
+            non_empty_seen_once: false,
+            empty_streak_ticks: 0,
             docker_rx: Some(rx),
             docker: None,
             tx_for_inspect: None,
@@ -338,6 +380,40 @@ impl App {
         // Brightness-pulse phase advance for the selected box (04-03 CAM-04).
         // Same dt source as dress() so the pulse is framerate-independent.
         self.selection.tick(dt);
+        // Empty-banner debounce counters (05-04-RV2). Tracked at TICK_HZ
+        // (60 Hz, framerate-independent) rather than at render rate so the
+        // debounce is consistent across slow / degraded frames. When the
+        // world is non-empty, mark "ever seen" and reset the streak; when
+        // empty, increment the streak (saturating). `ui::view` consults
+        // `should_show_empty_banner()` to decide whether to actually paint
+        // the banner — see that method's doc comment.
+        if self.world.entities.is_empty() {
+            self.empty_streak_ticks = self.empty_streak_ticks.saturating_add(1);
+        } else {
+            self.non_empty_seen_once = true;
+            self.empty_streak_ticks = 0;
+        }
+    }
+
+    /// Whether the empty-state banner should actually be drawn this frame.
+    ///
+    /// Returns `true` when EITHER:
+    /// 1. We have never observed a non-empty world (first launch, no
+    ///    containers ever) — `!non_empty_seen_once`. This preserves Phase 3
+    ///    criterion #5 (banner shows on a daemon with zero containers).
+    /// 2. The world has been STABLY empty for at least
+    ///    [`EMPTY_BANNER_DEBOUNCE_TICKS`] ticks (~200 ms). This suppresses
+    ///    transient flicker during rapid container churn (`docker rm -f`
+    ///    immediately followed by `docker run`).
+    ///
+    /// Returns `false` during the debounce window: the renderer continues
+    /// to display the (now-empty) last 3D scene — visually a retained
+    /// frame instead of a banner flash.
+    ///
+    /// Called only when `world.entities.is_empty()` is already true at the
+    /// view site; this method does NOT itself check that condition.
+    pub(crate) fn should_show_empty_banner(&self) -> bool {
+        !self.non_empty_seen_once || self.empty_streak_ticks >= EMPTY_BANNER_DEBOUNCE_TICKS
     }
 
     /// Drain everything currently queued on the Docker channel (non-blocking)
@@ -860,6 +936,135 @@ mod tests {
 
         assert_eq!(app.palette, crate::theme::Palette::cyberpunk_neon());
         assert_eq!(app.palette_name, "cyberpunk-neon");
+    }
+
+    // ---- 05-04-RV2: empty-banner debounce -----------------------------------
+
+    /// At startup (no container has ever been observed), the banner shows
+    /// IMMEDIATELY — no debounce wait. This preserves Phase 3 criterion #5
+    /// (a daemon with zero containers must show the banner) and the
+    /// "first-launch responsive" UX.
+    #[test]
+    fn empty_banner_shows_immediately_on_first_launch() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let app = App::with_docker_rx(rx);
+        // World is empty (no Added applied yet) AND non_empty_seen_once is
+        // false — the banner must show on this very first frame.
+        assert!(app.world.entities.is_empty());
+        assert!(!app.non_empty_seen_once);
+        assert!(
+            app.should_show_empty_banner(),
+            "first-launch empty must show the banner immediately"
+        );
+    }
+
+    /// After a container has appeared and then disappeared, the banner is
+    /// SUPPRESSED for the debounce window even though the world is empty
+    /// right now. The renderer keeps painting the last 3D scene chrome —
+    /// no flash.
+    #[test]
+    fn empty_banner_debounces_after_container_churn() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        // Container appears — flips non_empty_seen_once on the next tick.
+        tx.send(DockerMsg::Added(snap("only"))).unwrap();
+        app.drain_docker();
+        assert_eq!(app.world.entities.len(), 1);
+        app.on_tick(0.016);
+        assert!(app.non_empty_seen_once);
+        assert_eq!(app.empty_streak_ticks, 0);
+
+        // Container disappears — world is empty but streak counter is fresh.
+        tx.send(DockerMsg::Removed("only".to_string())).unwrap();
+        app.drain_docker();
+        assert!(app.world.entities.is_empty());
+
+        // First tick of empty: streak == 1 (< DEBOUNCE_TICKS=12). Banner
+        // SHOULD STAY HIDDEN — the visible behavior is "retained 3D scene
+        // chrome", not a banner flash.
+        app.on_tick(0.016);
+        assert_eq!(app.empty_streak_ticks, 1);
+        assert!(
+            !app.should_show_empty_banner(),
+            "first tick of post-churn empty must NOT show banner (debounce)"
+        );
+    }
+
+    /// After the debounce window elapses (12+ consecutive empty ticks), the
+    /// banner returns. A genuinely-empty daemon still gets its banner — just
+    /// after a brief retained-frame window.
+    #[test]
+    fn empty_banner_returns_after_debounce_window_elapses() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        tx.send(DockerMsg::Added(snap("only"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        tx.send(DockerMsg::Removed("only".to_string())).unwrap();
+        app.drain_docker();
+
+        // Tick the empty world EMPTY_BANNER_DEBOUNCE_TICKS times.
+        for _ in 0..EMPTY_BANNER_DEBOUNCE_TICKS {
+            app.on_tick(0.016);
+        }
+        assert_eq!(app.empty_streak_ticks, EMPTY_BANNER_DEBOUNCE_TICKS);
+        assert!(
+            app.should_show_empty_banner(),
+            "banner must return after the debounce window of stable emptiness"
+        );
+    }
+
+    /// A non-empty tick BETWEEN two empty episodes resets the streak — the
+    /// debounce window starts fresh on each transient. This is the realistic
+    /// `docker rm -f` then `docker run` pattern: never enough sustained
+    /// emptiness to trip the banner.
+    #[test]
+    fn empty_banner_streak_resets_on_non_empty_tick() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        tx.send(DockerMsg::Added(snap("only"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        // Empty for a few ticks but under threshold.
+        tx.send(DockerMsg::Removed("only".to_string())).unwrap();
+        app.drain_docker();
+        for _ in 0..5 {
+            app.on_tick(0.016);
+        }
+        assert_eq!(app.empty_streak_ticks, 5);
+        // New container arrives — streak resets, banner stays hidden.
+        tx.send(DockerMsg::Added(snap("two"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert_eq!(app.empty_streak_ticks, 0);
+        assert!(
+            !app.should_show_empty_banner(),
+            "non-empty tick must reset the empty streak"
+        );
+    }
+
+    /// `non_empty_seen_once` is sticky — it never flips back to false even
+    /// after the world empties. The flag's job is to distinguish first-launch
+    /// (no containers EVER) from post-launch transient empties.
+    #[test]
+    fn non_empty_seen_once_is_sticky_after_first_container() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        assert!(!app.non_empty_seen_once);
+        tx.send(DockerMsg::Added(snap("a"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert!(app.non_empty_seen_once);
+        tx.send(DockerMsg::Removed("a".to_string())).unwrap();
+        app.drain_docker();
+        // Many empty ticks must NOT flip the sticky flag.
+        for _ in 0..100 {
+            app.on_tick(0.016);
+        }
+        assert!(
+            app.non_empty_seen_once,
+            "non_empty_seen_once must stay sticky across empty ticks"
+        );
     }
 
     /// Unknown palette names in config fall back to notion-soft AND rewrite
