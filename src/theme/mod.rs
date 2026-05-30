@@ -144,15 +144,32 @@ impl Palette {
         }
     }
 
+    /// Derive a Palette from the current Omarchy theme bundle's
+    /// `alacritty.toml` at `~/.config/omarchy/current/theme/`. Returns `None`
+    /// if the file is missing or unparseable — the caller falls back to a
+    /// preset (typically [`Palette::notion_soft`]).
+    ///
+    /// THEME-03 entry point. Mapping rules: see [`omarchy::map_to_palette`].
+    pub fn from_omarchy() -> Option<Self> {
+        omarchy::load_omarchy_palette(None)
+    }
+
     /// Resolve a palette by name. Unknown names return `None` — the caller
     /// decides whether to log, error, or silently default. Accepts both the
     /// human-friendly kebab form (`"cyberpunk-neon"`) and the snake form
     /// (`"cyberpunk_neon"`) to be forgiving with TOML.
+    ///
+    /// The special name `"omarchy"` (THEME-03) dispatches to
+    /// [`Palette::from_omarchy`] and inherits its fallback semantics: if the
+    /// host has no omarchy theme installed (or the file is unparseable),
+    /// `by_name("omarchy")` returns `None` — pair with
+    /// [`Palette::by_name_or_default`] to fall back to notion-soft.
     pub fn by_name(name: &str) -> Option<Self> {
         match name.replace('_', "-").as_str() {
             "notion-soft" => Some(Self::notion_soft()),
             "cyberpunk-neon" => Some(Self::cyberpunk_neon()),
             "terminal-green" => Some(Self::terminal_green()),
+            "omarchy" => Self::from_omarchy(),
             _ => None,
         }
     }
@@ -385,6 +402,21 @@ mod tests {
             Palette::by_name("notion_soft"),
             Palette::by_name("notion-soft")
         );
+    }
+
+    /// THEME-03: `by_name("omarchy")` dispatches to `from_omarchy()`, so the
+    /// result is `Some(palette)` iff the host has an installed omarchy theme
+    /// (the case on the dev host) and `None` otherwise. Either way, the
+    /// `_or_default` flavor must produce a usable palette without panicking.
+    #[test]
+    fn by_name_omarchy_dispatches_to_from_omarchy() {
+        // Pair: by_name and from_omarchy must agree on Some-ness.
+        assert_eq!(Palette::by_name("omarchy"), Palette::from_omarchy());
+        // by_name_or_default must always return a real palette — when
+        // from_omarchy is None the fallback is notion_soft.
+        let actual = Palette::by_name_or_default("omarchy");
+        let expected = Palette::from_omarchy().unwrap_or_else(Palette::notion_soft);
+        assert_eq!(actual, expected);
     }
 
     /// `by_name_or_default` never returns `None`: unknown names fall back to
