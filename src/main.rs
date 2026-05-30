@@ -74,6 +74,26 @@ async fn main() -> Result<()> {
         return kitty::dump_snapshot(path, 720, 560);
     }
 
+    // THEME-06 v1: load runtime config (palette name, hud_visible, auto_degrade,
+    // force_mode, degraded_fps_cap) from ~/.config/3dd/config.toml or the
+    // --config <PATH> override. Same Pitfall 9 contract as the docker probe
+    // below: a malformed-TOML / unreadable-config error MUST land on a CLEAN
+    // terminal (no alt-screen yet, no raw mode yet) — eprintln + exit(1).
+    //
+    // 05-04 wires `config` into App::with_docker and run_kitty so the chosen
+    // palette / HUD state / degrade policy actually drives rendering. THIS
+    // plan (05-01) only validates the load: the binding is intentionally
+    // discarded so the loader runs at startup but no downstream consumer
+    // exists yet. The `let _ = config;` below is removed in 05-04.
+    let config = match config::load_or_default_with_cli(&args) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("config error: {e}");
+            std::process::exit(1);
+        }
+    };
+    let _ = config; // 05-04 removes this stub when App / run_kitty consume the config.
+
     // ROB-01 / PITFALLS Pitfall 9: probe the Docker daemon BEFORE entering raw
     // mode (Tui::enter for braille, enable_raw_mode inside run_kitty for kitty).
     // On failure we print the actionable ProbeError to a CLEAN terminal and
