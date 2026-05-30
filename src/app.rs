@@ -27,37 +27,56 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::action::{apply_input_action, coalesce_actions, Action, Effect};
 /// How many consecutive logic ticks the World must stay empty AFTER having
 /// previously been non-empty before the empty-state banner re-appears. At
-/// `crate::tui::TICK_HZ = 60` this is ~1000 ms of stable emptiness.
+/// `crate::tui::TICK_HZ = 60` this is ~5000 ms of stable emptiness — the
+/// 05-04-RV5 bump from RV4's 1000 ms.
 ///
-/// User feedback after 05-04-RV2 (the initial 200 ms / 12 ticks debounce):
-/// banner STILL flickered during normal use. Two compounding problems
-/// surfaced on the re-verify:
+/// User feedback after RV4 (1000 ms / 60 ticks debounce + cached world):
+/// banner STILL flickered ~100 ms occasionally on launch. Root cause
+/// diagnosed as the COLD-START race, not the RV4 debounce window:
 ///
-/// 1. **200 ms was too short** for real-daemon churn. A `docker rm -f`
-///    followed by `docker run` on a single-container scene routinely
-///    crosses the 200 ms window because the new container's `start` event
-///    takes ~250-400 ms to propagate through bollard. The user observable
-///    was repeated banner flashes, not just one rare flicker.
+/// 1. At process launch, `non_empty_seen_once == false` and the cache is
+///    `None` — both `should_show_empty_banner()` and `effective_world` fell
+///    through to the immediate banner branch.
+/// 2. bollard's `list_containers` seed pass routinely returns at
+///    t~80-150 ms; before that, NO `Added` message has drained. The first
+///    1-3 render frames (~33-100 ms at 30 FPS) painted the banner, then it
+///    vanished the moment containers populated — a textbook ~100 ms flash.
 ///
-/// 2. **The mid-debounce render emitted an EMPTY BORDERED BLOCK** (no
-///    Canvas, no 3D content) — visually identical to "blank scene" from
-///    the user's eye. RV2's "retained 3D scene chrome" promise was only
-///    partially delivered: the chrome (border + title) stayed, but the
-///    INSIDE went blank during the window. The user still sees a flash.
+/// RV5 closes the cold-start race AND tightens the invariant the user
+/// asked for ("if cache is populated, keep it for at least 5 seconds"):
 ///
-/// RV4 closes both: bump the window to 1000 ms AND cache the most recent
-/// non-empty world in [`App::last_non_empty_world`]. During the debounce
-/// window the view renders the CACHED world (frozen at the moment of
-/// emptying) so the scene chrome stays intact — boxes hold position for
-/// 1 second while the daemon settles; if emptiness sustains beyond the
-/// window the banner kicks in. Trade-off: 1 second of "ghost boxes" on a
-/// genuinely-empty post-churn daemon is far less jarring than a banner
-/// flash — and the boxes drop the moment the world stabilizes.
+/// - [`STARTUP_GRACE_TICKS`] (~1 s) suppresses the banner unconditionally
+///   for the first second after launch. The renderer paints the same
+///   neutral bordered "scene" chrome the RV4 fallback already used for
+///   the cache-None + debounce-active path — no banner text, no scene
+///   content, just borders. After the grace expires, either the daemon
+///   has spoken (non_empty_seen_once flipped → cache renders) or the
+///   daemon truly has zero containers (banner shows, Phase 3 criterion
+///   #5 preserved with a 1 s delay — acceptable trade for eliminating
+///   the flash).
 ///
-/// First-launch (banner-while-waiting-for-the-first-container) is preserved
-/// via the `non_empty_seen_once` sticky bit — the debounce only kicks in
-/// after the first container has been observed.
-pub(crate) const EMPTY_BANNER_DEBOUNCE_TICKS: u32 = 60;
+/// - The debounce window grows from 60 → 300 ticks (5 s). Combined with
+///   the invariant "cache always renders during the window", this means
+///   that during normal operation post-first-container the banner is
+///   effectively unreachable: every transient empty (`docker rm -f` +
+///   `docker run`, container restart-policy bounces, mid-session daemon
+///   hiccups) is well under 5 s, so the cached scene holds and the user
+///   never sees the banner unless they intentionally stop everything
+///   and wait.
+pub(crate) const EMPTY_BANNER_DEBOUNCE_TICKS: u32 = 300;
+
+/// How many consecutive logic ticks after launch during which the empty-
+/// state banner is unconditionally suppressed, regardless of
+/// `non_empty_seen_once`. At `crate::tui::TICK_HZ = 60` this is ~1000 ms.
+///
+/// Rationale: bollard's startup `list_containers` seed routinely lands at
+/// t~80-150 ms on a busy daemon. Before that, the App's `non_empty_seen_once`
+/// bit is `false` and the banner would paint for the first 1-3 render
+/// frames (~33-100 ms). The 1 s grace covers the seed roundtrip with
+/// generous headroom on slow daemons. After the grace, if the daemon
+/// truly has zero containers the banner finally shows (criterion #5
+/// preserved with a small delay).
+pub(crate) const STARTUP_GRACE_TICKS: u32 = 60;
 use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::docker::Docker;
@@ -446,25 +465,41 @@ impl App {
 
     /// Whether the empty-state banner should actually be drawn this frame.
     ///
-    /// Returns `true` when EITHER:
-    /// 1. We have never observed a non-empty world (first launch, no
-    ///    containers ever) — `!non_empty_seen_once`. This preserves Phase 3
-    ///    criterion #5 (banner shows on a daemon with zero containers).
-    /// 2. The world has been STABLY empty for at least
-    ///    [`EMPTY_BANNER_DEBOUNCE_TICKS`] ticks (~1000 ms — RV4 bump from
-    ///    RV2's 200 ms). This suppresses transient flicker during rapid
-    ///    container churn (`docker rm -f` immediately followed by
-    ///    `docker run`, which routinely crosses the 200 ms window because
-    ///    bollard's `start` event propagation takes ~250-400 ms).
+    /// Three gates, evaluated in order:
     ///
-    /// Returns `false` during the debounce window: the renderer continues
-    /// to display the LAST NON-EMPTY world (via
-    /// [`Self::effective_world_for_view`]) — visually a frozen frame of
-    /// the previous scene, NOT a blank/banner flash.
+    /// 1. **Cold-start grace** ([`STARTUP_GRACE_TICKS`], ~1 s at TICK_HZ=60):
+    ///    while `tick_count < STARTUP_GRACE_TICKS` the banner is
+    ///    unconditionally suppressed. Eliminates the ~100 ms flash the
+    ///    user reported when launching `dd3` against a busy daemon
+    ///    (bollard's `list_containers` seed lands at t~80-150 ms; the
+    ///    first 1-3 render frames would otherwise paint the banner before
+    ///    any Added arrives). 05-04-RV5 root-cause fix. The view renders
+    ///    a neutral bordered "scene" chrome (no banner text, no content)
+    ///    during this window — same chrome shape the live render uses, so
+    ///    the transition to populated state is visually seamless.
+    ///
+    /// 2. **First-launch true empty** (post-grace, `!non_empty_seen_once`):
+    ///    after the grace expires AND we have never observed a non-empty
+    ///    world, the banner shows. This preserves Phase 3 criterion #5
+    ///    (a daemon with zero containers must show the banner) with a
+    ///    ~1 s delay — acceptable trade for eliminating the flash.
+    ///
+    /// 3. **Sustained empty** ([`EMPTY_BANNER_DEBOUNCE_TICKS`], ~5 s at
+    ///    TICK_HZ=60): after we have seen at least one container, the
+    ///    banner only re-appears if the world stays empty for 5 s
+    ///    straight. RV5 bump from RV4's 1 s. Combined with the cached-
+    ///    world render path in [`ui::view`], this realizes the user's
+    ///    "keep cache for at least 5 seconds" invariant: every realistic
+    ///    transient empty (container restart, `docker rm -f` + `docker run`,
+    ///    mid-session daemon hiccup) is well under 5 s, so the cached
+    ///    scene holds and the banner stays hidden during normal use.
     ///
     /// Called only when `world.entities.is_empty()` is already true at the
     /// view site; this method does NOT itself check that condition.
     pub(crate) fn should_show_empty_banner(&self) -> bool {
+        if self.tick_count < STARTUP_GRACE_TICKS as u64 {
+            return false;
+        }
         !self.non_empty_seen_once || self.empty_streak_ticks >= EMPTY_BANNER_DEBOUNCE_TICKS
     }
 
@@ -997,21 +1032,43 @@ mod tests {
 
     // ---- 05-04-RV2: empty-banner debounce -----------------------------------
 
-    /// At startup (no container has ever been observed), the banner shows
-    /// IMMEDIATELY — no debounce wait. This preserves Phase 3 criterion #5
-    /// (a daemon with zero containers must show the banner) and the
-    /// "first-launch responsive" UX.
+    /// 05-04-RV5: at startup (no container has ever been observed AND the
+    /// cold-start grace has not yet expired), the banner is SUPPRESSED. The
+    /// renderer paints a neutral bordered "scene" block instead so the
+    /// ~80-150 ms bollard `list_containers` seed roundtrip can complete
+    /// without flashing the banner text on screen.
+    ///
+    /// After [`STARTUP_GRACE_TICKS`] ticks (~1 s at TICK_HZ=60) the gate
+    /// lifts: if `non_empty_seen_once` is still false the banner finally
+    /// shows (Phase 3 criterion #5 — a daemon with zero containers gets
+    /// its banner, just delayed by ~1 s).
     #[test]
-    fn empty_banner_shows_immediately_on_first_launch() {
+    fn empty_banner_suppressed_during_startup_grace_then_shows() {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
-        let app = App::with_docker_rx(rx);
-        // World is empty (no Added applied yet) AND non_empty_seen_once is
-        // false — the banner must show on this very first frame.
+        let mut app = App::with_docker_rx(rx);
+        // First frame after launch — world empty, never seen a container,
+        // tick_count == 0. The grace gate must SUPPRESS the banner.
         assert!(app.world.entities.is_empty());
         assert!(!app.non_empty_seen_once);
+        assert_eq!(app.tick_count, 0);
+        assert!(
+            !app.should_show_empty_banner(),
+            "RV5 cold-start grace must suppress the banner for the first \
+             STARTUP_GRACE_TICKS — this is the fix for the ~100 ms flash \
+             the user reported on dd3 launch"
+        );
+
+        // Tick all the way to the grace boundary; banner still suppressed
+        // on the LAST tick of the grace window (`tick_count < GRACE`).
+        for _ in 0..STARTUP_GRACE_TICKS {
+            app.on_tick(0.016);
+        }
+        // tick_count is now exactly STARTUP_GRACE_TICKS — the gate opens.
+        assert_eq!(app.tick_count, STARTUP_GRACE_TICKS as u64);
         assert!(
             app.should_show_empty_banner(),
-            "first-launch empty must show the banner immediately"
+            "after the grace expires AND we have never seen a container, \
+             the banner must finally show (Phase 3 criterion #5)"
         );
     }
 
@@ -1036,9 +1093,9 @@ mod tests {
         app.drain_docker();
         assert!(app.world.entities.is_empty());
 
-        // First tick of empty: streak == 1 (< DEBOUNCE_TICKS=12). Banner
-        // SHOULD STAY HIDDEN — the visible behavior is "retained 3D scene
-        // chrome", not a banner flash.
+        // First tick of empty: streak == 1 (RV5: < DEBOUNCE_TICKS=300).
+        // Banner SHOULD STAY HIDDEN — the visible behavior is "retained
+        // 3D scene chrome", not a banner flash.
         app.on_tick(0.016);
         assert_eq!(app.empty_streak_ticks, 1);
         assert!(
@@ -1047,9 +1104,10 @@ mod tests {
         );
     }
 
-    /// After the debounce window elapses (12+ consecutive empty ticks), the
-    /// banner returns. A genuinely-empty daemon still gets its banner — just
-    /// after a brief retained-frame window.
+    /// After the debounce window elapses (RV5: 300 consecutive empty ticks
+    /// = ~5 s at TICK_HZ=60), the banner returns. A genuinely-empty
+    /// daemon still gets its banner — just after a longer retained-frame
+    /// window than RV4's 1 s.
     #[test]
     fn empty_banner_returns_after_debounce_window_elapses() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
@@ -1075,14 +1133,25 @@ mod tests {
     /// debounce window starts fresh on each transient. This is the realistic
     /// `docker rm -f` then `docker run` pattern: never enough sustained
     /// emptiness to trip the banner.
+    ///
+    /// RV5: warm up past the cold-start grace first so the assertion isn't
+    /// trivially satisfied by the grace gate; we want to validate the
+    /// streak-reset semantics on their own.
     #[test]
     fn empty_banner_streak_resets_on_non_empty_tick() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
         let mut app = App::with_docker_rx(rx);
         tx.send(DockerMsg::Added(snap("only"))).unwrap();
         app.drain_docker();
-        app.on_tick(0.016);
-        // Empty for a few ticks but under threshold.
+        // Warm past the cold-start grace so the gate doesn't shadow this
+        // assertion. The world is non-empty here so the streak stays at 0
+        // throughout.
+        for _ in 0..STARTUP_GRACE_TICKS {
+            app.on_tick(0.016);
+        }
+        assert!(app.tick_count >= STARTUP_GRACE_TICKS as u64);
+        // Empty for a few ticks but under the (RV5: 300-tick) debounce
+        // threshold.
         tx.send(DockerMsg::Removed("only".to_string())).unwrap();
         app.drain_docker();
         for _ in 0..5 {
@@ -1215,33 +1284,39 @@ mod tests {
         );
     }
 
-    /// The bumped debounce window (RV4 1000 ms = 60 ticks at 60 Hz) holds
-    /// the banner off through a realistic docker churn gap. A 30-tick
-    /// (~500 ms) empty episode — which the RV2 12-tick (~200 ms) window
-    /// would have given up on — keeps the banner hidden under RV4.
+    /// The bumped debounce window (RV5 5000 ms = 300 ticks at 60 Hz) holds
+    /// the banner off through a much longer churn gap than RV4's 1 s. A
+    /// 200-tick (~3.3 s) empty episode — which RV4's 60-tick (~1 s)
+    /// window would have shown the banner for — keeps the banner hidden
+    /// under RV5. This realizes the user's "cache valid for at least 5
+    /// seconds" invariant.
     #[test]
-    fn rv4_debounce_window_covers_30_tick_empty_episode() {
+    fn rv5_debounce_window_covers_200_tick_empty_episode() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
         let mut app = App::with_docker_rx(rx);
         tx.send(DockerMsg::Added(snap("a"))).unwrap();
         app.drain_docker();
-        app.on_tick(0.016);
-        tx.send(DockerMsg::Removed("a".to_string())).unwrap();
-        app.drain_docker();
-        // 30 empty ticks — well past RV2's 12-tick threshold, well under
-        // RV4's 60-tick threshold.
-        for _ in 0..30 {
+        // Warm past the cold-start grace before exercising the post-empty
+        // debounce: otherwise the grace gate would shadow this assertion.
+        for _ in 0..STARTUP_GRACE_TICKS {
             app.on_tick(0.016);
         }
-        assert_eq!(app.empty_streak_ticks, 30);
+        tx.send(DockerMsg::Removed("a".to_string())).unwrap();
+        app.drain_docker();
+        // 200 empty ticks (~3.3 s at 60 Hz) — well past RV4's 60-tick
+        // threshold, well under RV5's 300-tick threshold.
+        for _ in 0..200 {
+            app.on_tick(0.016);
+        }
+        assert_eq!(app.empty_streak_ticks, 200);
         assert!(
             !app.should_show_empty_banner(),
-            "RV4 window (60 ticks) must keep banner hidden through a 30-tick empty episode"
+            "RV5 window (300 ticks) must keep banner hidden through a 200-tick empty episode"
         );
-        // Verify the threshold constant itself is the RV4 bump.
+        // Verify the threshold constant itself is the RV5 bump.
         assert_eq!(
-            EMPTY_BANNER_DEBOUNCE_TICKS, 60,
-            "RV4 expected EMPTY_BANNER_DEBOUNCE_TICKS bumped to 60 (~1000 ms at 60 Hz)"
+            EMPTY_BANNER_DEBOUNCE_TICKS, 300,
+            "RV5 expected EMPTY_BANNER_DEBOUNCE_TICKS bumped to 300 (~5000 ms at 60 Hz)"
         );
     }
 
@@ -1291,7 +1366,7 @@ mod tests {
             .unwrap();
         };
 
-        log(&mut f, 0, &app, "fresh app, first-launch (no cache, banner ON immediately)");
+        log(&mut f, 0, &app, "fresh app, first-launch (RV5 grace gate SUPPRESSES banner during the first STARTUP_GRACE_TICKS window — no flash)");
         // Add a container; tick once.
         tx.send(DockerMsg::Added(snap("c1"))).unwrap();
         app.drain_docker();
@@ -1311,16 +1386,16 @@ mod tests {
         for i in 6..35 {
             app.on_tick(0.016);
             if i == 17 {
-                log(&mut f, i, &app, "tick ~17: past RV2's 12-tick threshold, RV4 STILL holding banner");
+                log(&mut f, i, &app, "tick ~17: past RV2's 12-tick threshold, RV5 STILL holding banner");
             }
         }
-        log(&mut f, 35, &app, "30 ticks empty — RV4 still holding banner; cache freezes scene");
+        log(&mut f, 35, &app, "30 ticks empty — RV5 still holding banner; cache freezes scene");
         // New container arrives BEFORE debounce expires — banner never shows.
         tx.send(DockerMsg::Added(snap("c2"))).unwrap();
         app.drain_docker();
         app.on_tick(0.016);
         log(&mut f, 36, &app, "new container — streak reset, banner stays hidden, no flash");
-        // Now starve to a real empty: remove + ride out the full 60-tick window.
+        // Now starve to a real empty: remove + ride out the full debounce window.
         tx.send(DockerMsg::Removed("c2".to_string())).unwrap();
         app.drain_docker();
         for _ in 37..=37 + EMPTY_BANNER_DEBOUNCE_TICKS as usize {
@@ -1330,9 +1405,238 @@ mod tests {
             &mut f,
             37 + EMPTY_BANNER_DEBOUNCE_TICKS as usize,
             &app,
-            "60 ticks empty — debounce window elapsed, banner FINALLY shows (stable empty)",
+            "EMPTY_BANNER_DEBOUNCE_TICKS empty — debounce window elapsed, banner FINALLY shows (stable empty)",
         );
         writeln!(f, "\nPASS: banner stayed hidden through transient empties; showed only after stable empty").unwrap();
+    }
+
+    // ---- 05-04-RV5: cold-start grace + invariant tests ----------------------
+
+    /// **Cold-start no-flicker invariant** (the canonical RV5 regression
+    /// pin): from t=0 through any number of ticks where the daemon's
+    /// `list_containers` seed lands at frame N (e.g. N=3, ~100 ms),
+    /// `should_show_empty_banner()` must NEVER return true during the
+    /// `0..N` window — only AFTER the seed lands and the world is empty
+    /// for [`EMPTY_BANNER_DEBOUNCE_TICKS`] would the banner show.
+    ///
+    /// This is the test that pins the user's reported bug: "banner still
+    /// flickers ~100 ms occasionally on launch". Before RV5, this test
+    /// would FAIL at the very first frame because
+    /// `!non_empty_seen_once && tick_count < STARTUP_GRACE_TICKS` paths
+    /// to `true`.
+    #[test]
+    fn rv5_no_banner_during_cold_start_seed_race() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+
+        // SIMULATE a realistic bollard seed race: ticks 0..N pass with no
+        // Docker messages. Then at tick N the seed lands (multiple Added).
+        // For every frame in 0..N the banner MUST stay hidden (this is
+        // exactly the cold-start grace's job).
+        const SEED_LAND_FRAME: u32 = 6; // ~100 ms at 60 Hz — what the user reported
+        for i in 0..SEED_LAND_FRAME {
+            app.on_tick(0.016);
+            assert!(
+                !app.should_show_empty_banner(),
+                "frame {i}: banner must NOT show during cold-start grace \
+                 (user-reported ~100 ms flicker regression pin)"
+            );
+        }
+        // Seed lands.
+        tx.send(DockerMsg::Added(snap("c1"))).unwrap();
+        tx.send(DockerMsg::Added(snap("c2"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert_eq!(app.world.entities.len(), 2);
+        assert!(
+            app.non_empty_seen_once,
+            "seed lands → sticky flag flips on the first non-empty tick"
+        );
+        assert!(
+            !app.should_show_empty_banner(),
+            "post-seed: banner must stay hidden"
+        );
+    }
+
+    /// **Mid-session no-flicker invariant**: a single empty tick between
+    /// two non-empty ticks (the absolute-worst transient: 1-frame
+    /// removal-and-reappearance) MUST NOT show the banner on ANY frame.
+    /// This pins the user's "transient ~100 ms empty episode" pattern.
+    #[test]
+    fn rv5_no_banner_during_single_tick_transient_empty() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+
+        // Warm past cold-start grace with a container present so the test
+        // exercises the post-non-empty-seen branch.
+        tx.send(DockerMsg::Added(snap("a"))).unwrap();
+        app.drain_docker();
+        for _ in 0..STARTUP_GRACE_TICKS {
+            app.on_tick(0.016);
+        }
+        assert!(app.non_empty_seen_once);
+        assert!(app.last_non_empty_world.is_some());
+
+        // Remove → empty for one tick → re-add.
+        tx.send(DockerMsg::Removed("a".to_string())).unwrap();
+        app.drain_docker();
+        assert!(app.world.entities.is_empty());
+        app.on_tick(0.016);
+        assert_eq!(app.empty_streak_ticks, 1);
+        assert!(
+            !app.should_show_empty_banner(),
+            "1-tick transient empty must NOT show banner (debounce + cache)"
+        );
+
+        tx.send(DockerMsg::Added(snap("b"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert!(!app.world.entities.is_empty());
+        assert_eq!(app.empty_streak_ticks, 0);
+        assert!(
+            !app.should_show_empty_banner(),
+            "after re-add the streak resets — banner must stay hidden"
+        );
+    }
+
+    /// **Long-transient no-flicker invariant**: even a 4-second empty
+    /// episode (240 ticks) — far longer than any realistic Docker churn
+    /// gap, but inside the RV5 5-second debounce — keeps the banner
+    /// hidden. The cache renders for the whole window.
+    #[test]
+    fn rv5_no_banner_during_4_second_empty_episode() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        tx.send(DockerMsg::Added(snap("a"))).unwrap();
+        app.drain_docker();
+        for _ in 0..STARTUP_GRACE_TICKS {
+            app.on_tick(0.016);
+        }
+        tx.send(DockerMsg::Removed("a".to_string())).unwrap();
+        app.drain_docker();
+        // 240 empty ticks (~4 s at 60 Hz) — under the 300-tick window.
+        // The banner must stay hidden for ALL 240 frames.
+        for i in 0..240 {
+            app.on_tick(0.016);
+            assert!(
+                !app.should_show_empty_banner(),
+                "frame {i} of 4-s empty episode: banner must stay hidden \
+                 (RV5 5-s debounce + cached-world render)"
+            );
+        }
+        assert_eq!(app.empty_streak_ticks, 240);
+    }
+
+    /// **STARTUP_GRACE_TICKS sanity check**: pin the constant. If a future
+    /// refactor accidentally drops the grace to 0 or removes it, this test
+    /// will fail and the cold-start flicker would silently regress.
+    ///
+    /// `const { assert! }` per clippy's `assertions_on_constants` lint —
+    /// the assertion is evaluated at compile time, so a regressing edit
+    /// fails the BUILD, not just the test run.
+    #[test]
+    fn rv5_startup_grace_ticks_is_at_least_one_second() {
+        const { assert!(STARTUP_GRACE_TICKS >= 60) };
+    }
+
+    /// **RV5 invariant trace** (ignored test, writes to /tmp): tick-by-tick
+    /// state log through cold-start + steady-state + transient-empty +
+    /// long-empty for the human-verify checkpoint. Demonstrates that the
+    /// banner field stays `false` until either the grace expires on a
+    /// truly-empty daemon or 300 ticks of sustained emptiness elapse.
+    #[test]
+    #[ignore = "writes a file under /tmp; run on demand via --ignored for human verify"]
+    fn rv5_writes_invariant_trace() {
+        use std::io::Write;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        let mut f = std::fs::File::create("/tmp/v504-rv5-invariant-trace.txt").unwrap();
+        writeln!(
+            f,
+            "RV5 cold-start + cache invariant verify\n\
+             ==========================================\n\
+             STARTUP_GRACE_TICKS         = {STARTUP_GRACE_TICKS} (~{} ms at TICK_HZ=60)\n\
+             EMPTY_BANNER_DEBOUNCE_TICKS = {EMPTY_BANNER_DEBOUNCE_TICKS} (~{} ms at TICK_HZ=60)\n",
+            (STARTUP_GRACE_TICKS as f32) * 1000.0 / 60.0,
+            (EMPTY_BANNER_DEBOUNCE_TICKS as f32) * 1000.0 / 60.0,
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "tick    world  streak  seen_once  cache  banner?  note",
+        )
+        .unwrap();
+        let log = |f: &mut std::fs::File, app: &App, note: &str| {
+            let cache_len = app
+                .last_non_empty_world
+                .as_ref()
+                .map(|w| w.entities.len() as i64)
+                .unwrap_or(-1);
+            writeln!(
+                f,
+                "{:>5}  {:>5}  {:>6}  {:>9}  {:>5}  {:>7}  {}",
+                app.tick_count,
+                app.world.entities.len(),
+                app.empty_streak_ticks,
+                app.non_empty_seen_once,
+                cache_len,
+                app.should_show_empty_banner(),
+                note,
+            )
+            .unwrap();
+        };
+
+        // === COLD-START ===
+        log(&mut f, &app, "tick 0: fresh app, grace gate suppresses banner (no flash)");
+        // Simulate a slow seed: 6 ticks pass with NO Docker messages.
+        for _ in 0..6 {
+            app.on_tick(0.016);
+        }
+        log(&mut f, &app, "tick 6 (~100 ms): bollard seed still in flight; banner STILL suppressed by grace");
+        // Seed lands.
+        tx.send(DockerMsg::Added(snap("c1"))).unwrap();
+        tx.send(DockerMsg::Added(snap("c2"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        log(&mut f, &app, "tick 7: seed landed; sticky flag flipped; cache populated; banner hidden");
+        // Steady state.
+        for _ in 0..STARTUP_GRACE_TICKS {
+            app.on_tick(0.016);
+        }
+        log(&mut f, &app, "post-grace steady state: non-empty world, banner hidden");
+
+        // === TRANSIENT EMPTY ===
+        tx.send(DockerMsg::Removed("c1".to_string())).unwrap();
+        tx.send(DockerMsg::Removed("c2".to_string())).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        log(&mut f, &app, "containers removed; first empty tick — debounce HOLDS banner OFF, cache renders");
+        // 240 empty ticks (~4 s) — well under 5-s window.
+        for _ in 0..240 {
+            app.on_tick(0.016);
+        }
+        log(&mut f, &app, "4 s of empty — RV5 STILL holding banner; cache freezes scene");
+
+        // New container — streak resets.
+        tx.send(DockerMsg::Added(snap("c3"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        log(&mut f, &app, "new container arrived inside the window — streak reset, banner stays hidden, no flash");
+
+        // === SUSTAINED EMPTY (banner finally shows) ===
+        tx.send(DockerMsg::Removed("c3".to_string())).unwrap();
+        app.drain_docker();
+        for _ in 0..(EMPTY_BANNER_DEBOUNCE_TICKS as usize) {
+            app.on_tick(0.016);
+        }
+        log(&mut f, &app, "300 ticks empty (~5 s) — debounce elapsed, banner FINALLY shows");
+
+        writeln!(
+            f,
+            "\nPASS: banner stayed hidden through cold-start, transient empties, \
+             and a 4-s empty episode; showed only after sustained 5-s empty"
+        )
+        .unwrap();
     }
 
     /// Unknown palette names in config fall back to notion-soft AND rewrite

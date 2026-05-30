@@ -1166,23 +1166,32 @@ pub fn run_kitty(
     let mut last_was_empty = true;
     // Empty-banner debounce state (mirrors the braille App fields).
     //
-    // RV2 introduced the debounce at 6 frames (~200 ms). RV4 bumps to
-    // 30 frames (~1000 ms) AND adds the `last_non_empty_world_kitty` cache
-    // — the user reported flicker still happened with the 200 ms window
-    // because bollard's `start` event propagation routinely takes
-    // 250-400 ms on a busy daemon, AND the mid-debounce render emitted a
-    // BLANK image surface (delete_all without re-emit), which the user
-    // saw as a flash even before the banner showed. RV4 paints the CACHED
-    // last-non-empty world during the window so the scene stays visually
-    // continuous; only after 1 s of stable emptiness does the banner kick
-    // in.
+    // RV2 introduced the debounce at 6 frames (~200 ms). RV4 bumped to
+    // 30 frames (~1000 ms) AND added the `last_non_empty_world_kitty`
+    // cache. RV5 bumps the debounce window to 150 frames (~5000 ms at
+    // ~30 FPS) AND adds the cold-start grace: the banner is unconditionally
+    // suppressed for the first `KITTY_STARTUP_GRACE_FRAMES` (~1 s) of
+    // process life regardless of `non_empty_seen_once`. This fixes the
+    // ~100 ms launch flicker the user reported — bollard's
+    // `list_containers` seed lands at t~80-150 ms; before that, the
+    // pre-RV5 kitty loop painted the banner for the first 1-3 frames
+    // before any Added drained.
     //
     // `non_empty_seen_once` is sticky after the first non-empty world;
-    // until then the banner shows immediately (first-launch UX preserved).
+    // after the grace expires, if it's STILL false the banner shows
+    // (Phase 3 criterion #5: a daemon with zero containers gets its
+    // banner, just delayed by ~1 s).
+    //
+    // `frames_since_start` is the kitty mirror of `App.tick_count` —
+    // monotonically increments at the kitty frame cadence (~30 FPS); the
+    // grace gate consults it instead of wall-time so the kitty path
+    // doesn't drift on frame-rate stalls.
     let mut non_empty_seen_once = false;
     let mut empty_streak_frames: u32 = 0;
     let mut last_non_empty_world_kitty: Option<World> = None;
-    const KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES: u32 = 30;
+    let mut frames_since_start: u32 = 0;
+    const KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES: u32 = 150;
+    const KITTY_STARTUP_GRACE_FRAMES: u32 = 30;
     // 04-04 label state: the (col, row, len) of the LAST cell-grid label the
     // kitty path drew, so we can erase it with spaces BEFORE writing the new
     // one. Avoids stale-label streaks when the selection moves or the box
@@ -1353,6 +1362,13 @@ pub fn run_kitty(
             // RV4: also refresh the `last_non_empty_world_kitty` cache on
             // every non-empty frame so the debounce path has a frozen
             // snapshot to render instead of a blank surface.
+            //
+            // RV5: also advance `frames_since_start` every iteration so
+            // the cold-start grace gate (below) has a monotonic counter.
+            // The grace gate suppresses the banner unconditionally for
+            // ~1 s after launch, eliminating the ~100 ms flash the user
+            // reported.
+            frames_since_start = frames_since_start.saturating_add(1);
             let world_empty_now = world.entities.is_empty();
             if world_empty_now {
                 empty_streak_frames = empty_streak_frames.saturating_add(1);
@@ -1361,10 +1377,18 @@ pub fn run_kitty(
                 empty_streak_frames = 0;
                 last_non_empty_world_kitty = Some(world.clone());
             }
-            let show_banner =
-                world_empty_now
-                    && (!non_empty_seen_once
-                        || empty_streak_frames >= KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES);
+            // RV5 banner gate (mirrors `App::should_show_empty_banner`):
+            //   (1) During the cold-start grace, the banner is suppressed
+            //       regardless of other state.
+            //   (2) After the grace, the banner shows if the daemon has
+            //       never spoken about a container (criterion #5) OR the
+            //       world has been stably empty for >= the (RV5-bumped)
+            //       debounce window.
+            let in_startup_grace = frames_since_start < KITTY_STARTUP_GRACE_FRAMES;
+            let show_banner = world_empty_now
+                && !in_startup_grace
+                && (!non_empty_seen_once
+                    || empty_streak_frames >= KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES);
 
             // RV4: during the debounce window, render the CACHED world
             // (frozen at the moment it last had containers) instead of
