@@ -18,6 +18,8 @@
 //! masking dead code elsewhere in the crate.
 #![allow(dead_code)]
 
+pub mod omarchy;
+
 use ratatui::style::Color;
 
 /// Container lifecycle status (mirrors CONT-01). Defined here so the
