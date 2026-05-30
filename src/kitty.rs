@@ -1256,9 +1256,13 @@ pub fn run_kitty(
             (crate::theme::Palette::notion_soft(), "notion-soft".to_string())
         }
     };
-    // `config` is currently consumed only for `palette` in this plan;
-    // 05-05 / 05-06 will read `auto_degrade`, `degraded_fps_cap`,
-    // `force_mode`, `hud_visible` from it here.
+    // THEME-05: legend HUD visibility. Initialised from the config-file
+    // value so the kitty backend honors the same `hud_visible` setting
+    // App reads. Flipped at runtime by `Effect::ToggleLegend` (L key)
+    // below.
+    let mut hud_visible = config.hud_visible;
+    // `config` is otherwise unused in this plan (05-06 will read
+    // `auto_degrade`, `degraded_fps_cap`, `force_mode` from it).
     let _config = config;
     // Live reconciler + an initially empty World. The banner kicks in until
     // the first `Added` from the producer lands; `render_rgba` is never called
@@ -1385,6 +1389,12 @@ pub fn run_kitty(
                         let next = order[(cur + 1) % order.len()];
                         palette = crate::theme::Palette::by_name_or_default(next);
                         palette_name = next.to_string();
+                    }
+                    Effect::ToggleLegend => {
+                        // THEME-05: flip HUD visibility. Mirrors
+                        // `App::update`'s arm — kitty owns its own state
+                        // because the App is not in the kitty render loop.
+                        hud_visible = !hud_visible;
                     }
                     Effect::SpawnInspect(id) => {
                         // 04-06b: off-thread inspect via the tokio runtime
@@ -1668,6 +1678,41 @@ pub fn run_kitty(
                 }
             }
 
+            // Legend HUD (THEME-05). Emitted AFTER the scene image / label
+            // / banner / chrome — i.e. across ALL FOUR `KittyRenderDecision`
+            // variants — so the legend is visible in every render state:
+            //
+            // - LiveWorld: legend overdraws the top-right cells of the
+            //   pixel image, same as the popup overdraws the middle.
+            // - CachedWorld (debounce): legend over the cached frame.
+            // - Banner: legend coexists with the centered banner (Phase 3
+            //   criterion #5 still satisfied — banner text remains visible
+            //   left of and below the legend's top-right corner box).
+            // - ChromeOnly (RV6 cold-start fall-through): legend over a
+            //   cleared screen — the only visible UI for the brief grace
+            //   window before bollard's first Added lands. The braille
+            //   path mirrors this: legend renders on top of the bordered
+            //   "scene" block during the same window.
+            //
+            // Placed BEFORE the popup write so the popup overdraws the
+            // legend's footprint if/when they overlap (mirrors the
+            // braille view: scene → status_bar → legend → popup).
+            //
+            // Toggle-off strategy: Option (c). When the user presses L to
+            // hide the HUD we DO NOT emit clearing spaces here; the next
+            // `emit_kitty` (or screen clear in the Banner/ChromeOnly
+            // paths) re-paints over the legend cells naturally. One
+            // stale frame is acceptable for an explicit user action.
+            if hud_visible {
+                crate::ui::legend::emit_legend_kitty(
+                    &mut stdout,
+                    cols,
+                    rows,
+                    &palette,
+                    &palette_name,
+                )?;
+            }
+
             // CAM-05 / 04-06b: kitty popup OVER the image surface.
             //
             // Drawn AFTER the image emit + label so the box-drawing chars
@@ -1727,7 +1772,7 @@ pub fn run_kitty(
             let mode = if camera.autopilot_active { "auto" } else { "manual" };
             write!(
                 stdout,
-                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | boxes: {boxes} | mode: {mode} | palette: {palette_name} | kitty | P palette, Tab select, q quit"
+                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | boxes: {boxes} | mode: {mode} | palette: {palette_name} | kitty | P palette, L legend, Tab select, q quit"
             )?;
             stdout.flush()?;
 
