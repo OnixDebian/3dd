@@ -5,10 +5,12 @@
 //! which state — and so 05-04's palette cycling has a visible label that
 //! follows the swatches.
 //!
-//! The legend is anchored TOP-RIGHT (chosen to avoid colliding with the
-//! detail-panel popup, which is centered, and the status bar, which is
-//! the bottom row). Width: 22 cells (longest status label "restarting" +
-//! ■ + padding). Height: 7 rows (border + 5 statuses + border).
+//! The legend is anchored TOP-LEFT (05-05-RV2 — moved from top-right
+//! per user feedback at the human-verify checkpoint; chosen to avoid
+//! colliding with the detail-panel popup, which is centered, and the
+//! status bar, which is the bottom row). Width: 22 cells (longest
+//! status label "restarting" + ■ + padding). Height: 7 rows (border +
+//! 5 statuses + border).
 //!
 //! Toggled by `L`. Initial visibility comes from `AppConfig.hud_visible`
 //! (default true).
@@ -37,15 +39,20 @@ pub const LEGEND_STATUSES: [(Status, &str); 5] = [
     (Status::Crashed, "crashed"),
 ];
 
-/// Anchor the legend to the top-right corner of `scene_area`, with a
+/// Anchor the legend to the TOP-LEFT corner of `scene_area`, with a
 /// 1-cell inset from each edge. Returns the legend's Rect or None when
 /// the scene area is too small to host it (degrades gracefully).
+///
+/// 05-05-RV2 (Bug B): moved from top-right to top-left per user
+/// feedback. The popup (centered) and status bar (bottom row) are
+/// unaffected by the anchor flip — both already coexisted with the
+/// previous top-right anchor.
 pub fn legend_rect(scene_area: Rect) -> Option<Rect> {
     if scene_area.width < LEGEND_W + 2 || scene_area.height < LEGEND_H + 2 {
         return None;
     }
     Some(Rect {
-        x: scene_area.x + scene_area.width - LEGEND_W - 1,
+        x: scene_area.x + 1,
         y: scene_area.y + 1,
         width: LEGEND_W,
         height: LEGEND_H,
@@ -83,14 +90,18 @@ pub fn render_legend(frame: &mut Frame, area: Rect, palette: &Palette, palette_n
 
 // -------- kitty cell-grid emit ------------------------------------------
 
-/// Emit the legend as raw ANSI cell writes to `out` at the top-right of
+/// Emit the legend as raw ANSI cell writes to `out` at the TOP-LEFT of
 /// the kitty pixel surface. Mirrors `render_legend` content via plain
 /// terminal escapes (truecolor SGR) so the legend is visible on the
 /// real-pixel backend too.
 ///
 /// `cols`, `rows` are the terminal cell dimensions; the legend anchors
-/// to (cols - LEGEND_W - 1, 1) so it sits inside the visible area
-/// without touching the right edge or the status bar (rows - 1).
+/// to (1, 1) (1-cell inset from left + top, 0-indexed) so it sits
+/// inside the visible area without touching the left edge or the
+/// status bar (rows - 1).
+///
+/// 05-05-RV2 (Bug B): anchor moved from top-right to top-left per user
+/// feedback at the checkpoint.
 ///
 /// Pattern matches the existing kitty popup code (see
 /// `kitty::draw_popup_box`): unicode box-drawing chars + truecolor SGR.
@@ -104,7 +115,7 @@ pub fn emit_legend_kitty(
     if cols < LEGEND_W + 2 || rows < LEGEND_H + 2 {
         return Ok(()); // graceful skip on tiny terminals
     }
-    let x = cols - LEGEND_W - 1; // 0-indexed column (top-left of legend)
+    let x = 1u16; // 0-indexed column (top-left of legend, 1-cell inset from left)
     let y = 1u16; // 0-indexed row
     let (er, eg, eb) = rgb_of(palette.edge);
 
@@ -179,7 +190,7 @@ pub fn emit_legend_clear_kitty(
     if cols < LEGEND_W + 2 || rows < LEGEND_H + 2 {
         return Ok(());
     }
-    let x = cols - LEGEND_W - 1; // 0-indexed column (matches emit_legend_kitty)
+    let x = 1u16; // 0-indexed column (matches emit_legend_kitty's RV2 top-left anchor)
     let y = 1u16;
     let (br, bg_, bb) = rgb_of(palette.background);
     let pos = |col: u16, row: u16| format!("\x1b[{};{}H", row + 1, col + 1);
@@ -218,7 +229,7 @@ mod tests {
     }
 
     #[test]
-    fn legend_rect_anchors_top_right_on_normal_area() {
+    fn legend_rect_anchors_top_left_on_normal_area() {
         let area = Rect {
             x: 0,
             y: 0,
@@ -228,11 +239,29 @@ mod tests {
         let r = legend_rect(area).unwrap();
         assert_eq!(r.width, LEGEND_W);
         assert_eq!(r.height, LEGEND_H);
-        // Top-right: x near right edge, y near top.
-        assert!(r.x + r.width <= area.x + area.width);
+        // RV2 (Bug B): legend now anchors TOP-LEFT, not top-right.
+        // 1-cell inset from the left edge.
+        assert_eq!(r.x, area.x + 1);
         assert_eq!(r.y, area.y + 1);
-        // 1-cell inset from the right edge.
-        assert_eq!(r.x + r.width, area.x + area.width - 1);
+    }
+
+    /// RV2 regression pin: the rect must be on the LEFT side. If anyone
+    /// ever flips this back to right-anchored the test breaks immediately.
+    #[test]
+    fn legend_rect_x_is_one_cell_inset_from_left() {
+        let area = Rect {
+            x: 5,
+            y: 0,
+            width: 100,
+            height: 40,
+        };
+        let r = legend_rect(area).unwrap();
+        assert_eq!(
+            r.x,
+            area.x + 1,
+            "legend must anchor TOP-LEFT (1-cell inset from area.x), got x={}",
+            r.x
+        );
     }
 
     /// Boundary: width just under the minimum returns None; exactly the
