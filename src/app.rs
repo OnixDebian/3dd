@@ -1323,7 +1323,7 @@ mod tests {
         // Now starve to a real empty: remove + ride out the full 60-tick window.
         tx.send(DockerMsg::Removed("c2".to_string())).unwrap();
         app.drain_docker();
-        for i in 37..=37 + EMPTY_BANNER_DEBOUNCE_TICKS as usize {
+        for _ in 37..=37 + EMPTY_BANNER_DEBOUNCE_TICKS as usize {
             app.on_tick(0.016);
         }
         log(
