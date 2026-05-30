@@ -1164,17 +1164,25 @@ pub fn run_kitty(
     // so we can clear the image surface exactly when transitioning empty ->
     // non-empty (and vice versa) without flickering on every banner-only loop.
     let mut last_was_empty = true;
-    // Empty-banner debounce state (05-04-RV2 — mirrors the braille App fields).
-    // `non_empty_seen_once` is sticky after the first non-empty world; until
-    // then the banner shows immediately (first-launch UX preserved).
-    // `empty_streak_frames` counts consecutive renders the world has been
-    // empty AFTER having been non-empty — only once it crosses the debounce
-    // threshold do we actually re-show the banner. The threshold is in FRAME
-    // units here (~30 FPS) to match the kitty backend's render-driven cadence;
-    // 6 frames ≈ 200 ms of stable emptiness.
+    // Empty-banner debounce state (mirrors the braille App fields).
+    //
+    // RV2 introduced the debounce at 6 frames (~200 ms). RV4 bumps to
+    // 30 frames (~1000 ms) AND adds the `last_non_empty_world_kitty` cache
+    // — the user reported flicker still happened with the 200 ms window
+    // because bollard's `start` event propagation routinely takes
+    // 250-400 ms on a busy daemon, AND the mid-debounce render emitted a
+    // BLANK image surface (delete_all without re-emit), which the user
+    // saw as a flash even before the banner showed. RV4 paints the CACHED
+    // last-non-empty world during the window so the scene stays visually
+    // continuous; only after 1 s of stable emptiness does the banner kick
+    // in.
+    //
+    // `non_empty_seen_once` is sticky after the first non-empty world;
+    // until then the banner shows immediately (first-launch UX preserved).
     let mut non_empty_seen_once = false;
     let mut empty_streak_frames: u32 = 0;
-    const KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES: u32 = 6;
+    let mut last_non_empty_world_kitty: Option<World> = None;
+    const KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES: u32 = 30;
     // 04-04 label state: the (col, row, len) of the LAST cell-grid label the
     // kitty path drew, so we can erase it with spaces BEFORE writing the new
     // one. Avoids stale-label streaks when the selection moves or the box
@@ -1337,38 +1345,54 @@ pub fn run_kitty(
             // framerate-independent path the breathing pass uses (04-03).
             selection.tick(dt);
 
-            // Empty-banner debounce bookkeeping (05-04-RV2). Update the
-            // streak BEFORE deciding whether to paint banner-vs-image so the
-            // first non-empty world after launch immediately drops the
-            // debounce window for any future transient empties.
+            // Empty-banner debounce bookkeeping. Update the streak BEFORE
+            // deciding whether to paint banner-vs-image so the first
+            // non-empty world after launch immediately drops the debounce
+            // window for any future transient empties.
+            //
+            // RV4: also refresh the `last_non_empty_world_kitty` cache on
+            // every non-empty frame so the debounce path has a frozen
+            // snapshot to render instead of a blank surface.
             let world_empty_now = world.entities.is_empty();
             if world_empty_now {
                 empty_streak_frames = empty_streak_frames.saturating_add(1);
             } else {
                 non_empty_seen_once = true;
                 empty_streak_frames = 0;
+                last_non_empty_world_kitty = Some(world.clone());
             }
             let show_banner =
                 world_empty_now
                     && (!non_empty_seen_once
                         || empty_streak_frames >= KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES);
 
-            if world_empty_now && !show_banner {
-                // MID-DEBOUNCE EMPTY: the world just emptied but we haven't
-                // crossed the stability threshold yet — keep the previous
-                // image mounted (kitty image protocol persists the last
-                // emitted image until we delete_all). DO NOT call delete_all
-                // here; DO NOT paint a banner. Only update the status bar
-                // (still done below). This is the no-flicker path: a brief
-                // docker rm/run churn shows the old 3D scene retained for
-                // ~200 ms instead of flashing the banner.
-                //
-                // Status-bar `boxes` still reads 0 — the user sees the
-                // ground truth in the HUD; only the SCENE chrome is held
-                // steady.
-            } else if world_empty_now {
+            // RV4: during the debounce window, render the CACHED world
+            // (frozen at the moment it last had containers) instead of
+            // leaving a blank image surface. Without this, the user sees
+            // the previous image PERSIST (kitty's image protocol keeps
+            // the last emit until delete_all), which is OK for the first
+            // frame post-empty but quickly breaks because subsequent
+            // re-emits at 30 FPS need SOMETHING to draw — the pre-RV4
+            // code just skipped the image branch entirely and the
+            // terminal cell-grid status-bar / popup writes painted over
+            // parts of the held image, producing visual debris.
+            //
+            // Branch order:
+            // (a) show_banner==true   -> banner path (first launch or stable empty)
+            // (b) world_empty_now && cache exists -> render the cached world
+            // (c) world_empty_now && no cache (first launch race) -> banner
+            // (d) live non-empty -> normal render
+            let render_target: Option<&World> = if !world_empty_now {
+                Some(&world)
+            } else if !show_banner {
+                last_non_empty_world_kitty.as_ref()
+            } else {
+                None
+            };
+
+            if render_target.is_none() {
                 // Stable empty (debounce satisfied OR first launch never
-                // had containers) — same banner path as before.
+                // had containers) — banner path.
                 if !last_was_empty {
                     delete_all(&mut stdout)?;
                     last_was_empty = true;
@@ -1384,18 +1408,25 @@ pub fn run_kitty(
                 };
                 let banner_row = (rows / 2).max(1);
                 write!(stdout, "\x1b[{banner_row};{banner_col}H{banner}")?;
-            } else {
+            } else if let Some(target) = render_target {
                 let view = camera.view_params(DEFAULT_FOV);
                 // 04-04 extras: build floor-planes + port lookup PER FRAME
                 // from the live world. No clones: PortLookup borrows ports
                 // from LiveWorld entries via `snapshot`.
+                //
+                // RV4: `target` is either the live `&world` (normal path)
+                // or the cached `last_non_empty_world_kitty` (debounce
+                // path). Extras pull from `live` regardless because the
+                // selected entity / port lookup / cylinders reference
+                // live state that may have changed even when the world
+                // momentarily emptied. Stale entity-ids harmlessly skip.
                 let floors = build_floor_planes_kitty(&live, &selection, &palette);
-                let ports = build_port_lookup_kitty(&world, &live);
+                let ports = build_port_lookup_kitty(target, &live);
                 // 04-05 ENT-03 / ENT-04: volume cylinders + image stacks
                 // built per-frame from the live world. Builders are local
                 // to this file so all kitty-path extras assembly stays in
                 // one place.
-                let cylinders = build_volume_cylinders_kitty(&world, &live, &palette);
+                let cylinders = build_volume_cylinders_kitty(target, &live, &palette);
                 let image_stacks = build_image_stacks_kitty(&live);
                 let extras = SceneExtras::new(
                     floors.as_slice(),
@@ -1405,9 +1436,9 @@ pub fn run_kitty(
                 );
 
                 let rgba = render_rgba(
-                    &world.entities,
+                    &target.entities,
                     view,
-                    &world.bounds,
+                    &target.bounds,
                     &palette,
                     w,
                     h,
@@ -1432,7 +1463,7 @@ pub fn run_kitty(
                 if let Some((pcol, prow, plen)) = last_label_print.take() {
                     write!(stdout, "\x1b[{prow};{pcol}H{}", " ".repeat(plen))?;
                 }
-                if let Some(sel_entity) = selection.selected_entity(&world) {
+                if let Some(sel_entity) = selection.selected_entity(target) {
                     let cell_w_px = (px_w / cols as usize).max(1);
                     let cell_h_px = cell_h;
                     if let Some(anchor) = crate::ui::labels::project_label_anchor(

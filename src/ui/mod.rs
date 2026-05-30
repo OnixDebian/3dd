@@ -44,23 +44,42 @@ pub fn view(frame: &mut Frame, app: &mut App) {
     // copy here is trivial. Cycled at runtime by Effect::CyclePalette.
     let palette = app.palette;
 
-    if app.world.entities.is_empty() {
-        // Zero containers right now. The DEBOUNCED decision lives on App:
-        // `should_show_empty_banner` returns true only after the world has
-        // been stably empty for ~200 ms (or at first launch when no
-        // container has ever been observed). During the debounce window we
-        // keep painting the last 3D scene chrome — visually a retained
-        // frame, NOT a banner flash. This kills the user-reported flicker
-        // during `docker rm -f` + `docker run` churn while preserving the
-        // Phase 3 criterion #5 banner for a truly-empty daemon.
+    // 05-04-RV4: the view picks between the LIVE empty world and the
+    // CACHED last-non-empty world based on the debounce-window state. We
+    // borrow-split here so `scene::render_scene` can take `&mut app.selection`
+    // later while the chosen world borrow stays alive — calling
+    // `app.effective_world_for_view()` would lock the entire `app` immutably.
+    // The decision below mirrors `App::effective_world_for_view` exactly.
+    //
+    // During the empty-banner debounce window we render the cached
+    // snapshot so the scene chrome stays visually continuous through
+    // transient empties (e.g. `docker rm -f` + `docker run` churn). RV2's
+    // earlier fix returned only an empty bordered block during the
+    // window — the user still saw a blank flash because the 3D content
+    // vanished. RV4 paints the cached scene instead, so the boxes hold
+    // position until the debounce expires or new containers arrive.
+    let live_empty = app.world.entities.is_empty();
+    let in_debounce = live_empty && !app.should_show_empty_banner();
+    let effective_world: &crate::world::World = if in_debounce {
+        app.last_non_empty_world.as_ref().unwrap_or(&app.world)
+    } else {
+        &app.world
+    };
+    if effective_world.entities.is_empty() {
+        // No content to retain (first launch with no cache, OR debounce
+        // expired on a stable-empty daemon). The DEBOUNCED decision lives
+        // on App: `should_show_empty_banner` returns true at first launch
+        // (no `non_empty_seen_once`) and when the debounce window has
+        // elapsed. Phase 3 criterion #5 preserved.
         if app.should_show_empty_banner() {
             render_empty_banner(frame, scene_area, &palette);
         } else {
-            // Mid-debounce empty: paint the bordered "scene" block without
-            // content so the chrome stays consistent (no jump between
-            // banner and 3D scene chrome). The scene's previous content is
-            // already cleared by ratatui between frames — we just don't
-            // paint anything inside the block.
+            // Empty world + cache also empty (shouldn't happen in
+            // practice: should_show_empty_banner would have returned true
+            // at first-launch and the cache is populated whenever
+            // non_empty_seen_once flips). Defensive fallback to the
+            // bordered block — still no flash because the world has been
+            // empty since startup.
             let block = ratatui::widgets::Block::default()
                 .title("scene")
                 .borders(ratatui::widgets::Borders::ALL);
@@ -76,11 +95,18 @@ pub fn view(frame: &mut Frame, app: &mut App) {
         // 04-04: render_scene also reads `live` + `&mut selection` for the
         // floor-plane palette decision, the per-entity port lookup, and the
         // selected-only label's hysteresis update.
+        //
+        // Note: during the RV4 debounce-with-cache path, `effective_world`
+        // is the cached snapshot — boxes "freeze" at the last seen position
+        // for up to 1 second while the daemon settles. live + selection are
+        // still read from `app` (they reflect the LIVE state); a selected
+        // id that no longer exists in the cached world is harmless (the
+        // pulse path just skips it).
         scene::render_scene(
             frame,
             scene_area,
             &app.camera,
-            &app.world,
+            effective_world,
             &app.live,
             &mut app.selection,
             &palette,

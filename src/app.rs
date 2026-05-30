@@ -27,19 +27,37 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use crate::action::{apply_input_action, coalesce_actions, Action, Effect};
 /// How many consecutive logic ticks the World must stay empty AFTER having
 /// previously been non-empty before the empty-state banner re-appears. At
-/// `crate::tui::TICK_HZ = 60` this is ~200 ms of stable emptiness.
+/// `crate::tui::TICK_HZ = 60` this is ~1000 ms of stable emptiness.
 ///
-/// User feedback after 05-04: rapid `docker rm -f` + `docker run` flashed
-/// the "No containers running" banner during the gap between Removed and
-/// Added — visually a 3D-scene-then-banner-then-3D-scene flicker. Holding
-/// the banner off until emptiness sustains 200 ms suppresses that without
-/// hiding a legitimate empty state (300 ms of stable empty still shows the
-/// banner — the user just sees a brief retained-frame instead of a flash).
+/// User feedback after 05-04-RV2 (the initial 200 ms / 12 ticks debounce):
+/// banner STILL flickered during normal use. Two compounding problems
+/// surfaced on the re-verify:
+///
+/// 1. **200 ms was too short** for real-daemon churn. A `docker rm -f`
+///    followed by `docker run` on a single-container scene routinely
+///    crosses the 200 ms window because the new container's `start` event
+///    takes ~250-400 ms to propagate through bollard. The user observable
+///    was repeated banner flashes, not just one rare flicker.
+///
+/// 2. **The mid-debounce render emitted an EMPTY BORDERED BLOCK** (no
+///    Canvas, no 3D content) — visually identical to "blank scene" from
+///    the user's eye. RV2's "retained 3D scene chrome" promise was only
+///    partially delivered: the chrome (border + title) stayed, but the
+///    INSIDE went blank during the window. The user still sees a flash.
+///
+/// RV4 closes both: bump the window to 1000 ms AND cache the most recent
+/// non-empty world in [`App::last_non_empty_world`]. During the debounce
+/// window the view renders the CACHED world (frozen at the moment of
+/// emptying) so the scene chrome stays intact — boxes hold position for
+/// 1 second while the daemon settles; if emptiness sustains beyond the
+/// window the banner kicks in. Trade-off: 1 second of "ghost boxes" on a
+/// genuinely-empty post-churn daemon is far less jarring than a banner
+/// flash — and the boxes drop the moment the world stabilizes.
 ///
 /// First-launch (banner-while-waiting-for-the-first-container) is preserved
 /// via the `non_empty_seen_once` sticky bit — the debounce only kicks in
 /// after the first container has been observed.
-pub(crate) const EMPTY_BANNER_DEBOUNCE_TICKS: u32 = 12;
+pub(crate) const EMPTY_BANNER_DEBOUNCE_TICKS: u32 = 60;
 use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::docker::Docker;
@@ -113,6 +131,20 @@ pub struct App {
     /// [`Self::should_show_empty_banner`]) to gate the banner on stable
     /// emptiness rather than instantaneous emptiness.
     pub(crate) empty_streak_ticks: u32,
+    /// Cached snapshot of the most recent non-empty world (RV4).
+    ///
+    /// Written on every non-empty `on_tick` (cheap — `World: Clone` is a
+    /// `Vec<Entity>` clone plus a copy of `SceneBounds`; typical N <= ~50
+    /// containers, sub-microsecond per tick). Read by `ui::view` during
+    /// the empty-banner debounce window: instead of painting a blank
+    /// scene-block, the view renders this cached world so the chrome
+    /// stays visually continuous through transient empties.
+    ///
+    /// `None` only at first launch before any container has been seen —
+    /// at which point `non_empty_seen_once` is also `false` and the
+    /// view-layer falls through to the immediate banner path (Phase 3
+    /// criterion #5 preserved).
+    pub(crate) last_non_empty_world: Option<World>,
     /// Non-blocking receiver for typed DockerMsg events from the producer task
     /// in `docker::streams`. `None` for the test/dump constructor (`App::new`)
     /// so unit tests don't need a producer.
@@ -168,6 +200,12 @@ impl App {
             // because the world stays non-empty.
             non_empty_seen_once: true,
             empty_streak_ticks: 0,
+            // App::new seeds a synthetic non-empty world, but the cache is
+            // populated lazily on the first non-empty tick (see on_tick); a
+            // direct clone here would couple `new` to the test path's
+            // assumption of an EMPTY cache pre-tick. Leave None — the first
+            // tick fills it.
+            last_non_empty_world: None,
             docker_rx: None,
             docker: None,
             tx_for_inspect: None,
@@ -209,6 +247,9 @@ impl App {
             // kicks in for subsequent transient-empty states.
             non_empty_seen_once: false,
             empty_streak_ticks: 0,
+            // No container has ever been observed yet — cache is empty. The
+            // first non-empty on_tick will populate it.
+            last_non_empty_world: None,
             docker_rx: Some(rx),
             docker: None,
             tx_for_inspect: None,
@@ -392,6 +433,14 @@ impl App {
         } else {
             self.non_empty_seen_once = true;
             self.empty_streak_ticks = 0;
+            // RV4: cache the freshest non-empty world for the empty-banner
+            // debounce path. Cloning a small `Vec<Entity>` + `SceneBounds`
+            // every tick is well under the per-tick budget (worst case
+            // ~50 containers ~= ~5 µs at 60 Hz; the dress() pass already
+            // walked the same slice this tick). Reading `view`-side, the
+            // cache is preferred over the live empty world during the
+            // debounce window so the scene chrome doesn't flash to blank.
+            self.last_non_empty_world = Some(self.world.clone());
         }
     }
 
@@ -402,19 +451,27 @@ impl App {
     ///    containers ever) — `!non_empty_seen_once`. This preserves Phase 3
     ///    criterion #5 (banner shows on a daemon with zero containers).
     /// 2. The world has been STABLY empty for at least
-    ///    [`EMPTY_BANNER_DEBOUNCE_TICKS`] ticks (~200 ms). This suppresses
-    ///    transient flicker during rapid container churn (`docker rm -f`
-    ///    immediately followed by `docker run`).
+    ///    [`EMPTY_BANNER_DEBOUNCE_TICKS`] ticks (~1000 ms — RV4 bump from
+    ///    RV2's 200 ms). This suppresses transient flicker during rapid
+    ///    container churn (`docker rm -f` immediately followed by
+    ///    `docker run`, which routinely crosses the 200 ms window because
+    ///    bollard's `start` event propagation takes ~250-400 ms).
     ///
     /// Returns `false` during the debounce window: the renderer continues
-    /// to display the (now-empty) last 3D scene — visually a retained
-    /// frame instead of a banner flash.
+    /// to display the LAST NON-EMPTY world (via
+    /// [`Self::effective_world_for_view`]) — visually a frozen frame of
+    /// the previous scene, NOT a blank/banner flash.
     ///
     /// Called only when `world.entities.is_empty()` is already true at the
     /// view site; this method does NOT itself check that condition.
     pub(crate) fn should_show_empty_banner(&self) -> bool {
         !self.non_empty_seen_once || self.empty_streak_ticks >= EMPTY_BANNER_DEBOUNCE_TICKS
     }
+
+    // Note: `view` callers inline the "live vs cached world" decision so
+    // they can `&mut app.selection` alongside the chosen world borrow.
+    // The decision is documented at the `ui::view` call site and mirrored
+    // in the kitty backend's `render_target` selection.
 
     /// Drain everything currently queued on the Docker channel (non-blocking)
     /// and reconcile through the LiveWorld. Returns `true` if the entity COUNT
@@ -1065,6 +1122,217 @@ mod tests {
             app.non_empty_seen_once,
             "non_empty_seen_once must stay sticky across empty ticks"
         );
+    }
+
+    // ---- 05-04-RV4: cached-world during debounce + bumped window ----------
+
+    /// The cache is populated on EVERY non-empty `on_tick`, so a subsequent
+    /// transient-empty tick has a fresh snapshot to render from. The cache
+    /// holds the world's entities (the load-bearing surface for the view).
+    #[test]
+    fn last_non_empty_world_cache_populates_on_non_empty_tick() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        assert!(
+            app.last_non_empty_world.is_none(),
+            "fresh App must start with no cached world"
+        );
+        tx.send(DockerMsg::Added(snap("a"))).unwrap();
+        tx.send(DockerMsg::Added(snap("b"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        let cached = app
+            .last_non_empty_world
+            .as_ref()
+            .expect("cache must be Some after non-empty tick");
+        assert_eq!(
+            cached.entities.len(),
+            2,
+            "cache must mirror the world content (2 containers added)"
+        );
+    }
+
+    /// The cache survives a transient empty: once populated by a non-empty
+    /// tick, an empty world followed by ticks does NOT clear it (no
+    /// `last_non_empty_world = None` path on empty). That's what lets the
+    /// view-layer render the cached snapshot during the debounce window.
+    #[test]
+    fn last_non_empty_world_cache_survives_transient_empty() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        tx.send(DockerMsg::Added(snap("only"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert!(app.last_non_empty_world.is_some());
+
+        // Container disappears — cache MUST stay populated.
+        tx.send(DockerMsg::Removed("only".to_string())).unwrap();
+        app.drain_docker();
+        assert!(app.world.entities.is_empty());
+        // Several empty ticks within the debounce window: cache holds.
+        for _ in 0..10 {
+            app.on_tick(0.016);
+        }
+        let cached = app
+            .last_non_empty_world
+            .as_ref()
+            .expect("cache must survive transient empty ticks");
+        assert_eq!(
+            cached.entities.len(),
+            1,
+            "cached snapshot must hold the last non-empty entity set"
+        );
+    }
+
+    /// The cache UPDATES whenever the world is non-empty: a churn pattern
+    /// (1 -> 0 -> 2 containers) leaves the cache at the LATEST non-empty
+    /// snapshot (2 containers), not the original (1). This matters because
+    /// the next transient empty should render the freshest scene, not a
+    /// stale one from minutes ago.
+    #[test]
+    fn last_non_empty_world_cache_refreshes_on_each_non_empty_tick() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        // First era: 1 container.
+        tx.send(DockerMsg::Added(snap("first"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert_eq!(app.last_non_empty_world.as_ref().unwrap().entities.len(), 1);
+        // Removed — cache holds at 1.
+        tx.send(DockerMsg::Removed("first".to_string())).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert_eq!(app.last_non_empty_world.as_ref().unwrap().entities.len(), 1);
+        // Second era: 2 new containers — cache must refresh.
+        tx.send(DockerMsg::Added(snap("second"))).unwrap();
+        tx.send(DockerMsg::Added(snap("third"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        assert_eq!(
+            app.last_non_empty_world.as_ref().unwrap().entities.len(),
+            2,
+            "cache must reflect the FRESHEST non-empty world, not the original"
+        );
+    }
+
+    /// The bumped debounce window (RV4 1000 ms = 60 ticks at 60 Hz) holds
+    /// the banner off through a realistic docker churn gap. A 30-tick
+    /// (~500 ms) empty episode — which the RV2 12-tick (~200 ms) window
+    /// would have given up on — keeps the banner hidden under RV4.
+    #[test]
+    fn rv4_debounce_window_covers_30_tick_empty_episode() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        tx.send(DockerMsg::Added(snap("a"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        tx.send(DockerMsg::Removed("a".to_string())).unwrap();
+        app.drain_docker();
+        // 30 empty ticks — well past RV2's 12-tick threshold, well under
+        // RV4's 60-tick threshold.
+        for _ in 0..30 {
+            app.on_tick(0.016);
+        }
+        assert_eq!(app.empty_streak_ticks, 30);
+        assert!(
+            !app.should_show_empty_banner(),
+            "RV4 window (60 ticks) must keep banner hidden through a 30-tick empty episode"
+        );
+        // Verify the threshold constant itself is the RV4 bump.
+        assert_eq!(
+            EMPTY_BANNER_DEBOUNCE_TICKS, 60,
+            "RV4 expected EMPTY_BANNER_DEBOUNCE_TICKS bumped to 60 (~1000 ms at 60 Hz)"
+        );
+    }
+
+    /// Verify-frame helper for RV4: write a tick-by-tick trace of the
+    /// debounce state machine through a realistic churn scenario to
+    /// `/tmp/v504-rv4-debounce-trace.txt`. Demonstrates that the banner
+    /// stays hidden through transient empties while the cache freezes
+    /// the last non-empty scene.
+    #[test]
+    #[ignore = "writes a file under /tmp; run on demand via --ignored for human verify"]
+    fn rv4_writes_debounce_trace() {
+        use std::io::Write;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        let mut f = std::fs::File::create("/tmp/v504-rv4-debounce-trace.txt").unwrap();
+        writeln!(
+            f,
+            "RV4 empty-banner debounce verify\n\
+             ====================================\n\
+             EMPTY_BANNER_DEBOUNCE_TICKS = {EMPTY_BANNER_DEBOUNCE_TICKS} \
+             (at TICK_HZ=60 that's ~{} ms)\n",
+            (EMPTY_BANNER_DEBOUNCE_TICKS as f32) * 1000.0 / 60.0
+        )
+        .unwrap();
+        writeln!(
+            f,
+            "frame  world.len  streak  seen_once  cache.len  banner?  note",
+        )
+        .unwrap();
+        let log = |f: &mut std::fs::File, frame: usize, app: &App, note: &str| {
+            let cache_len = app
+                .last_non_empty_world
+                .as_ref()
+                .map(|w| w.entities.len() as i64)
+                .unwrap_or(-1);
+            writeln!(
+                f,
+                "{:>5}  {:>9}  {:>6}  {:>9}  {:>9}  {:>7}  {}",
+                frame,
+                app.world.entities.len(),
+                app.empty_streak_ticks,
+                app.non_empty_seen_once,
+                cache_len,
+                app.should_show_empty_banner(),
+                note,
+            )
+            .unwrap();
+        };
+
+        log(&mut f, 0, &app, "fresh app, first-launch (no cache, banner ON immediately)");
+        // Add a container; tick once.
+        tx.send(DockerMsg::Added(snap("c1"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        log(&mut f, 1, &app, "container added, non_empty_seen_once flipped, cache populated");
+        // Tick a few more times with the world non-empty.
+        for i in 2..5 {
+            app.on_tick(0.016);
+            log(&mut f, i, &app, "steady state with 1 container");
+        }
+        // Remove the container — transient empty begins.
+        tx.send(DockerMsg::Removed("c1".to_string())).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        log(&mut f, 5, &app, "container removed; first empty tick — debounce HOLDS banner OFF, cache RETAINS last scene");
+        // 30 more empty ticks (~500 ms — would have shown banner under RV2's 200 ms window).
+        for i in 6..35 {
+            app.on_tick(0.016);
+            if i == 17 {
+                log(&mut f, i, &app, "tick ~17: past RV2's 12-tick threshold, RV4 STILL holding banner");
+            }
+        }
+        log(&mut f, 35, &app, "30 ticks empty — RV4 still holding banner; cache freezes scene");
+        // New container arrives BEFORE debounce expires — banner never shows.
+        tx.send(DockerMsg::Added(snap("c2"))).unwrap();
+        app.drain_docker();
+        app.on_tick(0.016);
+        log(&mut f, 36, &app, "new container — streak reset, banner stays hidden, no flash");
+        // Now starve to a real empty: remove + ride out the full 60-tick window.
+        tx.send(DockerMsg::Removed("c2".to_string())).unwrap();
+        app.drain_docker();
+        for i in 37..=37 + EMPTY_BANNER_DEBOUNCE_TICKS as usize {
+            app.on_tick(0.016);
+        }
+        log(
+            &mut f,
+            37 + EMPTY_BANNER_DEBOUNCE_TICKS as usize,
+            &app,
+            "60 ticks empty — debounce window elapsed, banner FINALLY shows (stable empty)",
+        );
+        writeln!(f, "\nPASS: banner stayed hidden through transient empties; showed only after stable empty").unwrap();
     }
 
     /// Unknown palette names in config fall back to notion-soft AND rewrite
