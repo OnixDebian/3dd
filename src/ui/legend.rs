@@ -14,6 +14,30 @@
 //!
 //! Toggled by `L`. Initial visibility comes from `AppConfig.hud_visible`
 //! (default true).
+//!
+//! ## 05-05-RV3 (Bug C — "screen constantly flickers")
+//!
+//! Each kitty frame issues `delete_all` (removes the prior graphics
+//! image) immediately followed by `emit_kitty` (places the new one).
+//! Terminal cells (the legend's `│ ■ running │` text) are rendered ON
+//! TOP of kitty images, but with a DEFAULT (reset) background — which
+//! in kitty is transparent over images. So the spinning cube pixels
+//! showed through every gap between the legend's text characters,
+//! producing visible flicker at the render cadence (~30 Hz).
+//!
+//! Pre-05-05 the only cell text inside the image area was the small
+//! per-frame label (single line, infrequent updates) and the optional
+//! popup (opt-in, rare). The legend introduced a permanent 22×7 cell
+//! region of text directly on top of the most-pixel-changing area of
+//! the image — making the previously-tolerable transparency flicker
+//! constant and obvious.
+//!
+//! RV3 fix: emit an EXPLICIT solid background SGR
+//! (`\x1b[48;2;R;G;Bm` using `palette.background`) for every legend
+//! cell. The legend now renders as a SOLID PANEL that fully masks the
+//! image underneath. Braille mirror: the block style + per-span styles
+//! switch from `bg(Color::Reset)` (transparent) to `bg(palette
+//! .background)` (solid) — same intent, same fix.
 
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
@@ -62,19 +86,31 @@ pub fn legend_rect(scene_area: Rect) -> Option<Rect> {
 /// Render the legend into `area` of the braille `frame`. `palette_name`
 /// is shown in the block title (e.g. "notion-soft"). Clears the cells
 /// underneath first so the cube can't bleed through.
+///
+/// 05-05-RV3 (Bug C — flicker fix): every span and the block style
+/// now carry an explicit `bg(palette.background)` so the legend cells
+/// are SOLID, not transparent. Pre-RV3 the style used
+/// `bg(Color::Reset)`, which in kitty terminals is transparent over
+/// the graphics image — the constantly-changing pixels behind
+/// produced visible flicker at the legend's footprint. Solid bg fixes
+/// it on the braille side too: ratatui paints cells with
+/// `bg(palette.background)` as a solid fill that masks any underlying
+/// canvas content.
 pub fn render_legend(frame: &mut Frame, area: Rect, palette: &Palette, palette_name: &str) {
     // Clear the cells we're about to paint so the scene under us doesn't
-    // bleed through the borders / gaps.
+    // bleed through the borders / gaps. Clear writes default-style cells;
+    // the subsequent Block paints the solid bg over them.
     frame.render_widget(Clear, area);
 
+    let bg = palette.background;
     let mut lines: Vec<Line> = Vec::with_capacity(5);
     for (status, label) in LEGEND_STATUSES.iter() {
         let color = palette.status_color(*status);
         lines.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("■", Style::default().fg(color)),
-            Span::raw(" "),
-            Span::styled(label.to_string(), Style::default().fg(palette.edge)),
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled("■", Style::default().fg(color).bg(bg)),
+            Span::styled(" ", Style::default().bg(bg)),
+            Span::styled(label.to_string(), Style::default().fg(palette.edge).bg(bg)),
         ]));
     }
 
@@ -82,9 +118,11 @@ pub fn render_legend(frame: &mut Frame, area: Rect, palette: &Palette, palette_n
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .style(Style::default().fg(palette.edge).bg(Color::Reset));
+        .style(Style::default().fg(palette.edge).bg(bg));
 
-    let para = Paragraph::new(lines).block(block);
+    let para = Paragraph::new(lines)
+        .block(block)
+        .style(Style::default().bg(bg));
     frame.render_widget(para, area);
 }
 
@@ -101,7 +139,12 @@ pub fn render_legend(frame: &mut Frame, area: Rect, palette: &Palette, palette_n
 /// status bar (rows - 1).
 ///
 /// 05-05-RV2 (Bug B): anchor moved from top-right to top-left per user
-/// feedback at the checkpoint.
+/// feedback at the checkpoint. 05-05-RV3 (Bug C — flicker): every
+/// cell now carries an explicit `palette.background` bg SGR
+/// (`\x1b[48;2;R;G;Bm`) combined with the fg SGR so the kitty
+/// graphics image cannot show through the legend's cell gaps; the
+/// legend renders as a solid panel that fully masks the spinning
+/// cubes underneath.
 ///
 /// Pattern matches the existing kitty popup code (see
 /// `kitty::draw_popup_box`): unicode box-drawing chars + truecolor SGR.
@@ -118,10 +161,14 @@ pub fn emit_legend_kitty(
     let x = 1u16; // 0-indexed column (top-left of legend, 1-cell inset from left)
     let y = 1u16; // 0-indexed row
     let (er, eg, eb) = rgb_of(palette.edge);
+    let (br, bg_, bb) = rgb_of(palette.background);
 
     // Helper: position cursor (terminal cells are 1-indexed).
     let pos = |col: u16, row: u16| format!("\x1b[{};{}H", row + 1, col + 1);
-    let edge_sgr = format!("\x1b[38;2;{er};{eg};{eb}m");
+    // RV3 anti-flicker: the bg SGR is load-bearing. Every legend cell
+    // emits truecolor fg+bg in one SGR so kitty's image surface is
+    // fully masked under the legend's footprint.
+    let edge_sgr = format!("\x1b[38;2;{er};{eg};{eb};48;2;{br};{bg_};{bb}m");
     let reset = "\x1b[0m";
 
     // Top border with title centered.
@@ -138,7 +185,8 @@ pub fn emit_legend_kitty(
     top.push('┐');
     write!(out, "{}{edge_sgr}{top}{reset}", pos(x, y))?;
 
-    // Status rows.
+    // Status rows. The swatch color is the per-status fg; the bg stays
+    // `palette.background` end-to-end so the row is one solid panel.
     for (i, (status, label)) in LEGEND_STATUSES.iter().enumerate() {
         let (sr, sg, sb) = rgb_of(palette.status_color(*status));
         // Row interior layout: "│ ■ {label}{pad}│"
@@ -148,7 +196,7 @@ pub fn emit_legend_kitty(
         let row = y + 1 + i as u16;
         write!(
             out,
-            "{}{edge_sgr}│ \x1b[38;2;{sr};{sg};{sb}m■{edge_sgr} {label}{}│{reset}",
+            "{}{edge_sgr}│ \x1b[38;2;{sr};{sg};{sb};48;2;{br};{bg_};{bb}m■{edge_sgr} {label}{}│{reset}",
             pos(x, row),
             " ".repeat(label_pad),
         )?;
@@ -312,6 +360,30 @@ mod tests {
         assert!(s.contains("notion-soft"), "title must appear in output");
         // The kitty-style cursor-position escape is used to anchor cells.
         assert!(s.contains("\x1b["), "must include CSI cursor positioning");
+    }
+
+    /// RV3 (Bug C — flicker): every emit_legend_kitty cell must carry a
+    /// truecolor background SGR (`\x1b[...48;2;R;G;Bm`) so the kitty
+    /// image underneath cannot show through. Pre-RV3 cells used only fg
+    /// SGR and a `\x1b[0m` reset; the cell's default bg in kitty is
+    /// transparent over images, causing per-frame flicker as the
+    /// spinning cube pixels showed through the text gaps. This test
+    /// pins the load-bearing presence of the bg SGR in the emit output.
+    #[test]
+    fn emit_legend_kitty_uses_solid_truecolor_bg() {
+        let palette = Palette::notion_soft();
+        let (br, bg_, bb) = match palette.background {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => panic!("notion-soft background must be Color::Rgb"),
+        };
+        let mut buf: Vec<u8> = Vec::new();
+        emit_legend_kitty(&mut buf, 100, 40, &palette, "notion-soft").unwrap();
+        let s = String::from_utf8_lossy(&buf);
+        let needle = format!("48;2;{br};{bg_};{bb}");
+        assert!(
+            s.contains(&needle),
+            "every legend cell must carry the solid-bg SGR ({needle}) to mask the kitty image — RV3 anti-flicker fix",
+        );
     }
 
     /// On a tiny terminal the kitty emit is a noop (no escapes, no bytes).
