@@ -139,6 +139,30 @@ pub struct Camera {
     /// `App::run` / `run_kitty` skip the count-change auto re-frame so a manual
     /// driver isn't yanked back by every container add/remove.
     pub autopilot_active: bool,
+    /// Upper bound on `radius` enforced by [`Camera::nudge_zoom`] (CAM-02).
+    ///
+    /// **Why this is per-camera (RV3 fix).** [`crate::camera::manual::MAX_RADIUS`]
+    /// is the static safety ceiling (DEFAULT_RADIUS * 4 = 24.0). But
+    /// [`Camera::frame_scene`] solves a binary search against the scene's
+    /// projected AABB and can converge to a radius WELL ABOVE the static
+    /// MAX_RADIUS — the synthetic 30-box scene frames at ~36.3 on the braille
+    /// (cell_aspect=2.0) path. With a static clamp, the FIRST zoom-in click
+    /// immediately drops the radius from 36.3 to 24.0, and zoom-out can never
+    /// recover the original full-frame view. The user reports this as
+    /// "zoom-in then zoom-out doesn't return to the original distance".
+    ///
+    /// Fix: each call to `frame_scene` / `frame_scene_with_aspect` lifts this
+    /// ceiling to `max(MAX_RADIUS, framed_radius * 1.25)` so the user can
+    /// always zoom back to at least 125% of the initial framing distance
+    /// (gives a comfortable overview headroom without letting the user fly
+    /// into the fog plane indefinitely).
+    pub(crate) radius_max: f32,
+    /// Lower bound on `radius` enforced by [`Camera::nudge_zoom`]. Mirrors
+    /// [`Camera::radius_max`] for API symmetry; kept at
+    /// [`crate::camera::manual::MIN_RADIUS`] for now (no frame_scene-driven
+    /// lift, since "you can't get any closer than this" is a static comfort
+    /// floor — nothing about scene size makes the rack want a TIGHTER floor).
+    pub(crate) radius_min: f32,
 }
 
 impl Camera {
@@ -151,6 +175,11 @@ impl Camera {
             target: Vec3::ZERO,
             elapsed: 0.0,
             autopilot_active: true,
+            // Static defaults at construction. `frame_scene` lifts the upper
+            // bound to fit the scene the moment a non-empty world is framed
+            // (RV3 fix — see the field doc comment).
+            radius_max: crate::camera::manual::MAX_RADIUS,
+            radius_min: crate::camera::manual::MIN_RADIUS,
         }
     }
 
@@ -334,6 +363,24 @@ impl Camera {
         }
 
         self.radius = if hi.is_finite() && hi > 0.0 { hi } else { DEFAULT_RADIUS };
+
+        // RV3 fix: lift the per-camera zoom-out ceiling so the user can
+        // always pull back to AT LEAST 125% of the framed distance. Without
+        // this, a scene whose framed radius exceeds the static
+        // `manual::MAX_RADIUS` (e.g. the 30-box synthetic frames at ~36 on
+        // the braille path while MAX_RADIUS=24) leaves the user UNABLE to
+        // return to the original full-frame view after a single zoom-in —
+        // the clamp swallows the difference. The lift uses the framed
+        // radius we just computed, NOT the static constant.
+        //
+        // The 1.25 headroom (25% beyond the framed distance) keeps an
+        // overview achievable while preventing infinite pull-back. We never
+        // shrink `radius_max` below its current value — that would let
+        // re-framing a smaller scene narrow a user-driven zoom window.
+        let lifted = (self.radius * 1.25).max(crate::camera::manual::MAX_RADIUS);
+        if lifted.is_finite() && lifted > self.radius_max {
+            self.radius_max = lifted;
+        }
     }
 }
 

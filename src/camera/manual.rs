@@ -50,10 +50,23 @@ impl Camera {
     }
 
     /// Nudge radius (distance from target) by `delta` world units. Negative
-    /// pulls the camera closer, positive pushes it farther. Clamped to
-    /// `[MIN_RADIUS, MAX_RADIUS]`.
+    /// pulls the camera closer, positive pushes it farther.
+    ///
+    /// **Per-camera clamp (RV3 fix).** Reads `self.radius_min` /
+    /// `self.radius_max` instead of the static [`MIN_RADIUS`] / [`MAX_RADIUS`]
+    /// constants so [`Camera::frame_scene`] can lift the upper bound to
+    /// match a scene whose framed radius exceeds the static ceiling. Without
+    /// this, a scene framed at radius > MAX_RADIUS gets its FIRST zoom-in
+    /// click snapped down to MAX_RADIUS, and zoom-out can never recover the
+    /// original framing distance — the asymmetry the user reported as
+    /// "zoom-in then zoom-out doesn't return to the same place".
+    ///
+    /// The per-camera bounds default to MIN_RADIUS / MAX_RADIUS at
+    /// construction; `frame_scene` lifts `radius_max` upward only (never
+    /// shrinks it), so a subsequent re-frame on a smaller scene doesn't
+    /// narrow the user's zoom window.
     pub fn nudge_zoom(&mut self, delta: f32) {
-        self.radius = (self.radius + delta).clamp(MIN_RADIUS, MAX_RADIUS);
+        self.radius = (self.radius + delta).clamp(self.radius_min, self.radius_max);
     }
 }
 
@@ -98,11 +111,16 @@ mod tests {
         );
     }
 
-    /// Radius must stay within `[MIN_RADIUS, MAX_RADIUS]` so the user can't
-    /// fly inside the rack or to infinity.
+    /// Radius must stay within `[radius_min, radius_max]` so the user can't
+    /// fly inside the rack or to infinity. Defaults match the static
+    /// `MIN_RADIUS` / `MAX_RADIUS` constants when no `frame_scene` lift has
+    /// happened yet.
     #[test]
     fn nudge_zoom_clamps_to_radius_range() {
         let mut cam = Camera::new();
+        // Confirm the per-camera defaults match the static constants.
+        assert!((cam.radius_min - MIN_RADIUS).abs() < 1e-6);
+        assert!((cam.radius_max - MAX_RADIUS).abs() < 1e-6);
         cam.nudge_zoom(-1000.0);
         assert!(
             (cam.radius - MIN_RADIUS).abs() < 1e-6,
@@ -114,6 +132,186 @@ mod tests {
             (cam.radius - MAX_RADIUS).abs() < 1e-6,
             "radius should clamp to MAX_RADIUS, got {}",
             cam.radius
+        );
+    }
+
+    // ---- 05-04-RV3: zoom symmetry — frame_scene lifts radius_max ----------
+
+    /// **THE LOAD-BEARING REGRESSION PIN for RV3.** Walk N zoom-in steps then
+    /// N zoom-out steps from a `frame_scene`-framed starting radius (the
+    /// synthetic 30-box rack frames at ~36, well above the static MAX=24).
+    /// After the round-trip the radius MUST return to within one ZOOM_STEP of
+    /// the original framing distance.
+    ///
+    /// Pre-RV3: the first -ZOOM_STEP click snapped from 36→24 (the static
+    /// MAX_RADIUS ceiling), and zoom-out clamped at 24 forever — round-trip
+    /// would end at 24, not 36, breaking symmetry. With the per-camera lift,
+    /// `radius_max = max(24, 36*1.25) = 45`, so the round-trip stays
+    /// symmetric across the full [1.2, 36*1.25] range.
+    #[test]
+    fn zoom_round_trip_returns_to_framed_radius() {
+        let world = crate::world::scene::synthetic_scene();
+        let mut cam = Camera::new();
+        cam.frame_scene(&world);
+        let framed = cam.radius;
+        assert!(
+            framed > MAX_RADIUS,
+            "test precondition: synthetic scene must frame at radius > MAX_RADIUS \
+             so we exercise the lift (got framed={framed}, MAX_RADIUS={MAX_RADIUS})"
+        );
+
+        // 10 zoom-in clicks then 10 zoom-out clicks — should net to zero
+        // because nudge_zoom is additive and the lifted ceiling is high
+        // enough to absorb the round-trip without clamping.
+        for _ in 0..10 {
+            cam.nudge_zoom(-ZOOM_STEP);
+        }
+        for _ in 0..10 {
+            cam.nudge_zoom(ZOOM_STEP);
+        }
+        assert!(
+            (cam.radius - framed).abs() < 1e-4,
+            "10-in/10-out round-trip should return to framed radius {framed}, got {} (delta {})",
+            cam.radius,
+            cam.radius - framed
+        );
+    }
+
+    /// After `frame_scene` on a large scene, the per-camera `radius_max`
+    /// MUST be lifted to at least 125% of the framed radius. This is the
+    /// invariant `nudge_zoom` relies on to deliver the round-trip property
+    /// pinned above.
+    #[test]
+    fn frame_scene_lifts_radius_max_above_framed_distance() {
+        let world = crate::world::scene::synthetic_scene();
+        let mut cam = Camera::new();
+        cam.frame_scene(&world);
+        let framed = cam.radius;
+        assert!(
+            cam.radius_max >= framed * 1.25 - 1e-4,
+            "radius_max ({}) must be lifted to >= framed*1.25 ({}); RV3 invariant",
+            cam.radius_max,
+            framed * 1.25
+        );
+        // ALSO must be at least the static MAX_RADIUS — never below the
+        // small-scene safe ceiling.
+        assert!(
+            cam.radius_max >= MAX_RADIUS,
+            "radius_max ({}) must never drop below the static MAX_RADIUS ({MAX_RADIUS})",
+            cam.radius_max
+        );
+    }
+
+    /// User can now zoom OUT past the static MAX_RADIUS after framing a
+    /// large scene — the original failure mode. This is the user-facing
+    /// observable: "I can zoom back to the original distance and then some
+    /// for an overview view".
+    #[test]
+    fn zoom_out_reaches_lifted_ceiling_on_large_scene() {
+        let world = crate::world::scene::synthetic_scene();
+        let mut cam = Camera::new();
+        cam.frame_scene(&world);
+        let lifted_max = cam.radius_max;
+        assert!(
+            lifted_max > MAX_RADIUS,
+            "test precondition: synthetic scene must lift radius_max above static MAX"
+        );
+        // Pull the user all the way in then nudge-out 10000 steps — clamp
+        // must land at lifted_max, NOT static MAX_RADIUS.
+        cam.radius = MIN_RADIUS;
+        for _ in 0..10_000 {
+            cam.nudge_zoom(ZOOM_STEP);
+        }
+        assert!(
+            (cam.radius - lifted_max).abs() < 1e-4,
+            "after a full pull-out, radius should clamp at lifted_max ({lifted_max}), got {}",
+            cam.radius
+        );
+    }
+
+    /// Verify-frame helper: write a 10-step zoom-walk trace (radius before
+    /// each step) to /tmp/v504-rv3-zoom-walk.txt so the human-verify
+    /// checkpoint has a numeric artifact proving symmetry. Run this test
+    /// with `--ignored` (off by default to keep the test suite hermetic).
+    #[test]
+    #[ignore = "writes a file under /tmp; run on demand via --ignored for human verify"]
+    fn rv3_writes_zoom_walk_trace() {
+        use std::io::Write;
+        let world = crate::world::scene::synthetic_scene();
+        let mut cam = Camera::new();
+        cam.frame_scene(&world);
+        let framed = cam.radius;
+        let max = cam.radius_max;
+        let min = cam.radius_min;
+        let mut f = std::fs::File::create("/tmp/v504-rv3-zoom-walk.txt").unwrap();
+        writeln!(
+            f,
+            "RV3 zoom symmetry verify\n\
+             ============================\n\
+             initial framed radius (braille cell_aspect=2.0): {framed:.6}\n\
+             radius_max (lifted)                            : {max:.6}\n\
+             radius_min                                     : {min:.6}\n\
+             static MAX_RADIUS                              : {MAX_RADIUS}\n\
+             static MIN_RADIUS                              : {MIN_RADIUS}\n\
+             ZOOM_STEP                                      : {ZOOM_STEP}\n",
+        )
+        .unwrap();
+        writeln!(f, "step  direction  radius_before    radius_after").unwrap();
+        for i in 0..10 {
+            let before = cam.radius;
+            cam.nudge_zoom(-ZOOM_STEP);
+            writeln!(f, "{:>4}   IN         {:>12.6}    {:>12.6}", i, before, cam.radius).unwrap();
+        }
+        for i in 0..10 {
+            let before = cam.radius;
+            cam.nudge_zoom(ZOOM_STEP);
+            writeln!(f, "{:>4}   OUT        {:>12.6}    {:>12.6}", i, before, cam.radius).unwrap();
+        }
+        writeln!(
+            f,
+            "\nfinal radius after 10-in/10-out: {:.6}\n\
+             delta from initial framing      : {:.6e}\n\
+             PASS (within 1e-4): {}",
+            cam.radius,
+            cam.radius - framed,
+            (cam.radius - framed).abs() < 1e-4
+        )
+        .unwrap();
+    }
+
+    /// `frame_scene` lifts the ceiling UP-ONLY: re-framing a smaller scene
+    /// later must NOT shrink the user's zoom window. Once the user has been
+    /// allowed to zoom out to X, they keep that range even if a container
+    /// disappears and the rack shrinks.
+    #[test]
+    fn frame_scene_never_shrinks_radius_max() {
+        let world = crate::world::scene::synthetic_scene();
+        let mut cam = Camera::new();
+        cam.frame_scene(&world);
+        let after_big = cam.radius_max;
+
+        // Now frame a tiny scene (single entity). The static fallback for
+        // empty entities would set radius = DEFAULT_RADIUS and the lift
+        // would compute DEFAULT_RADIUS*1.25 = 7.5 — well below after_big.
+        // The ceiling must stay at after_big.
+        use crate::world::scene::SceneBounds;
+        use crate::world::{Entity, World};
+        use crate::theme::Status;
+        let tiny = World {
+            entities: vec![Entity {
+                id: 1,
+                position: glam::Vec3::ZERO,
+                half_extents: glam::Vec3::splat(0.1),
+                status: Status::Running,
+                group: 0,
+            }],
+            bounds: SceneBounds::from_entities(&[]),
+        };
+        cam.frame_scene(&tiny);
+        assert!(
+            cam.radius_max >= after_big - 1e-4,
+            "re-framing a smaller scene must NOT shrink radius_max ({}) below the previous lift ({after_big})",
+            cam.radius_max
         );
     }
 
