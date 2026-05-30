@@ -92,7 +92,6 @@ async fn main() -> Result<()> {
             std::process::exit(1);
         }
     };
-    let _ = config; // 05-04 removes this stub when App / run_kitty consume the config.
 
     // ROB-01 / PITFALLS Pitfall 9: probe the Docker daemon BEFORE entering raw
     // mode (Tui::enter for braille, enable_raw_mode inside run_kitty for kitty).
@@ -230,11 +229,11 @@ async fn main() -> Result<()> {
         // (Effect::SpawnInspect) schedule onto the SAME runtime the producer
         // task already runs on.
         let handle = tokio::runtime::Handle::current();
-        kitty::run_kitty(docker_for_render, tx_for_inspect, rx, handle)
+        kitty::run_kitty(docker_for_render, tx_for_inspect, rx, handle, config)
     } else {
         let mut tui = Tui::new()?;
         tui.enter()?;
-        let mut app = App::with_docker(docker_for_render, tx_for_inspect, rx);
+        let mut app = App::with_docker(docker_for_render, tx_for_inspect, rx, config);
         let r = app.run(&mut tui).await;
         // Always restore on the clean-exit path too, regardless of run() result.
         tui.exit()?;

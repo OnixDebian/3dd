@@ -39,7 +39,10 @@ pub fn view(frame: &mut Frame, app: &mut App) {
     let scene_area = chunks[0];
     let status_area = chunks[1];
 
-    let palette = crate::theme::Palette::default();
+    // Hot-swappable palette read from `app.palette` (05-04 THEME-04). The
+    // field is `Copy` (see src/theme/mod.rs Palette derive) so the byte
+    // copy here is trivial. Cycled at runtime by Effect::CyclePalette.
+    let palette = app.palette;
 
     if app.world.entities.is_empty() {
         // Zero containers: render a centered banner instead of an empty scene.

@@ -1110,6 +1110,7 @@ pub fn run_kitty(
     tx_for_inspect: UnboundedSender<DockerMsg>,
     mut docker_rx: UnboundedReceiver<DockerMsg>,
     handle: Handle,
+    config: crate::config::AppConfig,
 ) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -1117,7 +1118,25 @@ pub fn run_kitty(
     write!(stdout, "\x1b[2J")?; // clear screen
     stdout.flush()?;
 
-    let palette = Palette::default();
+    // Resolve initial palette from config.palette. Unknown name falls back
+    // to notion-soft AND rewrites palette_name so the cycle's .position()
+    // lookup can find the current slot (mirrors App::with_docker; see that
+    // method's doc comment for the broader rationale). `mut` because
+    // runtime cycling via Effect::CyclePalette swaps both fields in place.
+    let (mut palette, mut palette_name) = match crate::theme::Palette::by_name(&config.palette) {
+        Some(p) => (p, config.palette.clone()),
+        None => {
+            eprintln!(
+                "config: unknown palette '{}', falling back to notion-soft",
+                config.palette
+            );
+            (crate::theme::Palette::notion_soft(), "notion-soft".to_string())
+        }
+    };
+    // `config` is currently consumed only for `palette` in this plan;
+    // 05-05 / 05-06 will read `auto_degrade`, `degraded_fps_cap`,
+    // `force_mode`, `hud_visible` from it here.
+    let _config = config;
     // Live reconciler + an initially empty World. The banner kicks in until
     // the first `Added` from the producer lands; `render_rgba` is never called
     // on an empty entity set.
@@ -1170,6 +1189,24 @@ pub fn run_kitty(
                     );
                     match effect {
                         Effect::Quit => break,
+                        Effect::CyclePalette => {
+                            // Mirror App::next_palette logic. The cycle order
+                            // is the same in both backends — keep it in sync.
+                            // Helper kept local to avoid a hard dep from
+                            // kitty.rs on App's method.
+                            let mut order: Vec<&str> =
+                                vec!["notion-soft", "cyberpunk-neon", "terminal-green"];
+                            if crate::theme::Palette::from_omarchy().is_some() {
+                                order.push("omarchy");
+                            }
+                            let cur = order
+                                .iter()
+                                .position(|n| *n == palette_name.as_str())
+                                .unwrap_or(0);
+                            let next = order[(cur + 1) % order.len()];
+                            palette = crate::theme::Palette::by_name_or_default(next);
+                            palette_name = next.to_string();
+                        }
                         Effect::SpawnInspect(id) => {
                             // 04-06b: off-thread inspect via the tokio runtime
                             // Handle (run_kitty is sync but lives inside
@@ -1438,7 +1475,7 @@ pub fn run_kitty(
             let mode = if camera.autopilot_active { "auto" } else { "manual" };
             write!(
                 stdout,
-                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | boxes: {boxes} | mode: {mode} | kitty | arrows orbit, Tab select, q to quit"
+                "\x1b[{rows};1H\x1b[2K3dd | fps: {fps:.0} | size: {cols}x{rows} | boxes: {boxes} | mode: {mode} | palette: {palette_name} | kitty | P palette, Tab select, q quit"
             )?;
             stdout.flush()?;
 

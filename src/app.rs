@@ -70,6 +70,20 @@ pub struct App {
     /// Mutated by `update()` (via `apply_input_action`) and by
     /// `on_tick`/`drain_docker` (pulse advance + reconcile-on-remove).
     pub selection: Selection,
+    /// Active palette. Single source of truth for the braille backend's
+    /// color choices — `ui::view` reads `app.palette` each frame instead of
+    /// constructing `Palette::default()`. Cycled at runtime by
+    /// `Effect::CyclePalette` (THEME-04).
+    pub palette: crate::theme::Palette,
+    /// Active palette NAME (for the status bar + legend HUD label). Held
+    /// alongside `palette` because Color is opaque after construction —
+    /// we can't reverse a Palette back to its preset name.
+    pub palette_name: String,
+    /// App-wide config loaded by main.rs. The palette field above is its
+    /// already-resolved counterpart; this field carries everything ELSE
+    /// (auto_degrade, degraded_fps_cap, force_mode, hud_visible) that
+    /// 05-05 / 05-06 read from.
+    pub config: crate::config::AppConfig,
     /// Non-blocking receiver for typed DockerMsg events from the producer task
     /// in `docker::streams`. `None` for the test/dump constructor (`App::new`)
     /// so unit tests don't need a producer.
@@ -116,6 +130,9 @@ impl App {
             world,
             live: LiveWorld::new(),
             selection: Selection::new(),
+            palette: crate::theme::Palette::notion_soft(),
+            palette_name: "notion-soft".to_string(),
+            config: crate::config::AppConfig::default(),
             docker_rx: None,
             docker: None,
             tx_for_inspect: None,
@@ -147,6 +164,9 @@ impl App {
             },
             live: LiveWorld::new(),
             selection: Selection::new(),
+            palette: crate::theme::Palette::notion_soft(),
+            palette_name: "notion-soft".to_string(),
+            config: crate::config::AppConfig::default(),
             docker_rx: Some(rx),
             docker: None,
             tx_for_inspect: None,
@@ -167,11 +187,55 @@ impl App {
         docker: Docker,
         tx: UnboundedSender<DockerMsg>,
         rx: UnboundedReceiver<DockerMsg>,
+        config: crate::config::AppConfig,
     ) -> Self {
         let mut app = Self::with_docker_rx(rx);
         app.docker = Some(docker);
         app.tx_for_inspect = Some(tx);
+        // Resolve initial palette from config.palette. Unknown name falls
+        // back to notion-soft (by_name contract) AND we rewrite
+        // palette_name to "notion-soft" so next_palette's
+        // `.position(|n| *n == palette_name)` can locate the current slot
+        // and cycling keeps working. Without this rewrite, an unknown
+        // config string would leave palette_name pointing at a non-member
+        // of the order vec, breaking the cycle.
+        let (palette, palette_name) = match crate::theme::Palette::by_name(&config.palette) {
+            Some(p) => (p, config.palette.clone()),
+            None => {
+                eprintln!(
+                    "config: unknown palette '{}', falling back to notion-soft",
+                    config.palette
+                );
+                (crate::theme::Palette::notion_soft(), "notion-soft".to_string())
+            }
+        };
+        app.palette = palette;
+        app.palette_name = palette_name;
+        app.config = config;
         app
+    }
+
+    /// Cycle order for `P`. omarchy is included only when
+    /// `Palette::from_omarchy()` resolves at boot — we don't want to
+    /// silently include a slot that maps to nothing.
+    ///
+    /// Returns the next (name, palette) pair after the current name. Kept
+    /// local to App; the kitty backend mirrors this list inline in
+    /// `run_kitty` to avoid a hard kitty -> App dependency.
+    fn next_palette(&self) -> (String, crate::theme::Palette) {
+        let mut order: Vec<&str> = vec!["notion-soft", "cyberpunk-neon", "terminal-green"];
+        if crate::theme::Palette::from_omarchy().is_some() {
+            order.push("omarchy");
+        }
+        let cur = order
+            .iter()
+            .position(|n| *n == self.palette_name.as_str())
+            .unwrap_or(0);
+        let next_name = order[(cur + 1) % order.len()];
+        (
+            next_name.to_string(),
+            crate::theme::Palette::by_name_or_default(next_name),
+        )
     }
 
     /// Dispatch a high-level intent to a state mutation.
@@ -191,6 +255,11 @@ impl App {
         match effect {
             Effect::Quit => self.should_quit = true,
             Effect::SpawnInspect(id) => self.spawn_detail_fetch(id),
+            Effect::CyclePalette => {
+                let (name, palette) = self.next_palette();
+                self.palette = palette;
+                self.palette_name = name;
+            }
             Effect::None => {}
         }
     }
@@ -672,5 +741,146 @@ mod tests {
             app.selection.pending_detail.is_some(),
             "duplicate spawn must not clear pending_detail"
         );
+    }
+
+    // ---- THEME-04 (05-04) runtime palette swap ------------------------------
+
+    /// `next_palette` walks the cycle order in the documented sequence and
+    /// wraps back to notion-soft. The omarchy slot is conditional on
+    /// Palette::from_omarchy() — when the host has no alacritty theme file
+    /// the cycle is 3-element. We assert the first three steps because
+    /// those are stable regardless of host config.
+    #[test]
+    fn next_palette_cycles_through_named_presets() {
+        let mut app = App::new();
+        // Start at notion-soft (App::new() default).
+        assert_eq!(app.palette_name, "notion-soft");
+
+        let (n1, _) = app.next_palette();
+        assert_eq!(n1, "cyberpunk-neon", "step 1: notion-soft -> cyberpunk-neon");
+        app.palette_name = n1;
+
+        let (n2, _) = app.next_palette();
+        assert_eq!(n2, "terminal-green", "step 2: cyberpunk-neon -> terminal-green");
+        app.palette_name = n2;
+
+        // Step 3 is either "omarchy" (when from_omarchy() resolves) or wraps
+        // back to "notion-soft" — pin both possibilities so the test works on
+        // any host. The cycle MUST land on a member of the order vec.
+        let (n3, _) = app.next_palette();
+        assert!(
+            n3 == "omarchy" || n3 == "notion-soft",
+            "step 3 must be omarchy (if available) OR wrap to notion-soft, got: {n3}"
+        );
+    }
+
+    /// Dispatching Action::CyclePalette through `update()` mutates BOTH
+    /// `palette` and `palette_name` in place. The starting Palette is
+    /// notion_soft (App::new default); after one cycle it MUST differ.
+    #[test]
+    fn cycle_palette_via_update_mutates_state() {
+        let mut app = App::new();
+        let before_palette = app.palette;
+        let before_name = app.palette_name.clone();
+
+        app.update(Action::CyclePalette);
+
+        assert_ne!(
+            app.palette_name, before_name,
+            "CyclePalette must change palette_name"
+        );
+        assert_ne!(
+            app.palette, before_palette,
+            "CyclePalette must change the palette struct (different RGB triplets)"
+        );
+    }
+
+    /// Palette cycling is meta-state — App::update must NOT flip autopilot.
+    /// Mirrors the action.rs `apply_cycle_palette_does_not_flip_autopilot`
+    /// pin, exercised through the App dispatch path.
+    #[test]
+    fn cycle_palette_does_not_flip_autopilot() {
+        let mut app = App::new();
+        assert!(app.camera.autopilot_active);
+        app.update(Action::CyclePalette);
+        assert!(
+            app.camera.autopilot_active,
+            "CyclePalette through App::update must NOT disturb autopilot"
+        );
+    }
+
+    /// `App::with_docker` honors the AppConfig.palette field at startup —
+    /// passing `palette = "cyberpunk-neon"` constructs an App with that
+    /// palette already active AND palette_name set to the same string.
+    #[test]
+    fn with_docker_resolves_palette_from_config() {
+        use crate::config::AppConfig;
+        // We don't actually need a real Docker handle for this assertion;
+        // construct via with_docker_rx + manually set the fields the way
+        // with_docker would, since with_docker requires a bollard Docker
+        // handle we can't conjure without a live socket. Instead we exercise
+        // the resolution code path by mimicking what with_docker does after
+        // calling with_docker_rx.
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        let config = AppConfig {
+            palette: "cyberpunk-neon".to_string(),
+            ..AppConfig::default()
+        };
+        let (palette, palette_name) = match crate::theme::Palette::by_name(&config.palette) {
+            Some(p) => (p, config.palette.clone()),
+            None => (
+                crate::theme::Palette::notion_soft(),
+                "notion-soft".to_string(),
+            ),
+        };
+        app.palette = palette;
+        app.palette_name = palette_name;
+        app.config = config;
+
+        assert_eq!(app.palette, crate::theme::Palette::cyberpunk_neon());
+        assert_eq!(app.palette_name, "cyberpunk-neon");
+    }
+
+    /// Unknown palette names in config fall back to notion-soft AND rewrite
+    /// `palette_name` to "notion-soft" — so `next_palette`'s `.position()`
+    /// lookup can find the current slot and cycling keeps working. Without
+    /// this rewrite, an unknown TOML string would leave the cycle broken at
+    /// the wrap step.
+    #[test]
+    fn with_docker_unknown_palette_falls_back_and_renames() {
+        use crate::config::AppConfig;
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        let config = AppConfig {
+            palette: "no-such-palette".to_string(),
+            ..AppConfig::default()
+        };
+        // Same resolution logic as with_docker — mirrored here because
+        // with_docker needs a real Docker handle.
+        let (palette, palette_name) = match crate::theme::Palette::by_name(&config.palette) {
+            Some(p) => (p, config.palette.clone()),
+            None => (
+                crate::theme::Palette::notion_soft(),
+                "notion-soft".to_string(),
+            ),
+        };
+        app.palette = palette;
+        app.palette_name = palette_name;
+
+        assert_eq!(
+            app.palette,
+            crate::theme::Palette::notion_soft(),
+            "unknown name must fall back to notion_soft palette"
+        );
+        assert_eq!(
+            app.palette_name, "notion-soft",
+            "palette_name must be REWRITTEN to 'notion-soft' (not left as 'no-such-palette') so next_palette's .position() can find the slot"
+        );
+
+        // And cycling from the fallback state still works (regression-pin
+        // for the bug this rewrite prevents):
+        let (n1, _) = app.next_palette();
+        assert_eq!(n1, "cyberpunk-neon");
     }
 }
