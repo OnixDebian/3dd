@@ -40,6 +40,129 @@ use crate::world::{DockerMsg, LiveWorld, World};
 /// is plain box-filtered MSAA (no braille constraints).
 const SS: usize = 2;
 
+/// The four mutually-exclusive paths the kitty render loop can take per frame.
+///
+/// Returned by [`compute_kitty_render_decision`]. The loop body matches on the
+/// variant and either: renders the live or cached World as an RGBA image
+/// (`LiveWorld` / `CachedWorld`), writes the empty-state banner text
+/// (`Banner`), or paints only the screen-clear + status bar with NO banner
+/// text and NO image (`ChromeOnly`).
+///
+/// **The `ChromeOnly` variant fixes the RV6 cold-start banner-bypass bug.**
+///
+/// Pre-RV6, the kitty loop conflated two distinct empty-world cases into the
+/// same "render_target.is_none() -> paint banner" branch:
+///
+/// 1. *Stable empty* (debounce satisfied / first-launch and grace expired) —
+///    the legitimate banner case (Phase 3 criterion #5).
+/// 2. *Cold-start race* (process just launched, `frames_since_start <
+///    KITTY_STARTUP_GRACE_FRAMES`, no DockerMsg has been drained yet, cache
+///    is `None`) — the RV5 grace gate computed `show_banner=false` here, but
+///    the next-step `render_target` selector returned `None` because the
+///    cache was empty, and the loop body painted the banner ANYWAY.
+///
+/// The user-reported ~100 ms flicker in kitty after RV1-RV5 was this exact
+/// bypass: the App-side `should_show_empty_banner()` invariant was honored in
+/// the braille view (`ui::view` falls through to a bordered "scene" block with
+/// no banner text when the cache is empty during the grace), but the kitty
+/// path's parallel state machine was missing the equivalent fall-through.
+///
+/// `ChromeOnly` makes that fall-through explicit: the kitty path issues
+/// `\x1b[2J\x1b[H` to clear the surface but writes NOTHING into the scene
+/// region. The status bar still paints on the reserved bottom row (it lives
+/// downstream of every branch), so the user sees only "3dd | fps: ... | mode:
+/// ... | palette: ..." until the bollard seed lands and the first non-empty
+/// world clones into the cache.
+///
+/// Field semantics on the variants:
+/// - `LiveWorld` is taken when the live world has entities — normal hot path.
+/// - `CachedWorld` is taken when the live world is empty BUT the cache is
+///   populated AND the banner is suppressed — RV4 debounce path, holds the
+///   previous frame's geometry frozen.
+/// - `Banner` is taken when the banner is allowed AND the world is empty.
+/// - `ChromeOnly` is the cold-start fall-through: world empty, banner
+///   suppressed, cache empty.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KittyRenderDecision {
+    /// Render the live World as an RGBA image (normal path, world non-empty).
+    LiveWorld,
+    /// Render the cached `last_non_empty_world_kitty` as RGBA (debounce path
+    /// during a transient empty, after `non_empty_seen_once` flipped true).
+    CachedWorld,
+    /// Write the `EMPTY_BANNER` text centered in the scene area (Phase 3
+    /// criterion #5: stable-empty daemon must surface the message).
+    Banner,
+    /// Clear the screen + paint the status bar only — NO banner text, NO
+    /// scene image. The cold-start fall-through during the grace window
+    /// before bollard's seed has drained; this is the path that closes the
+    /// RV6 banner-bypass and eliminates the residual ~100 ms flicker.
+    ChromeOnly,
+}
+
+/// Pure decision function for the kitty render branch. Takes ONLY the state
+/// scalars the per-frame loop tracks; returns which path to take.
+///
+/// Extracted as a pure function so it can be unit-tested without spinning up
+/// the full `run_kitty` loop (which depends on a tokio runtime, crossterm raw
+/// mode, kitty graphics protocol output, bollard, and the docker mpsc
+/// channels). The single-state-machine invariant is now expressible as
+/// table-driven tests against this one function.
+///
+/// Invariants pinned by tests:
+///
+/// - **Cold-start frame 0 with no cache → `ChromeOnly`.** This is the RV6
+///   fix. The pre-RV6 loop returned (effectively) `Banner` here and the
+///   banner flickered for ~100 ms until bollard's seed landed.
+/// - **Live non-empty world → `LiveWorld`.** Always overrides everything;
+///   even during the grace window, a populated world renders immediately.
+/// - **Live empty + cache populated + banner suppressed → `CachedWorld`.**
+///   The RV4 debounce path: the last seen geometry holds while the daemon
+///   settles a transient empty.
+/// - **Live empty + banner allowed → `Banner`.** Stable-empty or
+///   post-grace-with-never-seen path; Phase 3 criterion #5.
+/// - **Live empty + banner suppressed + cache empty → `ChromeOnly`.** The
+///   cold-start fall-through, plus any rare edge where the cache somehow
+///   stays empty after the grace (defensive — should not happen in practice
+///   because `should_show_empty_banner` would have returned true).
+///
+/// Mirrors `App::should_show_empty_banner` + `App::effective_world_for_view`
+/// from the braille backend. The two backends now follow the SAME state
+/// machine.
+pub(crate) fn compute_kitty_render_decision(
+    world_empty_now: bool,
+    non_empty_seen_once: bool,
+    empty_streak_frames: u32,
+    frames_since_start: u32,
+    has_cached_world: bool,
+    debounce_frames: u32,
+    grace_frames: u32,
+) -> KittyRenderDecision {
+    // Live non-empty wins immediately, regardless of any timer.
+    if !world_empty_now {
+        return KittyRenderDecision::LiveWorld;
+    }
+    // World is empty. Compute whether the banner is allowed THIS frame.
+    let in_startup_grace = frames_since_start < grace_frames;
+    let show_banner = !in_startup_grace
+        && (!non_empty_seen_once || empty_streak_frames >= debounce_frames);
+    if show_banner {
+        // Stable empty (post-grace + never-seen, OR post-grace + sustained
+        // empty for debounce_frames). Phase 3 criterion #5.
+        return KittyRenderDecision::Banner;
+    }
+    // Banner is suppressed (in grace, or non_empty_seen_once and within the
+    // debounce window). If we have a cached non-empty world, use it.
+    if has_cached_world {
+        return KittyRenderDecision::CachedWorld;
+    }
+    // Banner suppressed AND no cache — the cold-start race. Paint chrome
+    // only; the bollard seed will drain within ~1 s and either populate the
+    // cache (→ CachedWorld next frame) or expire the grace (→ Banner once
+    // we're sure the daemon truly is empty). No flicker because no banner
+    // text is emitted here.
+    KittyRenderDecision::ChromeOnly
+}
+
 /// Half-thickness (in SUPERSAMPLED pixels) of wireframe edges in the kitty path.
 /// Chosen so the SS-downsampled line reads as ~1.5 output-pixels wide — thin
 /// enough that a dense wireframe (many stopped containers) doesn't visually
@@ -1168,14 +1291,24 @@ pub fn run_kitty(
     //
     // RV2 introduced the debounce at 6 frames (~200 ms). RV4 bumped to
     // 30 frames (~1000 ms) AND added the `last_non_empty_world_kitty`
-    // cache. RV5 bumps the debounce window to 150 frames (~5000 ms at
-    // ~30 FPS) AND adds the cold-start grace: the banner is unconditionally
+    // cache. RV5 bumped the debounce window to 150 frames (~5000 ms at
+    // ~30 FPS) AND added the cold-start grace: the banner is unconditionally
     // suppressed for the first `KITTY_STARTUP_GRACE_FRAMES` (~1 s) of
-    // process life regardless of `non_empty_seen_once`. This fixes the
-    // ~100 ms launch flicker the user reported — bollard's
-    // `list_containers` seed lands at t~80-150 ms; before that, the
-    // pre-RV5 kitty loop painted the banner for the first 1-3 frames
-    // before any Added drained.
+    // process life regardless of `non_empty_seen_once`.
+    //
+    // RV5 was INCOMPLETE: the gate computed `show_banner=false` during the
+    // grace, but the next-step `render_target` selector returned `None`
+    // (because the cache is also empty during cold start), and the loop
+    // body's `if render_target.is_none()` branch painted the banner ANYWAY.
+    // The user observed the same flicker after the RV5 binary shipped.
+    //
+    // RV6 closes the bypass by extracting the decision into a pure
+    // `compute_kitty_render_decision` function that returns one of FOUR
+    // explicit variants (LiveWorld / CachedWorld / Banner / ChromeOnly).
+    // The ChromeOnly variant is the cold-start fall-through: world empty,
+    // banner suppressed, cache empty -> paint only the status bar, NO
+    // banner text. This mirrors the braille `ui::view` path that draws a
+    // bordered "scene" block (no banner text) in the same situation.
     //
     // `non_empty_seen_once` is sticky after the first non-empty world;
     // after the grace expires, if it's STILL false the banner shows
@@ -1377,46 +1510,35 @@ pub fn run_kitty(
                 empty_streak_frames = 0;
                 last_non_empty_world_kitty = Some(world.clone());
             }
-            // RV5 banner gate (mirrors `App::should_show_empty_banner`):
-            //   (1) During the cold-start grace, the banner is suppressed
-            //       regardless of other state.
-            //   (2) After the grace, the banner shows if the daemon has
-            //       never spoken about a container (criterion #5) OR the
-            //       world has been stably empty for >= the (RV5-bumped)
-            //       debounce window.
-            let in_startup_grace = frames_since_start < KITTY_STARTUP_GRACE_FRAMES;
-            let show_banner = world_empty_now
-                && !in_startup_grace
-                && (!non_empty_seen_once
-                    || empty_streak_frames >= KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES);
+            // RV6 render decision (single state-machine, mirrors
+            // `App::should_show_empty_banner` + `App::effective_world_for_view`).
+            // Extracted into a pure function so the cold-start fall-through
+            // (`ChromeOnly`) is unit-testable without standing up the full
+            // kitty render loop. See `KittyRenderDecision` rustdoc for the
+            // four cases and the rationale for the RV6 fix.
+            let decision = compute_kitty_render_decision(
+                world_empty_now,
+                non_empty_seen_once,
+                empty_streak_frames,
+                frames_since_start,
+                last_non_empty_world_kitty.is_some(),
+                KITTY_EMPTY_BANNER_DEBOUNCE_FRAMES,
+                KITTY_STARTUP_GRACE_FRAMES,
+            );
 
-            // RV4: during the debounce window, render the CACHED world
-            // (frozen at the moment it last had containers) instead of
-            // leaving a blank image surface. Without this, the user sees
-            // the previous image PERSIST (kitty's image protocol keeps
-            // the last emit until delete_all), which is OK for the first
-            // frame post-empty but quickly breaks because subsequent
-            // re-emits at 30 FPS need SOMETHING to draw — the pre-RV4
-            // code just skipped the image branch entirely and the
-            // terminal cell-grid status-bar / popup writes painted over
-            // parts of the held image, producing visual debris.
-            //
-            // Branch order:
-            // (a) show_banner==true   -> banner path (first launch or stable empty)
-            // (b) world_empty_now && cache exists -> render the cached world
-            // (c) world_empty_now && no cache (first launch race) -> banner
-            // (d) live non-empty -> normal render
-            let render_target: Option<&World> = if !world_empty_now {
-                Some(&world)
-            } else if !show_banner {
-                last_non_empty_world_kitty.as_ref()
-            } else {
-                None
+            // Pick the World reference (if any) we'll feed to render_rgba.
+            // `LiveWorld` → live `&world`, `CachedWorld` → cached snapshot,
+            // `Banner` / `ChromeOnly` → no scene draw at all.
+            let render_target: Option<&World> = match decision {
+                KittyRenderDecision::LiveWorld => Some(&world),
+                KittyRenderDecision::CachedWorld => last_non_empty_world_kitty.as_ref(),
+                KittyRenderDecision::Banner | KittyRenderDecision::ChromeOnly => None,
             };
 
-            if render_target.is_none() {
+            if decision == KittyRenderDecision::Banner {
                 // Stable empty (debounce satisfied OR first launch never
-                // had containers) — banner path.
+                // had containers AND grace expired). Banner path — Phase 3
+                // criterion #5.
                 if !last_was_empty {
                     delete_all(&mut stdout)?;
                     last_was_empty = true;
@@ -1432,6 +1554,22 @@ pub fn run_kitty(
                 };
                 let banner_row = (rows / 2).max(1);
                 write!(stdout, "\x1b[{banner_row};{banner_col}H{banner}")?;
+            } else if decision == KittyRenderDecision::ChromeOnly {
+                // RV6 cold-start fall-through. World is empty, banner is
+                // suppressed (grace active or debounce within window), and
+                // we have no cached frame to render. Paint ONLY the screen
+                // clear — the status bar at the loop tail still draws on
+                // the reserved bottom row, but no banner text and no scene
+                // image flashes between launch and the first DockerMsg.
+                //
+                // This is the symmetric mirror of the braille `ui::view`
+                // path that falls through to a bordered "scene" block when
+                // `effective_world.is_empty() && !should_show_empty_banner()`.
+                if !last_was_empty {
+                    delete_all(&mut stdout)?;
+                    last_was_empty = true;
+                }
+                write!(stdout, "\x1b[2J\x1b[H")?;
             } else if let Some(target) = render_target {
                 let view = camera.view_params(DEFAULT_FOV);
                 // 04-04 extras: build floor-planes + port lookup PER FRAME
@@ -2361,6 +2499,205 @@ mod tests {
         assert_eq!(rgba.len(), w * h * 4);
         for px in rgba.chunks_exact(4) {
             assert_eq!((px[0], px[1], px[2]), bg, "non-background pixel in empty scene");
+        }
+    }
+
+    // ===== 05-04-RV6: kitty banner state-machine regression tests =====
+    //
+    // These tests pin the bypass the user kept hitting after RV1-RV5. The
+    // pre-RV6 kitty loop conflated "stable empty" (banner allowed) with
+    // "cold-start race" (banner suppressed by grace but cache also empty)
+    // into the same `render_target.is_none()` branch, which always painted
+    // the banner text. The fix extracted `compute_kitty_render_decision`
+    // returning one of four explicit variants; these tests pin all four
+    // variants AND the legacy bypass case that was the actual bug.
+
+    /// RV6 BUG CASE PINNED: frame 0 of process life, no DockerMsg yet
+    /// drained, cache is `None`, world is empty. The decision MUST be
+    /// `ChromeOnly`, NOT `Banner`. This is the exact frame the user saw
+    /// flicker on the kitty launch — pre-RV6 the code returned a logical
+    /// equivalent of `Banner` here.
+    #[test]
+    fn rv6_cold_start_frame_zero_no_cache_is_chrome_only() {
+        let decision = compute_kitty_render_decision(
+            /* world_empty_now    */ true,
+            /* non_empty_seen     */ false,
+            /* empty_streak       */ 0,
+            /* frames_since_start */ 0,
+            /* has_cache          */ false,
+            /* debounce_frames    */ 150,
+            /* grace_frames       */ 30,
+        );
+        assert_eq!(
+            decision,
+            KittyRenderDecision::ChromeOnly,
+            "RV6 cold-start frame 0 (no DockerMsg drained, cache None, grace active) \
+             MUST return ChromeOnly — pre-RV6 this returned Banner and painted the \
+             EMPTY_BANNER text, causing the ~100 ms launch flicker the user reported \
+             across rounds 1-5."
+        );
+    }
+
+    /// Every frame across the entire startup-grace window with no
+    /// container ever observed must return `ChromeOnly`. This pins the
+    /// "no banner during the grace, EVER, even on the boundary" invariant.
+    #[test]
+    fn rv6_all_grace_frames_are_chrome_only_when_cache_empty() {
+        const GRACE: u32 = 30;
+        for frame in 0..GRACE {
+            let decision = compute_kitty_render_decision(
+                true, false, frame, frame, false, 150, GRACE,
+            );
+            assert_eq!(
+                decision,
+                KittyRenderDecision::ChromeOnly,
+                "frame {frame} of {GRACE}-frame grace returned {decision:?}, expected ChromeOnly"
+            );
+        }
+    }
+
+    /// After the grace expires AND no container has ever appeared, the
+    /// banner must finally show. This preserves Phase 3 criterion #5
+    /// (a daemon with zero containers gets its banner, just delayed).
+    #[test]
+    fn rv6_post_grace_never_seen_shows_banner() {
+        let decision = compute_kitty_render_decision(
+            /* world_empty_now    */ true,
+            /* non_empty_seen     */ false,
+            /* empty_streak       */ 30,
+            /* frames_since_start */ 30, // exactly at grace boundary
+            /* has_cache          */ false,
+            /* debounce_frames    */ 150,
+            /* grace_frames       */ 30,
+        );
+        assert_eq!(
+            decision,
+            KittyRenderDecision::Banner,
+            "post-grace + never-seen-a-container MUST show the banner (Phase 3 \
+             criterion #5: empty daemon must surface the empty-state message)."
+        );
+    }
+
+    /// Live non-empty world ALWAYS wins, regardless of any timer. This
+    /// pins that a populated daemon at launch never flashes ChromeOnly
+    /// (which would also be perceived as flicker).
+    #[test]
+    fn rv6_live_non_empty_always_renders_live() {
+        // During grace, after grace, with or without cache — all variants
+        // must render LiveWorld when the world has entities.
+        for grace_state in &[0u32, 15, 30, 100, 10_000] {
+            for has_cache in &[true, false] {
+                let decision = compute_kitty_render_decision(
+                    false,
+                    false,
+                    0,
+                    *grace_state,
+                    *has_cache,
+                    150,
+                    30,
+                );
+                assert_eq!(
+                    decision,
+                    KittyRenderDecision::LiveWorld,
+                    "non-empty world at frames_since_start={grace_state}, has_cache={has_cache} \
+                     returned {decision:?}, expected LiveWorld"
+                );
+            }
+        }
+    }
+
+    /// Once the cache is populated (non_empty_seen_once + has_cache),
+    /// a transient empty within the debounce window must render the
+    /// cached world — NOT the banner, NOT ChromeOnly. This is the
+    /// RV4 invariant restated as a unit test on the decision function.
+    #[test]
+    fn rv6_transient_empty_with_cache_uses_cache() {
+        let decision = compute_kitty_render_decision(
+            /* world_empty_now    */ true,
+            /* non_empty_seen     */ true,
+            /* empty_streak       */ 5, // well below debounce
+            /* frames_since_start */ 500, // long past grace
+            /* has_cache          */ true,
+            /* debounce_frames    */ 150,
+            /* grace_frames       */ 30,
+        );
+        assert_eq!(
+            decision,
+            KittyRenderDecision::CachedWorld,
+            "transient empty after first container with cache populated must \
+             render the cached world (RV4 invariant)."
+        );
+    }
+
+    /// After a SUSTAINED empty exceeding the debounce window, the banner
+    /// must show even though we previously saw containers. This pins
+    /// the RV5 debounce-expiration path.
+    #[test]
+    fn rv6_sustained_empty_past_debounce_shows_banner() {
+        let decision = compute_kitty_render_decision(
+            /* world_empty_now    */ true,
+            /* non_empty_seen     */ true,
+            /* empty_streak       */ 150, // at debounce boundary
+            /* frames_since_start */ 1000,
+            /* has_cache          */ true,
+            /* debounce_frames    */ 150,
+            /* grace_frames       */ 30,
+        );
+        assert_eq!(
+            decision,
+            KittyRenderDecision::Banner,
+            "sustained empty past debounce_frames must finally show the \
+             banner — Phase 3 criterion #5 even if a container existed once."
+        );
+    }
+
+    /// The four variants are mutually exclusive and cover the entire
+    /// state space. A property-style sweep over a small grid pins that
+    /// no input combination returns a value the loop body can't handle.
+    /// Also pins that the function is total (never panics).
+    #[test]
+    fn rv6_decision_is_total_over_state_grid() {
+        let debounce = 150u32;
+        let grace = 30u32;
+        for &world_empty in &[true, false] {
+            for &seen in &[true, false] {
+                for &streak in &[0u32, 1, 29, 30, 100, 149, 150, 151, 1_000] {
+                    for &frame in &[0u32, 1, 15, 29, 30, 31, 100, 1_000] {
+                        for &has_cache in &[true, false] {
+                            let d = compute_kitty_render_decision(
+                                world_empty, seen, streak, frame, has_cache, debounce, grace,
+                            );
+                            // Total function — any of the four variants is fine,
+                            // we just need to confirm the call returns and the
+                            // result type is the enum (compiler enforces).
+                            let _ = d;
+                            // Specific invariants:
+                            if !world_empty {
+                                assert_eq!(d, KittyRenderDecision::LiveWorld);
+                            } else if frame < grace {
+                                // In the grace window, the banner must NEVER be
+                                // chosen — that's the whole point of RV5+RV6.
+                                // ChromeOnly / CachedWorld are both fine.
+                                assert_ne!(
+                                    d, KittyRenderDecision::Banner,
+                                    "frame={frame} (in grace) returned Banner — \
+                                     RV6 banner-bypass regression"
+                                );
+                            }
+                            // Specifically: during grace + no cache + empty world
+                            // -> always ChromeOnly. This is the user-reported bug.
+                            if world_empty && frame < grace && !has_cache {
+                                assert_eq!(
+                                    d,
+                                    KittyRenderDecision::ChromeOnly,
+                                    "frame={frame} (grace), no cache, world empty \
+                                     returned {d:?} — RV6 bypass regression"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }
