@@ -74,8 +74,24 @@ impl Default for Palette {
     /// A Notion-soft default: indigo `#5B5BD6` accent for running/glow against a
     /// muted near-black background, with a distinct, legible hue per status.
     ///
-    /// These RGB literals are the ONLY ones in the whole renderer.
+    /// Delegates to [`Palette::notion_soft`] — the single source of truth for
+    /// these RGB literals (THEME-02). Every existing caller that depends on
+    /// `Palette::default()` resolves to the same colors the renderer was tuned
+    /// against in Phases 1–4.
     fn default() -> Self {
+        Self::notion_soft()
+    }
+}
+
+impl Palette {
+    /// Notion-soft (the existing default — see PROJECT.md "design DNA").
+    /// Indigo `#5B5BD6` accent against a muted near-black background. This is
+    /// the palette the renderer was tuned against in Phases 1–4, so it stays
+    /// the [`Default`] for full backward compatibility with snapshot tests.
+    ///
+    /// These RGB literals — together with the other two presets below — are
+    /// the ONLY truecolor literals allowed in the whole renderer (THEME-01).
+    pub fn notion_soft() -> Self {
         Self {
             background: Color::Rgb(0x1A, 0x1A, 0x22), // muted near-black with a faint indigo tint
             edge: Color::Rgb(0x9A, 0x9A, 0xA8),       // soft gray — wireframe color for non-Running
@@ -87,6 +103,63 @@ impl Default for Palette {
             restarting: Color::Rgb(0x4F, 0xA6, 0xE2), // cyan-blue — in flux
             crashed: Color::Rgb(0xE2, 0x5B, 0x5B),    // red — failed
         }
+    }
+
+    /// Cyberpunk-neon: high-contrast magenta / cyan / lime against deep black.
+    /// Reads as "screen of a hacker thriller". Glow is hot magenta; running is
+    /// electric lime; crashed is hazard red-orange. Status colors are pulled
+    /// apart in hue so even at small sizes the lifecycle reads.
+    pub fn cyberpunk_neon() -> Self {
+        Self {
+            background: Color::Rgb(0x0A, 0x06, 0x12), // near-black with purple bias
+            edge: Color::Rgb(0x4A, 0x36, 0x6E),       // muted indigo edge
+            glow: Color::Rgb(0xFF, 0x2D, 0x95),       // hot magenta
+            volume: Color::Rgb(0x00, 0xE5, 0xE5),     // electric cyan
+            running: Color::Rgb(0xC0, 0xFF, 0x33),    // electric lime
+            paused: Color::Rgb(0xFF, 0xC8, 0x00),     // saturated amber
+            stopped: Color::Rgb(0x55, 0x4A, 0x68),    // muted indigo-gray
+            restarting: Color::Rgb(0x00, 0xB4, 0xFF), // bright cyan
+            crashed: Color::Rgb(0xFF, 0x3A, 0x14),    // hazard red-orange
+        }
+    }
+
+    /// Terminal-green: monochrome phosphor green on black, the classic
+    /// VT100 / IBM 3270 look. Status colors stay within the green / amber /
+    /// gray family to preserve the monochrome feel; `crashed` breaks the rule
+    /// (only red — without that break, a crashed container disappears into a
+    /// stopped one).
+    pub fn terminal_green() -> Self {
+        Self {
+            background: Color::Rgb(0x00, 0x0A, 0x00), // CRT black
+            edge: Color::Rgb(0x40, 0x80, 0x40),       // dim green
+            glow: Color::Rgb(0x80, 0xFF, 0xA0),       // bright phosphor
+            volume: Color::Rgb(0x40, 0xA0, 0x40),     // muted green (same family)
+            running: Color::Rgb(0x33, 0xFF, 0x33),    // CRT green
+            paused: Color::Rgb(0xC8, 0xC8, 0x40),     // dim amber-green
+            stopped: Color::Rgb(0x40, 0x60, 0x40),    // dim green-gray
+            restarting: Color::Rgb(0x80, 0xC8, 0x80), // mid green
+            crashed: Color::Rgb(0xFF, 0x40, 0x40),    // red (intentional break)
+        }
+    }
+
+    /// Resolve a palette by name. Unknown names return `None` — the caller
+    /// decides whether to log, error, or silently default. Accepts both the
+    /// human-friendly kebab form (`"cyberpunk-neon"`) and the snake form
+    /// (`"cyberpunk_neon"`) to be forgiving with TOML.
+    pub fn by_name(name: &str) -> Option<Self> {
+        match name.replace('_', "-").as_str() {
+            "notion-soft" => Some(Self::notion_soft()),
+            "cyberpunk-neon" => Some(Self::cyberpunk_neon()),
+            "terminal-green" => Some(Self::terminal_green()),
+            _ => None,
+        }
+    }
+
+    /// Like [`Palette::by_name`] but never `None` — unknown names fall back to
+    /// [`Palette::notion_soft`]. Used by `main.rs` when honoring
+    /// `AppConfig.palette`: a typo'd palette name must never crash the app.
+    pub fn by_name_or_default(name: &str) -> Self {
+        Self::by_name(name).unwrap_or_else(Self::notion_soft)
     }
 }
 
@@ -224,5 +297,135 @@ mod tests {
         let b = Color::Rgb(100, 200, 50);
         assert_eq!(lerp_color(a, b, 0.0), a);
         assert_eq!(lerp_color(a, b, 1.0), b);
+    }
+
+    // -- THEME-02: named palette presets ----------------------------------
+
+    /// Pins backward compatibility for every existing snapshot / visual test:
+    /// `Palette::notion_soft()` MUST return the exact RGB triplets that
+    /// `Default::default()` used to inline before THEME-02 landed.
+    #[test]
+    fn notion_soft_matches_legacy_default() {
+        let p = Palette::notion_soft();
+        assert_eq!(p.background, Color::Rgb(0x1A, 0x1A, 0x22));
+        assert_eq!(p.edge, Color::Rgb(0x9A, 0x9A, 0xA8));
+        assert_eq!(p.glow, Color::Rgb(0x8A, 0x8A, 0xF0));
+        assert_eq!(p.volume, Color::Rgb(0x50, 0x8C, 0x8C));
+        assert_eq!(p.running, Color::Rgb(0x7F, 0xE0, 0x8A));
+        assert_eq!(p.paused, Color::Rgb(0xE2, 0xB1, 0x4F));
+        assert_eq!(p.stopped, Color::Rgb(0x6B, 0x6B, 0x78));
+        assert_eq!(p.restarting, Color::Rgb(0x4F, 0xA6, 0xE2));
+        assert_eq!(p.crashed, Color::Rgb(0xE2, 0x5B, 0x5B));
+    }
+
+    /// `Default::default()` must keep delegating to `notion_soft` — every
+    /// existing call site relies on this for visual continuity.
+    #[test]
+    fn default_equals_notion_soft() {
+        assert_eq!(Palette::default(), Palette::notion_soft());
+    }
+
+    /// Visual distinguishability: each preset's `running` color must differ
+    /// from the other two — running boxes are the dominant signal, and the
+    /// whole point of a preset is for it to read differently.
+    #[test]
+    fn three_presets_have_distinct_running_colors() {
+        let n = Palette::notion_soft().running;
+        let c = Palette::cyberpunk_neon().running;
+        let t = Palette::terminal_green().running;
+        assert_ne!(n, c, "notion_soft and cyberpunk_neon share running color");
+        assert_ne!(n, t, "notion_soft and terminal_green share running color");
+        assert_ne!(c, t, "cyberpunk_neon and terminal_green share running color");
+    }
+
+    /// Visual distinguishability: each preset's `glow` (selection / accent)
+    /// must differ from the other two so the selected-container pulse reads
+    /// as a different color cue per palette.
+    #[test]
+    fn three_presets_have_distinct_glow_colors() {
+        let n = Palette::notion_soft().glow;
+        let c = Palette::cyberpunk_neon().glow;
+        let t = Palette::terminal_green().glow;
+        assert_ne!(n, c, "notion_soft and cyberpunk_neon share glow color");
+        assert_ne!(n, t, "notion_soft and terminal_green share glow color");
+        assert_ne!(c, t, "cyberpunk_neon and terminal_green share glow color");
+    }
+
+    /// Dispatcher contract: every known name resolves to its preset; an
+    /// unknown name returns `None` (caller decides default policy).
+    #[test]
+    fn by_name_matches_each_preset() {
+        assert_eq!(Palette::by_name("notion-soft"), Some(Palette::notion_soft()));
+        assert_eq!(
+            Palette::by_name("cyberpunk-neon"),
+            Some(Palette::cyberpunk_neon())
+        );
+        assert_eq!(
+            Palette::by_name("terminal-green"),
+            Some(Palette::terminal_green())
+        );
+        assert_eq!(Palette::by_name("no-such-palette"), None);
+    }
+
+    /// TOML often uses snake_case; CLI users often type kebab-case. Both
+    /// must resolve to the same preset.
+    #[test]
+    fn by_name_accepts_snake_and_kebab_case() {
+        assert_eq!(
+            Palette::by_name("cyberpunk_neon"),
+            Palette::by_name("cyberpunk-neon")
+        );
+        assert_eq!(
+            Palette::by_name("terminal_green"),
+            Palette::by_name("terminal-green")
+        );
+        assert_eq!(
+            Palette::by_name("notion_soft"),
+            Palette::by_name("notion-soft")
+        );
+    }
+
+    /// `by_name_or_default` never returns `None`: unknown names fall back to
+    /// `notion_soft`. Used by main.rs so a typo'd config value can't crash.
+    #[test]
+    fn by_name_or_default_falls_back_to_notion_soft() {
+        assert_eq!(
+            Palette::by_name_or_default("nope-not-real"),
+            Palette::notion_soft()
+        );
+        assert_eq!(
+            Palette::by_name_or_default("cyberpunk-neon"),
+            Palette::cyberpunk_neon()
+        );
+    }
+
+    /// Truecolor invariant: every preset field must be `Color::Rgb(_,_,_)`.
+    /// The renderer's fog / dim math passes non-RGB colors through unchanged,
+    /// which is wrong — a preset slipping in `Color::Reset` or a 16-color
+    /// named variant would silently break depth shading.
+    #[test]
+    fn every_preset_has_all_fields_as_rgb() {
+        for p in [
+            Palette::notion_soft(),
+            Palette::cyberpunk_neon(),
+            Palette::terminal_green(),
+        ] {
+            for c in [
+                p.background,
+                p.edge,
+                p.glow,
+                p.volume,
+                p.running,
+                p.paused,
+                p.stopped,
+                p.restarting,
+                p.crashed,
+            ] {
+                assert!(
+                    matches!(c, Color::Rgb(_, _, _)),
+                    "preset field is not Color::Rgb: {c:?}"
+                );
+            }
+        }
     }
 }
