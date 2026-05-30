@@ -24,7 +24,7 @@ use std::time::Instant;
 use color_eyre::Result;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::action::{apply_input_action, Action, Effect};
+use crate::action::{apply_input_action, coalesce_actions, Action, Effect};
 use crate::camera::{Camera, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::docker::Docker;
@@ -391,11 +391,23 @@ impl App {
             // applied immediately; Render is COALESCED to a single draw at the end.
             // This keeps the loop responsive to quit keys even if a heavy frame let
             // a backlog build up — we never render the backlog frame-by-frame.
+            //
+            // 05-04-RV1 (release-stops-input fix): KEY actions are collected,
+            // then `coalesce_actions` collapses repeats before dispatch. A
+            // user holding P or W for 2s queues ~60 key events at the OS
+            // auto-repeat rate; without coalescing the backlog plays out one-
+            // per-frame AFTER release, so the palette / camera keeps stepping
+            // for a noticeable beat. With coalescing, the drain pass discards
+            // duplicates and applies at most one nudge/cycle per outer loop —
+            // hold-to-glide still works (the next outer iteration sees the
+            // next batch and applies one more), but release stops the motion
+            // on the NEXT drain pass (no events arrive → no actions dispatched).
             let mut render_requested = false;
+            let mut pending_actions: Vec<Action> = Vec::new();
             let mut next = Some(event);
             while let Some(ev) = next {
                 match ev {
-                    Event::Key(key) => self.update(Action::from_key(key)),
+                    Event::Key(key) => pending_actions.push(Action::from_key(key)),
                     Event::Resize(w, h) => self.on_resize(w, h),
                     Event::Tick => {
                         let now = Instant::now();
@@ -405,10 +417,18 @@ impl App {
                     }
                     Event::Render => render_requested = true,
                 }
+                next = tui.try_next();
+            }
+
+            // Dispatch the coalesced action set in first-occurrence order. An
+            // OS key-repeat backlog of 30 CyclePalette events becomes ONE
+            // CyclePalette here; a left-then-right yaw pair sums into a near-
+            // zero yaw nudge that's effectively idempotent.
+            for action in coalesce_actions(&pending_actions) {
+                self.update(action);
                 if self.should_quit {
                     return Ok(());
                 }
-                next = tui.try_next();
             }
 
             // Reconcile any pending Docker messages BEFORE rendering. This runs

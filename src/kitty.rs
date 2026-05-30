@@ -22,7 +22,7 @@ use ratatui::style::Color;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::action::{apply_input_action, Action, Effect};
+use crate::action::{apply_input_action, coalesce_actions, Action, Effect};
 use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::docker::Docker;
@@ -1177,62 +1177,82 @@ pub fn run_kitty(
             // dispatch invariant) — the Effect interpretation here interprets
             // Quit -> break and SpawnInspect -> (04-06 plugs the off-thread
             // inspect spawn here).
-            if event::poll(Duration::from_millis(0))? {
+            //
+            // 05-04-RV1 (release-stops-input fix): drain EVERY pending event
+            // per frame, not just one. The pre-fix kitty loop read one event
+            // per 33ms frame; a 1-second key hold at 30 Hz OS repeat queued
+            // ~30 events in crossterm's internal reader, which then drained
+            // one-per-frame for ANOTHER second after release. Now we pull all
+            // pending events in a tight inner loop, build an Action list, and
+            // coalesce identical kinds into one (matches App::run in braille).
+            // Hold-to-glide still works (each frame pulls the next batch and
+            // applies one nudge); release stops motion on the next frame.
+            let mut pending_actions: Vec<Action> = Vec::new();
+            while event::poll(Duration::from_millis(0))? {
                 if let Event::Key(k) = event::read()? {
-                    let action = Action::from_key(k);
-                    let effect = apply_input_action(
-                        action,
-                        &mut camera,
-                        &mut selection,
-                        &world,
-                        &live,
-                    );
-                    match effect {
-                        Effect::Quit => break,
-                        Effect::CyclePalette => {
-                            // Mirror App::next_palette logic. The cycle order
-                            // is the same in both backends — keep it in sync.
-                            // Helper kept local to avoid a hard dep from
-                            // kitty.rs on App's method.
-                            let mut order: Vec<&str> =
-                                vec!["notion-soft", "cyberpunk-neon", "terminal-green"];
-                            if crate::theme::Palette::from_omarchy().is_some() {
-                                order.push("omarchy");
-                            }
-                            let cur = order
-                                .iter()
-                                .position(|n| *n == palette_name.as_str())
-                                .unwrap_or(0);
-                            let next = order[(cur + 1) % order.len()];
-                            palette = crate::theme::Palette::by_name_or_default(next);
-                            palette_name = next.to_string();
-                        }
-                        Effect::SpawnInspect(id) => {
-                            // 04-06b: off-thread inspect via the tokio runtime
-                            // Handle (run_kitty is sync but lives inside
-                            // #[tokio::main]; Handle::spawn schedules onto
-                            // that runtime). Idempotent: skip if already
-                            // in-flight. Pitfall 8: render loop never blocks
-                            // on the inspect.
-                            if !selection.inspect_in_flight {
-                                selection.inspect_in_flight = true;
-                                selection.pending_detail = None;
-                                let docker_c = docker.clone();
-                                let tx_c = tx_for_inspect.clone();
-                                handle.spawn(async move {
-                                    if let Ok(snap) =
-                                        crate::docker::fetch_detail(&docker_c, &id).await
-                                    {
-                                        let _ = tx_c.send(DockerMsg::Inspected(snap));
-                                    }
-                                    // On error: swallow. Popup stays "loading…"
-                                    // until user presses Esc or Enter again.
-                                });
-                            }
-                        }
-                        Effect::None => {}
-                    }
+                    pending_actions.push(Action::from_key(k));
                 }
+            }
+            let mut quit_requested = false;
+            for action in coalesce_actions(&pending_actions) {
+                let effect = apply_input_action(
+                    action,
+                    &mut camera,
+                    &mut selection,
+                    &world,
+                    &live,
+                );
+                match effect {
+                    Effect::Quit => {
+                        quit_requested = true;
+                        break;
+                    }
+                    Effect::CyclePalette => {
+                        // Mirror App::next_palette logic. The cycle order
+                        // is the same in both backends — keep it in sync.
+                        // Helper kept local to avoid a hard dep from
+                        // kitty.rs on App's method.
+                        let mut order: Vec<&str> =
+                            vec!["notion-soft", "cyberpunk-neon", "terminal-green"];
+                        if crate::theme::Palette::from_omarchy().is_some() {
+                            order.push("omarchy");
+                        }
+                        let cur = order
+                            .iter()
+                            .position(|n| *n == palette_name.as_str())
+                            .unwrap_or(0);
+                        let next = order[(cur + 1) % order.len()];
+                        palette = crate::theme::Palette::by_name_or_default(next);
+                        palette_name = next.to_string();
+                    }
+                    Effect::SpawnInspect(id) => {
+                        // 04-06b: off-thread inspect via the tokio runtime
+                        // Handle (run_kitty is sync but lives inside
+                        // #[tokio::main]; Handle::spawn schedules onto
+                        // that runtime). Idempotent: skip if already
+                        // in-flight. Pitfall 8: render loop never blocks
+                        // on the inspect.
+                        if !selection.inspect_in_flight {
+                            selection.inspect_in_flight = true;
+                            selection.pending_detail = None;
+                            let docker_c = docker.clone();
+                            let tx_c = tx_for_inspect.clone();
+                            handle.spawn(async move {
+                                if let Ok(snap) =
+                                    crate::docker::fetch_detail(&docker_c, &id).await
+                                {
+                                    let _ = tx_c.send(DockerMsg::Inspected(snap));
+                                }
+                                // On error: swallow. Popup stays "loading…"
+                                // until user presses Esc or Enter again.
+                            });
+                        }
+                    }
+                    Effect::None => {}
+                }
+            }
+            if quit_requested {
+                break;
             }
 
             // Drain pending DockerMsgs non-blocking. `try_recv` on

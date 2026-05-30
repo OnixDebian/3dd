@@ -134,6 +134,108 @@ impl Action {
     }
 }
 
+/// Collapse a backlog of queued [`Action`]s into a minimal equivalent set.
+///
+/// **Why this exists (the post-05-04 release feedback fix).** Terminals deliver
+/// key-repeat events at the OS auto-repeat rate (~30 Hz). When the render loop
+/// falls behind for a moment (heavy frame, GC pause, scheduler hiccup), repeats
+/// queue up in the unbounded event channel. Without coalescing, the loop would
+/// drain them one-by-one AFTER the user has released the key — the camera
+/// keeps rotating / the palette keeps cycling for a noticeable beat past
+/// release. The user observable: "I let go but it kept going for a second".
+///
+/// The contract is: hold-to-glide still works (each frame still sees at most
+/// one nudge of each axis, regardless of backlog depth), but the moment the
+/// user releases the key, the loop runs out of events on the NEXT drain pass
+/// and motion stops within one frame. Backlog accumulation is incapable of
+/// outliving the release because each drain pass throws away duplicates.
+///
+/// **Coalesce rules:**
+///
+/// - `NudgeYaw(d)` / `NudgePitch(d)` / `NudgeZoom(d)`: combined into ONE per
+///   axis whose delta is the SUM of all queued deltas of that axis. Summing
+///   (rather than "last wins") preserves the small-step intent — a queued
+///   left+right pair cancels out, which is what the user would expect if they
+///   tapped both keys in the same frame. Clamps inside `Camera::nudge_*`
+///   handle large summed deltas safely (radius/pitch hard-clamp; yaw wraps).
+///
+/// - `CyclePalette`, `SelectNext`, `SelectPrev`, `OpenDetail`, `CloseDetail`,
+///   `Quit`: kept at most ONCE in the output. These are discrete state-
+///   change intents — pressing P 30 times in a single drain pass clearly
+///   means "cycle the palette once", not "cycle 30 times".
+///
+/// - `Action::None` is dropped (carries no intent).
+///
+/// **Ordering:** the output preserves first-occurrence order across distinct
+/// action kinds so the camera flips before selection moves before quit (matches
+/// the natural sequential UX). Within a single kind, only one survives.
+///
+/// **Pure / total / side-effect-free** — safe to unit-test without a Camera
+/// or LiveWorld; the coalescing decision is purely on the Action slice.
+pub fn coalesce_actions(actions: &[Action]) -> Vec<Action> {
+    use std::collections::HashSet;
+    use std::mem::discriminant;
+
+    let mut out: Vec<Action> = Vec::with_capacity(actions.len().min(8));
+    let mut seen_discrete: HashSet<std::mem::Discriminant<Action>> = HashSet::new();
+    // Accumulators for the three nudge axes — index into `out` so we mutate the
+    // already-inserted Action in place when more of the same axis arrive.
+    let mut yaw_slot: Option<usize> = None;
+    let mut pitch_slot: Option<usize> = None;
+    let mut zoom_slot: Option<usize> = None;
+
+    for &a in actions {
+        match a {
+            Action::None => continue,
+            Action::NudgeYaw(d) => match yaw_slot {
+                Some(i) => {
+                    if let Action::NudgeYaw(prev) = out[i] {
+                        out[i] = Action::NudgeYaw(prev + d);
+                    }
+                }
+                None => {
+                    yaw_slot = Some(out.len());
+                    out.push(Action::NudgeYaw(d));
+                }
+            },
+            Action::NudgePitch(d) => match pitch_slot {
+                Some(i) => {
+                    if let Action::NudgePitch(prev) = out[i] {
+                        out[i] = Action::NudgePitch(prev + d);
+                    }
+                }
+                None => {
+                    pitch_slot = Some(out.len());
+                    out.push(Action::NudgePitch(d));
+                }
+            },
+            Action::NudgeZoom(d) => match zoom_slot {
+                Some(i) => {
+                    if let Action::NudgeZoom(prev) = out[i] {
+                        out[i] = Action::NudgeZoom(prev + d);
+                    }
+                }
+                None => {
+                    zoom_slot = Some(out.len());
+                    out.push(Action::NudgeZoom(d));
+                }
+            },
+            // Discrete intents: keep at most one of each in the output.
+            Action::Quit
+            | Action::SelectNext
+            | Action::SelectPrev
+            | Action::OpenDetail
+            | Action::CloseDetail
+            | Action::CyclePalette => {
+                if seen_discrete.insert(discriminant(&a)) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Apply an [`Action`] to the shared input state owned by both backends.
 ///
 /// Returns an [`Effect`] the caller interprets — Quit / SpawnInspect / None.
@@ -554,5 +656,134 @@ mod tests {
             cam.autopilot_active,
             "CyclePalette is meta-state and must NOT disturb autopilot mode"
         );
+    }
+
+    // ---- 05-04-RV1: coalesce_actions — release-stops-input regression -------
+
+    /// 30 queued CyclePalette repeats (the OS key-repeat backlog after holding
+    /// P for a second) coalesce to exactly ONE CyclePalette in the output.
+    /// This is the load-bearing pin for the "release stops palette cycling"
+    /// fix.
+    #[test]
+    fn coalesce_collapses_n_cycle_palette_into_one() {
+        let backlog: Vec<Action> = std::iter::repeat_n(Action::CyclePalette, 30).collect();
+        let collapsed = coalesce_actions(&backlog);
+        assert_eq!(
+            collapsed,
+            vec![Action::CyclePalette],
+            "30 queued P repeats must collapse to exactly one CyclePalette"
+        );
+    }
+
+    /// Multiple queued NudgeYaw deltas SUM into one. Sum (not last-wins)
+    /// preserves the small-step UX — opposite-direction nudges in the same
+    /// drain pass cancel cleanly.
+    #[test]
+    fn coalesce_sums_nudge_yaw_deltas() {
+        let backlog = vec![
+            Action::NudgeYaw(0.1),
+            Action::NudgeYaw(0.1),
+            Action::NudgeYaw(-0.05),
+        ];
+        let collapsed = coalesce_actions(&backlog);
+        assert_eq!(collapsed.len(), 1);
+        match collapsed[0] {
+            Action::NudgeYaw(d) => assert!(
+                (d - 0.15).abs() < 1e-5,
+                "summed yaw delta should be 0.1 + 0.1 - 0.05 = 0.15, got {d}"
+            ),
+            _ => panic!("expected NudgeYaw, got {:?}", collapsed[0]),
+        }
+    }
+
+    /// Each axis is coalesced independently — a backlog of W (pitch) + D
+    /// (yaw) repeats collapses to one of each, not one combined nudge. The
+    /// user's pitch and yaw inputs are orthogonal.
+    #[test]
+    fn coalesce_keeps_separate_axes() {
+        let backlog = vec![
+            Action::NudgeYaw(0.1),
+            Action::NudgePitch(0.07),
+            Action::NudgeYaw(0.1),
+            Action::NudgePitch(0.07),
+            Action::NudgeYaw(0.1),
+        ];
+        let collapsed = coalesce_actions(&backlog);
+        assert_eq!(collapsed.len(), 2);
+        // Yaw came first, so it appears first in the output (first-occurrence
+        // order across kinds).
+        match collapsed[0] {
+            Action::NudgeYaw(d) => assert!((d - 0.3).abs() < 1e-5),
+            _ => panic!("expected NudgeYaw first"),
+        }
+        match collapsed[1] {
+            Action::NudgePitch(d) => assert!((d - 0.14).abs() < 1e-5),
+            _ => panic!("expected NudgePitch second"),
+        }
+    }
+
+    /// SelectNext repeats from holding Tab collapse to ONE SelectNext per
+    /// drain. The user wants Tab to step once per press, not Nx per release-
+    /// drain.
+    #[test]
+    fn coalesce_collapses_select_next_repeats() {
+        let backlog: Vec<Action> = std::iter::repeat_n(Action::SelectNext, 20).collect();
+        let collapsed = coalesce_actions(&backlog);
+        assert_eq!(collapsed, vec![Action::SelectNext]);
+    }
+
+    /// Action::None entries are dropped — they carry no intent and clutter
+    /// the output.
+    #[test]
+    fn coalesce_drops_none_entries() {
+        let backlog = vec![
+            Action::None,
+            Action::NudgeYaw(0.1),
+            Action::None,
+            Action::None,
+        ];
+        let collapsed = coalesce_actions(&backlog);
+        assert_eq!(collapsed, vec![Action::NudgeYaw(0.1)]);
+    }
+
+    /// Empty input produces empty output (no-op safety pin).
+    #[test]
+    fn coalesce_empty_input_is_empty() {
+        assert!(coalesce_actions(&[]).is_empty());
+    }
+
+    /// A mixed backlog (yaw repeats + palette repeats + select repeats) all
+    /// collapse simultaneously. This is the realistic case when the user
+    /// holds multiple keys briefly (e.g. P then Tab then W).
+    #[test]
+    fn coalesce_mixed_backlog_collapses_all() {
+        let backlog = vec![
+            Action::CyclePalette,
+            Action::NudgeYaw(0.1),
+            Action::CyclePalette,
+            Action::SelectNext,
+            Action::NudgeYaw(0.1),
+            Action::SelectNext,
+            Action::CyclePalette,
+        ];
+        let collapsed = coalesce_actions(&backlog);
+        assert_eq!(collapsed.len(), 3, "expected 3 distinct kinds: {collapsed:?}");
+        // CyclePalette appears first (it was first in input).
+        assert_eq!(collapsed[0], Action::CyclePalette);
+        // NudgeYaw second with summed delta.
+        match collapsed[1] {
+            Action::NudgeYaw(d) => assert!((d - 0.2).abs() < 1e-5),
+            _ => panic!("expected NudgeYaw"),
+        }
+        // SelectNext third.
+        assert_eq!(collapsed[2], Action::SelectNext);
+    }
+
+    /// Quit is also coalesced — Ctrl-C + q in the same drain should fire once
+    /// (no harm, but documents the rule).
+    #[test]
+    fn coalesce_collapses_quit_repeats() {
+        let backlog = vec![Action::Quit, Action::Quit, Action::Quit];
+        assert_eq!(coalesce_actions(&backlog), vec![Action::Quit]);
     }
 }
