@@ -57,6 +57,33 @@ use crate::world::live::LiveWorld;
 use crate::world::selection::Selection;
 use crate::world::{Entity, World};
 
+/// Number of framebuffer pixels per terminal cell for a given ratatui
+/// [`Marker`] (05-06 ROB-02).
+///
+/// ratatui's `Canvas` painter accepts pixel indices whose density depends
+/// on the marker:
+/// - `Marker::Braille` packs 2×4 sub-cell dots per cell.
+/// - `Marker::Block` / `Marker::Dot` / `Marker::HalfBlock` paint 1 pixel
+///   per cell (each pixel is the whole cell or a half-cell character).
+///
+/// The renderer sizes the framebuffer to `cells * px_per_cell` so every
+/// `painter.paint(x, y, color)` call lands inside the canvas bounds. Pre-
+/// 05-06 the framebuffer was hard-coded to braille resolution (2, 4),
+/// so under Block mode every pixel index landed 2× / 4× out of range and
+/// the painter silently dropped them — visible result: an empty
+/// scene-block with no boxes. This helper is the single point of truth
+/// for the multiplier and is tested directly so the regression can never
+/// reintroduce silently.
+pub(crate) fn marker_pixel_ratio(marker: Marker) -> (usize, usize) {
+    match marker {
+        Marker::Braille => (2, 4),
+        // Block / Dot / HalfBlock all paint at 1 pixel per cell. The
+        // default arm covers the Block tier 05-06 needs PLUS any future
+        // ratatui marker addition — safer than panic on unknown variants.
+        _ => (1, 1),
+    }
+}
+
 /// A ratatui [`Shape`] that blits a rendered multi-box framebuffer into a
 /// braille canvas. Owns a snapshot of the camera/config/entities it renders with.
 struct SceneShape<'a> {
@@ -256,11 +283,28 @@ pub fn render_scene(
 ) {
     let block = Block::default().title("scene").borders(Borders::ALL);
 
-    // Inner area = canvas grid in CELLS (block borders removed). Braille grid
-    // resolution is 2 dots wide × 4 dots tall per cell.
+    // Inner area = canvas grid in CELLS (block borders removed). 05-06
+    // ROB-02 deviation fix: the per-pixel resolution depends on the
+    // marker. Braille is sub-cell (1 cell = 2 dots wide × 4 dots tall);
+    // Block / Dot / HalfBlock paint at 1 pixel = 1 cell.
+    //
+    // PRE-05-06 BUG (caught at visual-verify): the framebuffer was sized
+    // for braille resolution unconditionally, so under Block mode every
+    // painter.paint(x, y) call landed at indices 2×/4× larger than the
+    // canvas accepted — and the ratatui Painter silently dropped the
+    // out-of-range writes. Visible result: an empty scene-block with no
+    // boxes at all (rule-1 auto-fix territory).
+    //
+    // Fix: parameterize (px_per_cell_x, px_per_cell_y) on the marker so
+    // the framebuffer resolution matches what the marker's Painter
+    // actually accepts. Braille keeps the historical (2, 4); Block /
+    // anything-else picks (1, 1) — coarser, one painted "pixel" per
+    // terminal cell. The same multiplier feeds the label-snap math so
+    // the selected-container name still lands on the right cell.
     let inner = block.inner(area);
     let cells = (inner.width as usize, inner.height as usize);
-    let viewport = (cells.0 * 2, cells.1 * 4);
+    let (px_per_cell_x, px_per_cell_y) = marker_pixel_ratio(marker);
+    let viewport = (cells.0 * px_per_cell_x, cells.1 * px_per_cell_y);
 
     // 04-04 optional primitives — built per-frame from the live world.
     let floors = build_floor_planes(live, selection, palette);
@@ -290,9 +334,15 @@ pub fn render_scene(
                 (viewport.0 as u32, viewport.1 as u32),
                 config.cell_aspect,
             )?;
-            // Braille cell = 2 dots wide × 4 dots tall.
-            let (col, row) =
-                snap_anchor_with_hysteresis(dot_anchor, &mut selection.last_label_cell, (2, 4));
+            // Cell = px_per_cell_x dots wide × px_per_cell_y dots tall.
+            // Braille uses (2, 4); Block uses (1, 1). The snap_anchor
+            // helper takes the cell size in dots to round the anchor
+            // onto a cell boundary; pre-05-06 this was hard-coded (2,4).
+            let (col, row) = snap_anchor_with_hysteresis(
+                dot_anchor,
+                &mut selection.last_label_cell,
+                (px_per_cell_x as u32, px_per_cell_y as u32),
+            );
             // Container name via the live snapshot. Truncated for safety.
             let name_owned = live
                 .id_string_for_entity(sel_entity.id)
@@ -328,32 +378,36 @@ pub fn render_scene(
         ),
     };
 
-    // Canvas X bounds are in DOT coordinates (top-left origin); ctx.print
-    // takes the same. Cell coords from snap are converted to dot coords by
-    // multiplying by (2, 4) — the same conversion the canvas uses internally
-    // for its braille grid. Pin print position in DOT coords so ratatui's
+    // Canvas X bounds are in PIXEL coordinates (top-left origin); ctx.print
+    // takes the same. Cell coords from snap are converted to pixel coords by
+    // multiplying by (px_per_cell_x, px_per_cell_y) — same convention the
+    // canvas uses internally for the chosen marker's grid (2,4 for braille;
+    // 1,1 for block / dot). Pin print position in pixel coords so ratatui's
     // cell quantization lands the text where we computed.
+    let px_x = px_per_cell_x as f64;
+    let px_y = px_per_cell_y as f64;
     let canvas = Canvas::default()
         .block(block)
         .marker(marker)
         .background_color(palette.background)
-        // Bounds match the braille dot grid (top-left math via Painter::paint,
-        // not these high-level bounds — kept 1:1 with the grid for clarity).
+        // Bounds match the marker's per-pixel grid (top-left math via
+        // Painter::paint, not these high-level bounds — kept 1:1 with
+        // the grid for clarity).
         .x_bounds([0.0, viewport.0.max(1) as f64 - 1.0])
         .y_bounds([0.0, viewport.1.max(1) as f64 - 1.0])
         .paint(move |ctx| {
             ctx.draw(&shape);
             if let Some((col, row, name)) = label_print.as_ref() {
-                // Cells -> dot coords (canvas bounds are in dots, but ratatui
-                // print is cell-quantized internally and we already snapped to
-                // cell granularity). Map by (col*2, row*4) so the text lands
-                // on a cell boundary, then flip Y back to math coords
-                // (Canvas.print uses math coords: bottom-left origin).
-                let cx_dot = (*col as f64) * 2.0;
+                // Cells -> pixel coords (canvas bounds are in pixels; ratatui
+                // print is cell-quantized internally and we already snapped
+                // to cell granularity). Map by (col*px_x, row*px_y) so the
+                // text lands on a cell boundary, then flip Y back to math
+                // coords (Canvas.print uses math coords: bottom-left origin).
+                let cx_dot = (*col as f64) * px_x;
                 // Canvas y_bounds are bottom-left math: y=0 at the bottom,
                 // y=viewport.1-1 at the top. Our (row) is in TOP-LEFT cell
                 // coords; convert to math y at the cell top.
-                let cy_dot_top_left = (*row as f64) * 4.0;
+                let cy_dot_top_left = (*row as f64) * px_y;
                 let cy_math = (viewport.1 as f64 - 1.0) - cy_dot_top_left;
                 // Owned ratatui Line so the lifetime is 'static and doesn't
                 // tangle with the ctx borrow. Clone is cheap (a small String).
@@ -442,5 +496,39 @@ mod tests {
         };
         let ports = build_port_lookup(&world, &live);
         assert!(ports.is_empty());
+    }
+
+    // ---- 05-06 ROB-02 Block-resolution regression pins -----------------
+
+    /// Braille marker keeps the historical 2×4 sub-cell resolution. Pre-
+    /// 05-06 the framebuffer was hard-coded to (2, 4) — this pin makes
+    /// sure the refactor to a marker-driven multiplier didn't perturb
+    /// the braille tier's exact pixel count.
+    #[test]
+    fn marker_pixel_ratio_braille_is_two_by_four() {
+        assert_eq!(marker_pixel_ratio(Marker::Braille), (2, 4));
+    }
+
+    /// Block marker paints 1 pixel per cell. THIS is the regression-pin
+    /// for the rule-1 auto-fix shipped in 05-06 Task 2: pre-fix, the
+    /// framebuffer was sized for braille resolution unconditionally
+    /// under Block too, and every painter.paint(x, y) call landed at
+    /// indices 2× / 4× too large — the ratatui Painter silently dropped
+    /// the out-of-range writes, producing an empty scene with no boxes.
+    /// If this pin breaks (someone reverts the multiplier), the visual
+    /// regression returns INVISIBLY at runtime — so the test must catch it.
+    #[test]
+    fn marker_pixel_ratio_block_is_one_by_one() {
+        assert_eq!(marker_pixel_ratio(Marker::Block), (1, 1));
+    }
+
+    /// Dot and HalfBlock fall through the same 1×1 arm as Block — every
+    /// non-braille marker that ratatui ships uses one pixel per cell.
+    /// Pins the default-arm behavior so a future marker variant doesn't
+    /// silently get treated as braille resolution.
+    #[test]
+    fn marker_pixel_ratio_dot_and_halfblock_are_one_by_one() {
+        assert_eq!(marker_pixel_ratio(Marker::Dot), (1, 1));
+        assert_eq!(marker_pixel_ratio(Marker::HalfBlock), (1, 1));
     }
 }
