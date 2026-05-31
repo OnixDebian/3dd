@@ -1430,14 +1430,17 @@ fn kitty_human_bytes(n: u64) -> String {
     }
 }
 
+/// True when the active terminal exposes the kitty graphics protocol.
+///
+/// Delegates to [`crate::term::capability::detect`] (05-06 ROB-02): the
+/// unified detector is the single source of truth for env-driven terminal
+/// classification. Returns true iff `detect()` returns
+/// [`crate::term::capability::TerminalCapability::Kitty`].
 pub fn supports_kitty_graphics() -> bool {
-    if std::env::var_os("KITTY_WINDOW_ID").is_some()
-        || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some()
-        || std::env::var_os("WEZTERM_PANE").is_some()
-    {
-        return true;
-    }
-    matches!(std::env::var("TERM"), Ok(t) if t.contains("kitty") || t.contains("ghostty"))
+    matches!(
+        crate::term::capability::detect(),
+        crate::term::capability::TerminalCapability::Kitty,
+    )
 }
 
 /// Live loop rendering real pixels via kitty graphics: a static-camera 3/4 view of

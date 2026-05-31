@@ -5,6 +5,7 @@ mod config;
 mod docker;
 mod kitty;
 mod render3d;
+mod term;
 mod theme;
 mod tui;
 mod ui;
