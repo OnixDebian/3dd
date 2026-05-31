@@ -237,6 +237,10 @@ fn build_image_stacks(live: &LiveWorld) -> Vec<ImageStack> {
 /// PRE-COMPUTATION only — by the time we construct the `Canvas::paint`
 /// closure, the `&mut` borrow has been dropped and only Copy primitives
 /// travel inside (the closure is `Fn`, not `FnMut`).
+/// `marker` (05-06 ROB-02): the Canvas cell marker. `Marker::Braille` is
+/// the truecolor tier (1×2 dot × 1×4 sub-pixel per cell). The Ascii tier
+/// passes `Marker::Block` (one solid '█' per cell — coarser but SSH /
+/// dumb-terminal friendly with no Unicode-braille dependency).
 #[allow(clippy::too_many_arguments)]
 pub fn render_scene(
     frame: &mut Frame,
@@ -248,6 +252,7 @@ pub fn render_scene(
     palette: &Palette,
     config: &RenderConfig,
     spin: f32,
+    marker: Marker,
 ) {
     let block = Block::default().title("scene").borders(Borders::ALL);
 
@@ -330,7 +335,7 @@ pub fn render_scene(
     // cell quantization lands the text where we computed.
     let canvas = Canvas::default()
         .block(block)
-        .marker(Marker::Braille)
+        .marker(marker)
         .background_color(palette.background)
         // Bounds match the braille dot grid (top-left math via Painter::paint,
         // not these high-level bounds — kept 1:1 with the grid for clarity).

@@ -219,26 +219,60 @@ async fn main() -> Result<()> {
         });
     }
 
-    // Backend selection: explicit --kitty / --braille override; otherwise
-    // auto-detect — real pixels where the graphics protocol exists (kitty/ghostty/
-    // wezterm), braille everywhere else (Alacritty, SSH, dumb terminals).
-    let force_kitty = args.iter().any(|a| a == "--kitty");
-    let force_braille = args.iter().any(|a| a == "--braille");
-    let result: Result<()> = if force_kitty || (!force_braille && kitty::supports_kitty_graphics()) {
-        // run_kitty is sync but lives inside #[tokio::main] — Handle::current()
-        // captures the active runtime so its inline `handle.spawn(...)` calls
-        // (Effect::SpawnInspect) schedule onto the SAME runtime the producer
-        // task already runs on.
-        let handle = tokio::runtime::Handle::current();
-        kitty::run_kitty(docker_for_render, tx_for_inspect, rx, handle, config)
+    // Backend + render-mode pick (05-06 ROB-02). The unified resolver in
+    // `term::capability::resolve` blends CLI flags > config.force_mode >
+    // env-driven auto-detect into a single `TerminalCapability` tier:
+    //
+    // - `Kitty`     → run_kitty (graphics protocol)
+    // - `Truecolor` → braille fallback with `Marker::Braille`
+    // - `Ascii`     → braille fallback with `Marker::Block`, FPS capped
+    //                 at `config.degraded_fps_cap` (default 15) — SSH /
+    //                 weak-terminal friendly.
+    //
+    // CLI overrides (--kitty / --braille / --ascii) win over the TOML
+    // config; absent both, the env-driven detector picks the tier. The
+    // legacy --braille and --kitty flags map cleanly through
+    // `from_force_mode` ("braille" → Truecolor). --ascii is new in
+    // 05-06 and exposes the third tier on the CLI for quick verify.
+    let cli_force: Option<&str> = if args.iter().any(|a| a == "--kitty") {
+        Some("kitty")
+    } else if args.iter().any(|a| a == "--braille") {
+        Some("braille")
+    } else if args.iter().any(|a| a == "--ascii") {
+        Some("ascii")
+    } else if config.force_mode == "auto" {
+        None
     } else {
-        let mut tui = Tui::new()?;
-        tui.enter()?;
-        let mut app = App::with_docker(docker_for_render, tx_for_inspect, rx, config);
-        let r = app.run(&mut tui).await;
-        // Always restore on the clean-exit path too, regardless of run() result.
-        tui.exit()?;
-        r
+        Some(config.force_mode.as_str())
+    };
+
+    let capability = term::capability::resolve(cli_force, config.auto_degrade);
+
+    let result: Result<()> = match capability {
+        term::capability::TerminalCapability::Kitty => {
+            // run_kitty is sync but lives inside #[tokio::main] — Handle::current()
+            // captures the active runtime so its inline `handle.spawn(...)` calls
+            // (Effect::SpawnInspect) schedule onto the SAME runtime the producer
+            // task already runs on.
+            let handle = tokio::runtime::Handle::current();
+            kitty::run_kitty(docker_for_render, tx_for_inspect, rx, handle, config)
+        }
+        term::capability::TerminalCapability::Truecolor
+        | term::capability::TerminalCapability::Ascii => {
+            let mut tui = Tui::new()?;
+            tui.enter()?;
+            let mut app = App::with_docker(docker_for_render, tx_for_inspect, rx, config);
+            // Propagate the resolved capability so braille renders with the
+            // right marker AND App::run applies the right FPS cap. App reads
+            // it from the new `render_mode` field; we set it after the
+            // with_docker constructor since with_docker doesn't know about
+            // CLI flags or env-driven detection.
+            app.set_render_mode(capability);
+            let r = app.run(&mut tui).await;
+            // Always restore on the clean-exit path too, regardless of run() result.
+            tui.exit()?;
+            r
+        }
     };
 
     // Tear down the Docker producer task so it doesn't outlive the renderer.

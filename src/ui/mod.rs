@@ -14,6 +14,7 @@ pub mod status_bar;
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
@@ -103,6 +104,18 @@ pub fn view(frame: &mut Frame, app: &mut App) {
         // still read from `app` (they reflect the LIVE state); a selected
         // id that no longer exists in the cached world is harmless (the
         // pulse path just skips it).
+        // 05-06 ROB-02: select the braille marker based on the resolved
+        // render capability. `Ascii` swaps Braille → Block so the scene
+        // legibly renders over SSH / dumb terminals with no Unicode-
+        // braille dependency (coarser, but visible). `Kitty` only reaches
+        // this code path on the braille-fallback (`--braille` CLI or
+        // capability-pinned-down to Truecolor), so we treat it the same
+        // as Truecolor here — the kitty graphics backend lives in
+        // run_kitty and bypasses this branch entirely.
+        let marker = match app.render_mode {
+            crate::term::capability::TerminalCapability::Ascii => Marker::Block,
+            _ => Marker::Braille,
+        };
         scene::render_scene(
             frame,
             scene_area,
@@ -113,6 +126,7 @@ pub fn view(frame: &mut Frame, app: &mut App) {
             &palette,
             &app.render_config,
             app.spin,
+            marker,
         );
     }
 

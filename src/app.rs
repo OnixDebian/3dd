@@ -188,6 +188,17 @@ pub struct App {
     /// `drain_docker` loop demuxes Inspected into `selection.pending_detail`
     /// alongside Stat / Added / Removed. `None` in tests.
     tx_for_inspect: Option<UnboundedSender<DockerMsg>>,
+    /// Resolved render capability (05-06 ROB-02). Set by main.rs after
+    /// construction via [`Self::set_render_mode`]. Drives:
+    /// - the braille marker in `ui::view` (`Ascii` → `Marker::Block`,
+    ///   `Truecolor`/`Kitty` → `Marker::Braille`),
+    /// - the FPS cap in `App::run` (`Ascii` → throttle to
+    ///   `config.degraded_fps_cap`, others → uncapped),
+    /// - the degraded indicator in the status bar (`Ascii` only).
+    ///
+    /// Default `Truecolor` so the test / `App::new()` path renders the
+    /// existing braille canvas exactly as it did pre-05-06.
+    pub render_mode: crate::term::capability::TerminalCapability,
 }
 
 impl App {
@@ -240,6 +251,10 @@ impl App {
             docker_rx: None,
             docker: None,
             tx_for_inspect: None,
+            // 05-06 ROB-02: tests + dump path render the existing
+            // braille canvas exactly as they did pre-05-06. main.rs
+            // overrides via set_render_mode after with_docker.
+            render_mode: crate::term::capability::TerminalCapability::Truecolor,
         }
     }
 
@@ -288,6 +303,10 @@ impl App {
             docker_rx: Some(rx),
             docker: None,
             tx_for_inspect: None,
+            // 05-06 ROB-02: safe default — main.rs overrides via
+            // set_render_mode after with_docker so the resolved
+            // capability drives marker + fps cap + status indicator.
+            render_mode: crate::term::capability::TerminalCapability::Truecolor,
         }
     }
 
@@ -359,6 +378,15 @@ impl App {
             next_name.to_string(),
             crate::theme::Palette::by_name_or_default(next_name),
         )
+    }
+
+    /// Override the resolved render capability (05-06 ROB-02). Called by
+    /// main.rs after `with_docker` with the result of
+    /// `term::capability::resolve`. Drives the braille marker in
+    /// `ui::view`, the FPS cap in `App::run`, and the degraded indicator
+    /// in the status bar.
+    pub fn set_render_mode(&mut self, cap: crate::term::capability::TerminalCapability) {
+        self.render_mode = cap;
     }
 
     /// Dispatch a high-level intent to a state mutation.
@@ -726,8 +754,28 @@ impl App {
             }
 
             if render_requested {
+                // 05-06 ROB-02: degraded FPS cap. When render_mode is
+                // `Ascii`, throttle draws to `config.degraded_fps_cap`
+                // (default 15). `continue` returns to the OUTER
+                // `while let Some(event) = tui.next().await` loop (the
+                // nearest enclosing loop), skipping THIS draw entirely —
+                // the next Render event will fire the next draw at the
+                // right cadence. `last_render` is NOT updated on skip so
+                // the cap is measured against the actual last painted
+                // frame. For non-Ascii tiers `min_dt == 0.0` so the gate
+                // is a noop (preserves the pre-05-06 unthrottled cadence).
                 let now = Instant::now();
                 let dt = now.duration_since(self.last_render).as_secs_f32();
+                let min_dt = if self.render_mode
+                    == crate::term::capability::TerminalCapability::Ascii
+                {
+                    1.0 / self.config.degraded_fps_cap.max(1) as f32
+                } else {
+                    0.0
+                };
+                if dt < min_dt {
+                    continue;
+                }
                 self.last_render = now;
                 if dt > 0.0 {
                     // Smooth the fps reading a little to avoid jitter.
@@ -1819,6 +1867,56 @@ mod tests {
         assert!(
             app.camera.autopilot_active,
             "ToggleLegend through App::update must NOT disturb autopilot"
+        );
+    }
+
+    // ---- ROB-02 (05-06) render_mode field plumbing ---------------------------
+
+    /// App::new() seeds `render_mode` to `Truecolor` so the test / dump path
+    /// renders the existing braille canvas exactly as it did pre-05-06. The
+    /// Truecolor default is also the safest fallback for the with_docker
+    /// path before main.rs calls set_render_mode.
+    #[test]
+    fn app_default_render_mode_is_truecolor() {
+        let app = App::new();
+        assert_eq!(
+            app.render_mode,
+            crate::term::capability::TerminalCapability::Truecolor,
+            "App::new() must default render_mode to Truecolor so existing braille tests / dump paths are unchanged",
+        );
+    }
+
+    /// `with_docker_rx` (the test path's live-receiver constructor) inherits
+    /// the same Truecolor default — main.rs ALWAYS overrides via
+    /// set_render_mode after with_docker, so this is purely the safety
+    /// net for unit tests that build an App through the receiver path.
+    #[test]
+    fn app_with_docker_rx_default_render_mode_is_truecolor() {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let app = App::with_docker_rx(rx);
+        assert_eq!(
+            app.render_mode,
+            crate::term::capability::TerminalCapability::Truecolor,
+        );
+    }
+
+    /// `set_render_mode` persists the resolved capability so subsequent
+    /// renders pick the right marker + FPS cap path. Pins the contract
+    /// main.rs depends on for the post-with_docker override.
+    #[test]
+    fn app_set_render_mode_persists() {
+        let mut app = App::new();
+        app.set_render_mode(crate::term::capability::TerminalCapability::Ascii);
+        assert_eq!(
+            app.render_mode,
+            crate::term::capability::TerminalCapability::Ascii,
+        );
+        // And re-setting to Kitty (e.g. user re-runs with --kitty in a
+        // future re-init path) cleanly overwrites — no sticky bit.
+        app.set_render_mode(crate::term::capability::TerminalCapability::Kitty);
+        assert_eq!(
+            app.render_mode,
+            crate::term::capability::TerminalCapability::Kitty,
         );
     }
 }

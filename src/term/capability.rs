@@ -36,7 +36,7 @@ pub enum TerminalCapability {
 
 impl TerminalCapability {
     /// Stable lowercase tag for the status bar / logs.
-    #[allow(dead_code)] // Wired by main.rs + status_bar in Task 2 of 05-06.
+    #[allow(dead_code)] // status_bar inlines its own labels; kept for callers / future logging.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Kitty => "kitty",
@@ -53,7 +53,6 @@ impl TerminalCapability {
     /// renderer IS the truecolor tier on the 3dd side — the user thinks
     /// in terms of the renderer, the resolver thinks in terms of the
     /// capability class.
-    #[allow(dead_code)] // Wired by main.rs CLI flag mapper in Task 2 of 05-06.
     pub fn from_force_mode(s: &str) -> Option<Self> {
         match s {
             "kitty" => Some(Self::Kitty),
@@ -119,7 +118,6 @@ pub fn detect() -> TerminalCapability {
 /// auto-detect rather than panicking — the typo still produces a usable
 /// app, and we eprintln on the way in (see main.rs caller) so the user
 /// notices.
-#[allow(dead_code)] // Wired by main.rs backend-pick in Task 2 of 05-06.
 pub fn resolve(force_mode: Option<&str>, auto_degrade: bool) -> TerminalCapability {
     if let Some(s) = force_mode {
         if let Some(forced) = TerminalCapability::from_force_mode(s) {

@@ -1436,6 +1436,12 @@ fn kitty_human_bytes(n: u64) -> String {
 /// unified detector is the single source of truth for env-driven terminal
 /// classification. Returns true iff `detect()` returns
 /// [`crate::term::capability::TerminalCapability::Kitty`].
+///
+/// Kept as a one-liner re-export so external callers (future bin targets,
+/// integration tests) still have the friendly name. main.rs itself
+/// switched in 05-06 to consume `term::capability::resolve` directly so
+/// the CLI / config / auto-detect blend stays in one place.
+#[allow(dead_code)]
 pub fn supports_kitty_graphics() -> bool {
     matches!(
         crate::term::capability::detect(),
