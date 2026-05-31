@@ -160,6 +160,14 @@ pub fn render(
 /// box spinning in place: every box's 8 world vertices AND its face normals are
 /// rotated about that box's center by `spin` before culling/projecting. Rotating
 /// a rigid box keeps it convex, so the cross-box painter's sort is still correct.
+///
+/// `force_solid` (05-06 RV5): when `true`, EVERY entity is rendered via the
+/// SOLID back-face-culled face path regardless of `Status::is_solid()`. The
+/// wireframe path on non-Running statuses pushes ALL 12 edges (no cull), so
+/// back-of-cube edges from far boxes bleed through near-box faces and the
+/// scene reads as "see-through" mush on the coarse ASCII marker (RV5 user
+/// feedback "убрать прозрачность блоков"). Kitty + Truecolor pass `false`
+/// here and preserve the wireframe-on-Paused/Stopped/Crashed visual.
 #[allow(clippy::too_many_arguments)]
 pub fn render_scene(
     entities: &[Entity],
@@ -171,6 +179,7 @@ pub fn render_scene(
     selected_id: Option<u32>,
     selection_pulse_phase: f32,
     extras: &SceneExtras<'_>,
+    force_solid: bool,
 ) -> Framebuffer {
     let (w, h) = viewport;
     let (hw, hh) = (w * SS, h * SS);
@@ -231,8 +240,18 @@ pub fn render_scene(
         }
         let pulse_mult = pulse_mult_for(entity.id);
 
-        if entity.status.is_solid() {
+        // 05-06 RV5: ASCII tier forces every box through the SOLID path so
+        // back-of-cube wireframe edges don't bleed through near-box faces
+        // (user feedback "убрать прозрачность блоков"). Kitty + Truecolor
+        // pass `force_solid=false` and keep `status.is_solid()` — wireframes
+        // on non-Running statuses remain the truecolor / kitty visual.
+        let render_as_solid = entity.status.is_solid() || force_solid;
+        if render_as_solid {
             // SOLID PATH: cull back-faces, push the visible faces as fragments.
+            // Color: the entity's own status color (Running -> palette.running;
+            // Paused/Stopped/Restarting/Crashed -> their respective status
+            // colors). The face shader still applies fog + Lambert, so the
+            // resulting silhouette reads as a colored opaque cube.
             let base = palette.status_color(entity.status);
             for face in &cube.faces {
                 let verts = [
@@ -1083,7 +1102,7 @@ mod tests {
         let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
         let ports: crate::render3d::scene_extras::PortLookup = Default::default();
         let extras = empty_extras(&floors, &ports);
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras, false);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -1129,7 +1148,7 @@ mod tests {
         let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
         let ports: crate::render3d::scene_extras::PortLookup = Default::default();
         let extras = empty_extras(&floors, &ports);
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras, false);
 
         let center = fb
             .get(VIEWPORT.0 / 2, VIEWPORT.1 / 2)
@@ -1154,7 +1173,7 @@ mod tests {
         let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
         let ports: crate::render3d::scene_extras::PortLookup = Default::default();
         let extras = empty_extras(&floors, &ports);
-        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
+        let fb = render_scene(&entities, head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras, false);
 
         let distinct: std::collections::HashSet<_> =
             fb.lit_pixels().map(|(_, _, c)| c).collect();
@@ -1172,7 +1191,7 @@ mod tests {
         let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
         let ports: crate::render3d::scene_extras::PortLookup = Default::default();
         let extras = empty_extras(&floors, &ports);
-        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
+        let fb = render_scene(&[], head_on_view(), VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras, false);
         assert_eq!(fb.lit_pixels().count(), 0, "empty scene must be all unlit");
     }
 
@@ -1192,11 +1211,130 @@ mod tests {
         let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
         let ports: crate::render3d::scene_extras::PortLookup = Default::default();
         let extras = empty_extras(&floors, &ports);
-        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras);
+        let fb = render_scene(&[off], view, VIEWPORT, &pal, &cfg, 0.0, None, 0.0, &extras, false);
         assert!(
             fb.lit_pixels().count() > 50,
             "off-center box should rasterize a solid footprint when framed, got {}",
             fb.lit_pixels().count()
+        );
+    }
+
+    // ---- 05-06 RV5: force_solid pin -------------------------------------
+
+    /// RV5 contract: with `force_solid=true`, a non-Running (Crashed) box
+    /// renders as a SOLID face footprint instead of the 12-edge wireframe.
+    /// Verify by comparing pixel counts: the solid path rasterizes a
+    /// contiguous front face (hundreds of dots), the wireframe path
+    /// rasterizes only thin lines along the 12 edges (tens of dots, but
+    /// always strictly fewer than the filled face). User feedback "убрать
+    /// прозрачность блоков" — this is the pin that catches a future revert
+    /// of the `force_solid` plumbing.
+    #[test]
+    fn render_scene_force_solid_renders_non_running_as_face() {
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+        // A Crashed box (non-Running -> wireframe by default) centered on
+        // the view axis with the head-on camera.
+        let crashed = entity_at(0, Vec3::ZERO, 0.6, Status::Crashed);
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports: crate::render3d::scene_extras::PortLookup = Default::default();
+        let extras = empty_extras(&floors, &ports);
+
+        // Wireframe path (force_solid=false): only edges contribute.
+        let fb_wire = render_scene(
+            &[crashed],
+            head_on_view(),
+            VIEWPORT,
+            &pal,
+            &cfg,
+            0.0,
+            None,
+            0.0,
+            &extras,
+            false,
+        );
+        let wire_count = fb_wire.lit_pixels().count();
+
+        // Solid path (force_solid=true): the front face fills a quad.
+        let fb_solid = render_scene(
+            &[crashed],
+            head_on_view(),
+            VIEWPORT,
+            &pal,
+            &cfg,
+            0.0,
+            None,
+            0.0,
+            &extras,
+            true,
+        );
+        let solid_count = fb_solid.lit_pixels().count();
+
+        // Solid path fills a contiguous face footprint while the wireframe
+        // path lights only the box's projected edge pixels. The solid count
+        // MUST exceed the wireframe count by a meaningful margin (head-on
+        // view at 0 spin: wireframe ~20 edge dots vs solid ~36 face dots
+        // at VIEWPORT=64×64). Pin the > inequality + an absolute margin
+        // (+8) so a future "force_solid renders fewer fragments" regression
+        // can't sneak through under round-off.
+        assert!(
+            solid_count > wire_count + 8,
+            "force_solid must render a filled face footprint with strictly more pixels than the wireframe edges; wireframe={wire_count}, solid={solid_count}",
+        );
+        // And: the solid render uses the Crashed status color (the entity's
+        // own status; force_solid does NOT reskin to Running).
+        let crashed_base = pal.status_color(Status::Crashed);
+        let has_crashed_pixel = fb_solid
+            .lit_pixels()
+            .any(|(_, _, c)| c == crashed_base);
+        assert!(
+            has_crashed_pixel,
+            "force_solid must preserve the entity's own status color (Crashed) — not reskin to Running",
+        );
+    }
+
+    /// RV5 contract: `force_solid=true` does NOT change the rendering of a
+    /// Running box (already solid). Pin so a future refactor doesn't
+    /// accidentally double-process Running entities.
+    #[test]
+    fn render_scene_force_solid_running_unchanged() {
+        let pal = Palette::default();
+        let cfg = RenderConfig::default();
+        let running = entity_at(0, Vec3::ZERO, 0.6, Status::Running);
+        let floors: Vec<crate::render3d::scene_extras::FloorPlane> = Vec::new();
+        let ports: crate::render3d::scene_extras::PortLookup = Default::default();
+        let extras = empty_extras(&floors, &ports);
+
+        let fb_normal = render_scene(
+            &[running],
+            head_on_view(),
+            VIEWPORT,
+            &pal,
+            &cfg,
+            0.0,
+            None,
+            0.0,
+            &extras,
+            false,
+        );
+        let fb_forced = render_scene(
+            &[running],
+            head_on_view(),
+            VIEWPORT,
+            &pal,
+            &cfg,
+            0.0,
+            None,
+            0.0,
+            &extras,
+            true,
+        );
+        // Pixel-identical: a Running box is solid on both paths.
+        let normal_pixels: Vec<_> = fb_normal.lit_pixels().collect();
+        let forced_pixels: Vec<_> = fb_forced.lit_pixels().collect();
+        assert_eq!(
+            normal_pixels, forced_pixels,
+            "force_solid must be a no-op for an already-Running entity (got differing pixel sets)",
         );
     }
 }

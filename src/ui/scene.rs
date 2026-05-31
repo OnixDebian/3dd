@@ -126,6 +126,11 @@ struct SceneShape<'a> {
     /// 04-04 optional primitives (floor-planes + per-entity port lookup) —
     /// borrowed; built fresh per frame by `render_scene` from the live world.
     extras: SceneExtras<'a>,
+    /// 05-06 RV5: when `true`, the rasterizer forces every entity through
+    /// the SOLID face-rendering path so back-of-cube wireframe edges don't
+    /// bleed through near-box faces. Set only on the ASCII tier — Kitty +
+    /// Truecolor pass `false` and keep the wireframe-on-Paused visual.
+    force_solid: bool,
 }
 
 impl Shape for SceneShape<'_> {
@@ -148,6 +153,7 @@ impl Shape for SceneShape<'_> {
             self.selected_id,
             self.selection_pulse_phase,
             &self.extras,
+            self.force_solid,
         );
 
         // Blit: framebuffer top-left (x, y) maps to braille dot (x, y) with NO
@@ -285,6 +291,12 @@ fn build_image_stacks(live: &LiveWorld) -> Vec<ImageStack> {
 /// the truecolor tier (1×2 dot × 1×4 sub-pixel per cell). The Ascii tier
 /// passes `Marker::Block` (one solid '█' per cell — coarser but SSH /
 /// dumb-terminal friendly with no Unicode-braille dependency).
+///
+/// `force_solid` (05-06 RV5): when `true`, every entity renders through the
+/// SOLID face path regardless of `Status::is_solid()` — opaque silhouettes,
+/// no wireframe bleed-through. Set only on the ASCII tier (per user feedback
+/// "убрать прозрачность блоков"); Kitty + Truecolor pass `false` to keep the
+/// wireframe-on-non-Running visual.
 #[allow(clippy::too_many_arguments)]
 pub fn render_scene(
     frame: &mut Frame,
@@ -297,6 +309,7 @@ pub fn render_scene(
     config: &RenderConfig,
     spin: f32,
     marker: Marker,
+    force_solid: bool,
 ) {
     let block = Block::default().title("scene").borders(Borders::ALL);
 
@@ -393,6 +406,7 @@ pub fn render_scene(
             cylinders.as_slice(),
             image_stacks.as_slice(),
         ),
+        force_solid,
     };
 
     // Canvas X bounds are in PIXEL coordinates (top-left origin); ctx.print

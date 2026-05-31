@@ -61,6 +61,34 @@ impl TerminalCapability {
             _ => None,
         }
     }
+
+    /// Whether boxes should ANIMATE in this tier (per-box self-spin + breathing
+    /// size easing). `false` only for [`Self::Ascii`]: 05-06 RV5 user feedback —
+    /// over SSH / dumb terminals the rotating, breathing 3D boxes were
+    /// unreadable; the user explicitly requested static frames in the degrade
+    /// tier ("ascii все ещё ничего не понятно, может там убрать анимацию и
+    /// прозрачность блоков"). Kitty + Truecolor stay animated (the user signed
+    /// off "kitty идеально" + "braille лучше" after RV4).
+    ///
+    /// Implementation contract: callers gating animation read this — App's
+    /// on_tick zeros the spin-advance dt AND snaps the breathing target
+    /// instead of easing when `false`.
+    pub fn is_animated(self) -> bool {
+        !matches!(self, Self::Ascii)
+    }
+
+    /// Whether the rasterizer should force every entity through the SOLID
+    /// face-rendering path regardless of `Status::is_solid()`. `true` only for
+    /// [`Self::Ascii`]: 05-06 RV5 user feedback — the wireframe path on
+    /// non-Running statuses (Paused / Stopped / Restarting / Crashed) draws
+    /// ALL 12 cube edges (no back-face cull), so back-of-cube edges bleed
+    /// through front-of-cube faces and the scene reads as "see-through" mush
+    /// on a coarse marker. Forcing solid in the ASCII tier renders every box
+    /// as an opaque silhouette via the back-face-culled face pool — readable
+    /// at SSH resolution.
+    pub fn force_solid_render(self) -> bool {
+        matches!(self, Self::Ascii)
+    }
 }
 
 /// Detect via env vars. Pure — same inputs always yield same output.
@@ -369,5 +397,26 @@ mod tests {
         assert_eq!(TerminalCapability::from_force_mode("auto"), None);
         assert_eq!(TerminalCapability::from_force_mode(""), None);
         assert_eq!(TerminalCapability::from_force_mode("BRAILLE"), None);
+    }
+
+    // ---- RV5: tier-gated animation + opaque rendering ---------------------
+
+    /// 05-06 RV5: ASCII is the only static tier (user feedback "убрать
+    /// анимацию"). Kitty + Truecolor stay animated.
+    #[test]
+    fn is_animated_only_ascii_is_static() {
+        assert!(TerminalCapability::Kitty.is_animated());
+        assert!(TerminalCapability::Truecolor.is_animated());
+        assert!(!TerminalCapability::Ascii.is_animated());
+    }
+
+    /// 05-06 RV5: ASCII is the only tier that forces every box through the
+    /// solid face-rendering path (user feedback "убрать прозрачность блоков").
+    /// Kitty + Truecolor keep the wireframe path for non-Running statuses.
+    #[test]
+    fn force_solid_render_only_ascii() {
+        assert!(!TerminalCapability::Kitty.force_solid_render());
+        assert!(!TerminalCapability::Truecolor.force_solid_render());
+        assert!(TerminalCapability::Ascii.force_solid_render());
     }
 }

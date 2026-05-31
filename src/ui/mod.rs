@@ -126,6 +126,11 @@ pub fn view(frame: &mut Frame, app: &mut App) {
             crate::term::capability::TerminalCapability::Ascii => Marker::HalfBlock,
             _ => Marker::Braille,
         };
+        // 05-06 RV5: ASCII tier renders every box as a solid opaque
+        // silhouette (no wireframe bleed-through) per user feedback "убрать
+        // прозрачность блоков". Kitty + Truecolor keep the wireframe-on-
+        // non-Running visual (`force_solid=false`).
+        let force_solid = app.render_mode.force_solid_render();
         scene::render_scene(
             frame,
             scene_area,
@@ -137,6 +142,7 @@ pub fn view(frame: &mut Frame, app: &mut App) {
             &app.render_config,
             app.spin,
             marker,
+            force_solid,
         );
     }
 

@@ -484,13 +484,37 @@ impl App {
         self.camera.step(dt); // static framing now (no orbit)
         // Advance the per-box self-spin by REAL elapsed time, wrapped to [0, TAU).
         let dt = if dt.is_finite() && dt > 0.0 { dt } else { 0.0 };
-        self.spin = (self.spin + SPIN_RATE * dt).rem_euclid(std::f32::consts::TAU);
-        // Per-frame size easing (CONT-03 / 04-01). Mutates `half_extents` in
-        // place on the live world's entity slice — no World reallocation per
-        // tick (RESEARCH Pitfall A). dt is REAL elapsed time; `on_tick` is
-        // the canonical place for framerate-independent motion. Empty world
-        // is a no-op (zero-length slice).
-        self.live.dress(dt, &mut self.world.entities);
+
+        // 05-06 RV5: tier-gated animation. ASCII tier is STATIC per user
+        // feedback ("ascii все ещё ничего не понятно, может там убрать
+        // анимацию и прозрачность блоков" — RV5). Skip the spin advance
+        // (spin stays at its current value — 0.0 on a fresh App that's
+        // entered Ascii mode at startup) AND drive dress() with a "snap"
+        // dt so boxes jump straight to target half-extent instead of
+        // breathing. Spring half-life is 0.15s; 1.0s of simulated dt
+        // settles to within ~10^-3 (>5·half_life), well past the visible
+        // 2% threshold — boxes "teleport" to size from the renderer's POV
+        // without breaching the spring's framerate-independent guard.
+        //
+        // Kitty + Truecolor tiers keep the original behavior — spin
+        // advances, breathing eases, every commit before RV5 stays
+        // pixel-identical there.
+        if self.render_mode.is_animated() {
+            self.spin = (self.spin + SPIN_RATE * dt).rem_euclid(std::f32::consts::TAU);
+            // Per-frame size easing (CONT-03 / 04-01). Mutates `half_extents`
+            // in place on the live world's entity slice — no World
+            // reallocation per tick (RESEARCH Pitfall A). dt is REAL elapsed
+            // time; `on_tick` is the canonical place for framerate-independent
+            // motion. Empty world is a no-op (zero-length slice).
+            self.live.dress(dt, &mut self.world.entities);
+        } else {
+            // Static-tier snap: settle every entry to target instantly so
+            // a newly-added container appears at its real size rather than
+            // the MIN_HALF floor a wireframe-pre-easing frame would show.
+            // dt=1.0 is well past 5·half_life (0.75s); the spring lands
+            // within 1‰ of target.
+            self.live.dress(1.0, &mut self.world.entities);
+        }
         // Brightness-pulse phase advance for the selected box (04-03 CAM-04).
         // Same dt source as dress() so the pulse is framerate-independent.
         self.selection.tick(dt);
@@ -1973,6 +1997,119 @@ mod tests {
         assert_eq!(
             app.render_mode,
             crate::term::capability::TerminalCapability::Kitty,
+        );
+    }
+
+    // ---- 05-06 RV5: tier-gated animation (ASCII = static) ---------------
+
+    /// RV5 pin: in the Truecolor tier (and Kitty — both `is_animated()`)
+    /// `on_tick` advances `self.spin` by `SPIN_RATE * dt`. This pins the
+    /// pre-RV5 baseline so a future change to the gate doesn't accidentally
+    /// freeze the animated tiers.
+    #[test]
+    fn on_tick_advances_spin_in_truecolor_tier() {
+        let mut app = App::new();
+        // Default tier is Truecolor — animated.
+        assert_eq!(
+            app.render_mode,
+            crate::term::capability::TerminalCapability::Truecolor,
+        );
+        let spin_before = app.spin;
+        app.on_tick(0.1);
+        assert!(
+            app.spin > spin_before,
+            "Truecolor tier must advance spin per tick; before={spin_before} after={}",
+            app.spin,
+        );
+        // Numerically: 0.1s at SPIN_RATE (0.525 rad/s) -> ~0.0525 rad.
+        assert!(
+            (app.spin - 0.0525).abs() < 1e-4,
+            "expected ~0.0525 rad after 0.1s tick, got {}",
+            app.spin,
+        );
+    }
+
+    /// RV5 contract: in the ASCII tier `on_tick` MUST NOT advance `self.spin`.
+    /// The user feedback that triggered RV5: "ascii все ещё ничего не
+    /// понятно, может там убрать анимацию и прозрачность блоков". Frozen
+    /// boxes are the legibility floor for SSH / weak terminals.
+    #[test]
+    fn on_tick_freezes_spin_in_ascii_tier() {
+        let mut app = App::new();
+        app.set_render_mode(crate::term::capability::TerminalCapability::Ascii);
+        let spin_before = app.spin;
+        // 100 ticks of 50ms — at SPIN_RATE this would normally rotate
+        // ~2.6 rad (almost a half turn). ASCII tier must hold spin still.
+        for _ in 0..100 {
+            app.on_tick(0.05);
+        }
+        assert_eq!(
+            app.spin, spin_before,
+            "ASCII tier must NOT advance spin across 100 ticks; got {} (started {spin_before})",
+            app.spin,
+        );
+    }
+
+    /// RV5 contract: in the ASCII tier `dress()` is called with a "snap" dt
+    /// (1.0s, well past 5·BREATHING_HALF_LIFE) so a newly-added container
+    /// jumps straight to its target size on the next tick instead of easing
+    /// up from the MIN_HALF floor — frame-to-frame STATIC, but the size is
+    /// still meaningful. Verify by adding a container and ticking once.
+    #[test]
+    fn on_tick_snaps_breathing_in_ascii_tier() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<DockerMsg>();
+        let mut app = App::with_docker_rx(rx);
+        app.set_render_mode(crate::term::capability::TerminalCapability::Ascii);
+
+        // Container appears with NO stats — target half is the MIN_HALF
+        // floor for a Running container. We tick once to drive dress().
+        tx.send(DockerMsg::Added(snap("only"))).unwrap();
+        app.drain_docker();
+        let half_before = app.world.entities[0].half_extents.x;
+
+        // Single ASCII-tier tick: dress() gets dt=1.0 (5·half_life past
+        // the 2% settle threshold).
+        app.on_tick(0.016);
+        let half_after = app.world.entities[0].half_extents.x;
+        // For a freshly-added Running container with no stat, target ==
+        // current (both MIN_HALF), so half_after == half_before is fine.
+        // The pin we care about: dress was called, the value is finite,
+        // no NaN. The snap behavior is exercised by easing.rs's
+        // `degenerate_half_life_snaps_safely` + reaches_within_two_percent
+        // tests; here we just pin that on_tick doesn't poison state in
+        // ASCII tier.
+        assert!(
+            half_after.is_finite() && half_after > 0.0,
+            "ASCII tier on_tick produced non-finite or non-positive half_extent: {half_after} (was {half_before})",
+        );
+    }
+
+    /// RV5 contract: switching tiers mid-flight changes the spin advance
+    /// behavior on the very NEXT tick — no sticky animation latch. Pin the
+    /// transition so a future "remember last tier" optimization doesn't
+    /// regress this.
+    #[test]
+    fn on_tick_tier_switch_changes_spin_behavior_immediately() {
+        let mut app = App::new(); // starts Truecolor (animated)
+        // First tick: animated -> spin advances.
+        app.on_tick(0.1);
+        let after_animated = app.spin;
+        assert!(after_animated > 0.0);
+
+        // Switch to ASCII; next tick must NOT advance spin.
+        app.set_render_mode(crate::term::capability::TerminalCapability::Ascii);
+        app.on_tick(0.1);
+        assert_eq!(
+            app.spin, after_animated,
+            "tier switch to ASCII must freeze spin from the very next tick",
+        );
+
+        // Switch back to Kitty (also animated) — spin resumes.
+        app.set_render_mode(crate::term::capability::TerminalCapability::Kitty);
+        app.on_tick(0.1);
+        assert!(
+            app.spin > after_animated,
+            "tier switch back to Kitty must resume spin advance",
         );
     }
 }
