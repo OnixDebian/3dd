@@ -99,6 +99,149 @@ pub(crate) enum KittyRenderDecision {
     ChromeOnly,
 }
 
+/// Terminal geometry the kitty render loop feeds to `render_rgba` /
+/// `emit_kitty`: `(cols, rows, image_px_w, image_px_h)`.
+///
+/// `image_px_w/image_px_h` are the IMAGE pixel dimensions (after reserving
+/// the bottom row for the status bar), not the raw terminal pixel size. They
+/// land in the kitty graphics protocol header as `s={w},v={h}` — so any
+/// change between consecutive frames forces kitty to allocate a NEW GPU
+/// texture instead of taking the same-dimension atomic-replace fast path
+/// that RV5 relies on.
+pub(crate) type KittyGeometry = (u16, u16, usize, usize);
+
+/// Number of consecutive frames a NEW geometry must be reported by
+/// `crossterm::terminal::window_size()` before the kitty render loop
+/// adopts it as the live geometry.
+///
+/// Set to 3 frames (~100 ms at the 30 FPS render cadence). Single-frame
+/// blips from compositor surface reconfiguration (e.g. OBS / wf-recorder /
+/// any xdg-desktop-portal screencast init that briefly invalidates the
+/// terminal surface and triggers a transient pixel-size change) are
+/// suppressed: the loop keeps using the previously-stable geometry and
+/// `emit_kitty` keeps hitting the same-dimension atomic-replace path. A
+/// genuine user-driven resize persists across many frames and is adopted
+/// after the ~100 ms gate — imperceptible to a human resizing a window.
+pub(crate) const KITTY_GEOMETRY_STABILITY_FRAMES: u32 = 3;
+pub(crate) const KITTY_FALLBACK_GEOMETRY: KittyGeometry = (90, 30, 720, 560);
+
+/// Per-frame state for the dimension-stability gate.
+///
+/// Tracks the currently-adopted geometry (`stable`) plus the most recently
+/// CANDIDATE geometry from `window_size()` and how many consecutive frames
+/// it has been observed.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct KittyGeometryGate {
+    stable: Option<KittyGeometry>,
+    candidate: Option<KittyGeometry>,
+    candidate_streak: u32,
+}
+
+impl KittyGeometryGate {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// The currently-adopted geometry (`None` before the first successful
+    /// poll). Tests use this to assert the stability gate's external
+    /// behavior without poking at internal counters.
+    #[allow(dead_code)]
+    pub(crate) fn stable(&self) -> Option<KittyGeometry> {
+        self.stable
+    }
+}
+
+/// Pure dimension-stability resolver for the kitty render loop.
+///
+/// Drives `KittyGeometryGate`. Called once per frame with the result of
+/// `crossterm::terminal::window_size()` (filtered to `Some` iff the values
+/// look valid: positive cols/rows AND positive pixel dimensions). Returns
+/// the geometry the frame should use.
+///
+/// Behavior:
+///
+/// 1. **First valid poll (cold start).** Adopt immediately as `stable` —
+///    no gate; the loop has nothing else to use.
+/// 2. **Current matches `stable`.** Adopt; reset the candidate counter
+///    (steady state — no flutter).
+/// 3. **Current matches the candidate AND streak ≥
+///    `KITTY_GEOMETRY_STABILITY_FRAMES`.** Promote candidate to `stable`,
+///    reset counter — genuine resize confirmed.
+/// 4. **Current matches the candidate but streak hasn't yet hit the
+///    threshold.** Increment streak; return the old `stable` (don't yet
+///    adopt the new geometry; this is the suppress-flutter path that
+///    closes the OBS-recording-start flicker).
+/// 5. **Current differs from BOTH `stable` and current candidate.** Set a
+///    new candidate with streak=1; return old `stable`.
+/// 6. **No valid `current` (window_size returned 0 or errored).** Hold
+///    the existing `stable` if any, else fall back to
+///    `KITTY_FALLBACK_GEOMETRY`. Candidate is left unchanged — a
+///    transient-invalid frame doesn't reset a real in-flight resize.
+///
+/// **Invariant** — once `stable` is `Some(_)`, the resolver NEVER returns
+/// a different geometry within the next `KITTY_GEOMETRY_STABILITY_FRAMES -
+/// 1` calls regardless of `current`. This is the byte-level property that
+/// closes the user-reported "flickers when starting OBS recording" bug:
+/// during the compositor surface reconfiguration triggered by OBS's
+/// screencast portal allocation, the terminal may emit one or two
+/// invalid/transient pixel-size reports, but the kitty image headers stay
+/// byte-stable (`s={w},v={h}` unchanged) so `emit_kitty` keeps using the
+/// same-dimension atomic-replace fast path RV5 relies on.
+pub(crate) fn resolve_kitty_geometry(
+    gate: &mut KittyGeometryGate,
+    current: Option<KittyGeometry>,
+) -> KittyGeometry {
+    match current {
+        Some(cur) => {
+            match gate.stable {
+                None => {
+                    // Cold-start: first valid poll. Adopt immediately —
+                    // there is nothing else to hold.
+                    gate.stable = Some(cur);
+                    gate.candidate = None;
+                    gate.candidate_streak = 0;
+                    cur
+                }
+                Some(stable) if cur == stable => {
+                    // Steady state: same geometry as stable. Reset any
+                    // in-flight candidate (flutter has resolved).
+                    gate.candidate = None;
+                    gate.candidate_streak = 0;
+                    stable
+                }
+                Some(stable) => {
+                    // Differs from stable. Treat as a candidate.
+                    if gate.candidate == Some(cur) {
+                        gate.candidate_streak =
+                            gate.candidate_streak.saturating_add(1);
+                    } else {
+                        gate.candidate = Some(cur);
+                        gate.candidate_streak = 1;
+                    }
+                    if gate.candidate_streak >= KITTY_GEOMETRY_STABILITY_FRAMES {
+                        // Confirmed resize — promote.
+                        gate.stable = Some(cur);
+                        gate.candidate = None;
+                        gate.candidate_streak = 0;
+                        cur
+                    } else {
+                        // Suppress the flutter: keep emitting at the
+                        // previously-stable geometry so the kitty image
+                        // header's `s=,v=` bytes don't change.
+                        stable
+                    }
+                }
+            }
+        }
+        None => {
+            // Invalid poll. Hold the stable geometry if any, else fall
+            // back. Leave candidate state alone — a single invalid frame
+            // shouldn't reset an in-flight resize.
+            gate.stable.unwrap_or(KITTY_FALLBACK_GEOMETRY)
+        }
+    }
+}
+
 /// Pure decision function for the kitty render branch. Takes ONLY the state
 /// scalars the per-frame loop tracks; returns which path to take.
 ///
@@ -1423,6 +1566,20 @@ pub fn run_kitty(
     // one. Avoids stale-label streaks when the selection moves or the box
     // spins past the camera-facing position.
     let mut last_label_print: Option<(u16, u16, usize)> = None;
+    // 05-05-RV6: dimension-stability gate. The kitty graphics protocol
+    // emits image dimensions in the header (`s={w},v={h}`); when those
+    // bytes change between consecutive frames, kitty must allocate a new
+    // GPU texture for the `i=1` placement (the same-dimension atomic-
+    // replace fast path RV5 relies on doesn't apply to a dimension
+    // change). The user reported "still flickers when starting OBS
+    // recording" — diagnosed as compositor surface reconfiguration during
+    // xdg-desktop-portal screencast init causing one or two transient
+    // pixel-size reports from `crossterm::terminal::window_size()`. The
+    // gate holds the previously-stable geometry until a NEW geometry
+    // persists for `KITTY_GEOMETRY_STABILITY_FRAMES` consecutive frames
+    // (~100 ms at 30 FPS) — single-frame flutter is suppressed; a
+    // genuine user-driven resize is adopted ~100 ms later (imperceptible).
+    let mut geometry_gate = KittyGeometryGate::new();
 
     let result = (|| -> Result<()> {
         loop {
@@ -1555,14 +1712,29 @@ pub fn run_kitty(
 
             // Terminal geometry: cells (cols/rows) for the status line + pixels for
             // the image. Reserve the BOTTOM cell row for the status bar so the image
-            // never covers it. Fall back to sane defaults if the terminal doesn't
-            // report a pixel size.
-            let (cols, rows, px_w, px_h) = match crossterm::terminal::window_size() {
-                Ok(ws) if ws.width > 0 && ws.height > 0 && ws.rows > 0 => {
-                    (ws.columns, ws.rows, ws.width as usize, ws.height as usize)
-                }
-                _ => (90, 30, 720, 560),
-            };
+            // never covers it.
+            //
+            // 05-05-RV6: route through `resolve_kitty_geometry` /
+            // `KittyGeometryGate` (above) to suppress single-frame pixel-
+            // size flutter from compositor surface reconfiguration (OBS
+            // screencast portal init, wf-recorder start, etc.). The kitty
+            // image header carries `s={w},v={h}`; holding those bytes
+            // stable across the OBS-init window keeps `emit_kitty` on the
+            // same-dimension atomic-replace fast path (RV5 invariant) so
+            // the user no longer sees the 3D image vanish for a frame or
+            // two when starting a screen recording.
+            let current_geometry: Option<KittyGeometry> =
+                match crossterm::terminal::window_size() {
+                    Ok(ws) if ws.width > 0 && ws.height > 0 && ws.rows > 0 => Some((
+                        ws.columns,
+                        ws.rows,
+                        ws.width as usize,
+                        ws.height as usize,
+                    )),
+                    _ => None,
+                };
+            let (cols, rows, px_w, px_h) =
+                resolve_kitty_geometry(&mut geometry_gate, current_geometry);
             let cell_h = (px_h / rows as usize).max(1);
             let w = px_w.min(1400);
             let h = px_h.saturating_sub(cell_h).clamp(1, 1080); // leave the last row
@@ -3096,5 +3268,205 @@ mod tests {
              Wire bytes (lossy): {s:?}",
             KITTY_IMAGE_ID,
         );
+    }
+
+    // ---- 05-05-RV6 dimension-stability gate (OBS-recording-start flicker) ----
+
+    /// Cold start: the very first valid poll is adopted immediately as the
+    /// stable geometry. There is nothing else to hold; the gate must not
+    /// fall back to `KITTY_FALLBACK_GEOMETRY` once the terminal reports a
+    /// real value.
+    #[test]
+    fn rv6_geometry_gate_cold_start_adopts_first_valid_poll() {
+        let mut gate = KittyGeometryGate::new();
+        let real: KittyGeometry = (120, 40, 1280, 720);
+        let resolved = resolve_kitty_geometry(&mut gate, Some(real));
+        assert_eq!(resolved, real);
+        assert_eq!(gate.stable(), Some(real));
+    }
+
+    /// Single-frame flutter (one frame at a DIFFERENT geometry surrounded
+    /// by the original) is SUPPRESSED. The kitty image header bytes
+    /// `s={w},v={h}` stay constant across the blip, so `emit_kitty` keeps
+    /// hitting the same-dimension atomic-replace fast path RV5 relies on.
+    /// This is the property that closes the user-reported "still flickers
+    /// when starting OBS recording" bug.
+    #[test]
+    fn rv6_geometry_gate_suppresses_single_frame_flutter() {
+        let mut gate = KittyGeometryGate::new();
+        let stable: KittyGeometry = (120, 40, 1280, 720);
+        let blip: KittyGeometry = (90, 30, 720, 560);
+        // Warm up to stable.
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(stable)), stable);
+        // ONE frame at blip → still stable.
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(blip)), stable);
+        // Back to stable → still stable; candidate cleared.
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(stable)), stable);
+        assert_eq!(gate.stable(), Some(stable));
+    }
+
+    /// Two-frame flutter (e.g. compositor reconfigure spans two frames)
+    /// is still suppressed — only at frame 3 of a sustained NEW geometry
+    /// does the gate adopt it. This is the load-bearing invariant: the
+    /// `KITTY_GEOMETRY_STABILITY_FRAMES = 3` threshold means a real
+    /// resize is adopted ~100 ms after the user stops dragging (well
+    /// within human perception threshold) but transient blips up to 2
+    /// frames are filtered out.
+    #[test]
+    fn rv6_geometry_gate_suppresses_two_frame_flutter_then_adopts_at_three() {
+        let mut gate = KittyGeometryGate::new();
+        let stable: KittyGeometry = (120, 40, 1280, 720);
+        let new: KittyGeometry = (140, 50, 1400, 900);
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(stable)), stable);
+        // Frame 1 of new: still stable.
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(new)), stable);
+        // Frame 2 of new: still stable.
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(new)), stable);
+        // Frame 3 of new: PROMOTED. Confirmed resize.
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(new)), new);
+        assert_eq!(gate.stable(), Some(new));
+    }
+
+    /// A transient INVALID poll (window_size returned 0 or errored) is
+    /// silently held at the stable geometry. The kitty path never emits
+    /// a frame at the `(90, 30, 720, 560)` fallback unless the very first
+    /// poll (cold start) is invalid. This stops the pre-RV6 behavior
+    /// where a single transient invalid report flipped the emit
+    /// dimensions to the fallback and back, breaking RV5's same-dimension
+    /// atomic-replace.
+    #[test]
+    fn rv6_geometry_gate_holds_stable_on_invalid_poll() {
+        let mut gate = KittyGeometryGate::new();
+        let stable: KittyGeometry = (120, 40, 1280, 720);
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(stable)), stable);
+        // Invalid poll: hold stable, do NOT fall back.
+        assert_eq!(resolve_kitty_geometry(&mut gate, None), stable);
+        assert_eq!(resolve_kitty_geometry(&mut gate, None), stable);
+        // Recover: stable still stable.
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(stable)), stable);
+    }
+
+    /// Cold-start invalid poll falls back to `KITTY_FALLBACK_GEOMETRY`
+    /// (the only time the fallback is ever returned). This is a
+    /// defensive contract — without a stable to hold, the loop needs
+    /// SOMETHING for the first frame's `render_rgba` + `emit_kitty`.
+    #[test]
+    fn rv6_geometry_gate_falls_back_only_on_cold_start_invalid() {
+        let mut gate = KittyGeometryGate::new();
+        assert_eq!(resolve_kitty_geometry(&mut gate, None), KITTY_FALLBACK_GEOMETRY);
+        // The fallback is NOT promoted to stable — the next valid poll
+        // adopts cleanly.
+        assert_eq!(gate.stable(), None);
+        let real: KittyGeometry = (120, 40, 1280, 720);
+        assert_eq!(resolve_kitty_geometry(&mut gate, Some(real)), real);
+    }
+
+    /// Constant-geometry steady state: 100 frames at the same geometry
+    /// must all return the same geometry. This pins that the gate doesn't
+    /// drift, spuriously promote, or otherwise mutate the stable value
+    /// when nothing has changed — the most common case in practice (a
+    /// user not resizing their window during normal operation).
+    #[test]
+    fn rv6_geometry_gate_steady_state_is_stable() {
+        let mut gate = KittyGeometryGate::new();
+        let geom: KittyGeometry = (120, 40, 1280, 720);
+        for i in 0..100 {
+            let resolved = resolve_kitty_geometry(&mut gate, Some(geom));
+            assert_eq!(resolved, geom, "frame {i}: drifted from steady state");
+        }
+        assert_eq!(gate.stable(), Some(geom));
+    }
+
+    /// **05-05-RV6 ANTI-FLICKER end-to-end byte-level invariant.**
+    ///
+    /// Simulate the wire-bytes scenario that reproduces the OBS-start
+    /// flicker: 6 frames where the middle 2 frames report a DIFFERENT
+    /// geometry (compositor surface reconfigure during xdg-desktop-portal
+    /// screencast init). With the gate in place, all 6 emitted images
+    /// MUST carry the same `s=,v=` bytes — kitty stays on the same-
+    /// dimension atomic-replace fast path the entire time and the user
+    /// sees no gap in the 3D image.
+    ///
+    /// Pre-RV6 the middle two frames would have emitted with a DIFFERENT
+    /// `s=,v=`, forcing kitty to allocate a new GPU texture twice (once
+    /// on the way in, once on the way out) — each allocation creating a
+    /// gap in the `i=1` placement and a one-frame flash of the prior
+    /// image's geometry. The user's "still flickers when starting OBS
+    /// recording" symptom IS that exact gap.
+    #[test]
+    fn rv6_consecutive_frames_image_header_bytes_stable_under_blip() {
+        let mut gate = KittyGeometryGate::new();
+        let stable: KittyGeometry = (120, 40, 1280, 720);
+        // 6-frame sequence: 2 stable, 2 blip (different), 2 stable.
+        // The blip lasts under KITTY_GEOMETRY_STABILITY_FRAMES so the
+        // gate must hold stable for ALL 6 frames.
+        let blip: KittyGeometry = (90, 30, 720, 560);
+        let polls: [Option<KittyGeometry>; 6] = [
+            Some(stable),
+            Some(stable),
+            Some(blip),
+            Some(blip),
+            Some(stable),
+            Some(stable),
+        ];
+        let mut wire: Vec<u8> = Vec::new();
+        for poll in polls {
+            let (_cols, _rows, w, h) = resolve_kitty_geometry(&mut gate, poll);
+            // Reserve last row → image height is px_h minus one cell.
+            // For the test we just feed (px_w, px_h) directly; the
+            // property under test is that EVERY frame's emitted header
+            // carries the same `s=,v=`.
+            //
+            // Tiny rgba: 1×1 px. We only assert header bytes — not the
+            // visual content.
+            let small_w = w.min(8);
+            let small_h = h.min(8);
+            let rgba = vec![0u8; small_w * small_h * 4];
+            emit_kitty(&mut wire, &rgba, small_w, small_h).expect("emit_kitty");
+        }
+        let s = String::from_utf8_lossy(&wire);
+        // Stable geometry feeds w=8, h=8 because of the `.min(8)`
+        // clamp — both stable AND blip should reduce to the same 8×8 in
+        // the test. So this property is trivially satisfied UNLESS the
+        // gate accidentally promoted blip mid-sequence and stable !=
+        // blip even after clamping. Defensive: also assert via wider
+        // dims that exceed the clamp.
+        //
+        // Re-run with larger dims so the `.min(8)` clamp can't mask a
+        // promotion bug.
+        let mut gate2 = KittyGeometryGate::new();
+        let stable2: KittyGeometry = (120, 40, 200, 200);
+        let blip2: KittyGeometry = (90, 30, 100, 100);
+        let polls2: [Option<KittyGeometry>; 6] = [
+            Some(stable2),
+            Some(stable2),
+            Some(blip2),
+            Some(blip2),
+            Some(stable2),
+            Some(stable2),
+        ];
+        let mut wire2: Vec<u8> = Vec::new();
+        for poll in polls2 {
+            let (_cols, _rows, w, h) = resolve_kitty_geometry(&mut gate2, poll);
+            let rgba = vec![0u8; w * h * 4];
+            emit_kitty(&mut wire2, &rgba, w, h).expect("emit_kitty");
+        }
+        let s2 = String::from_utf8_lossy(&wire2);
+        // Every frame must have used the stable (200×200) dims.
+        let n_stable = s2.matches("s=200,v=200").count();
+        let n_blip = s2.matches("s=100,v=100").count();
+        assert_eq!(
+            n_stable, 6,
+            "all 6 frames must emit with the stable s=200,v=200 header; \
+             got {n_stable}. Wire (lossy, len={}): {s2:.500?}", s2.len(),
+        );
+        assert_eq!(
+            n_blip, 0,
+            "no frame may emit with the blip s=100,v=100 header; got \
+             {n_blip}. Wire (lossy, len={}): {s2:.500?}", s2.len(),
+        );
+        // First-test sanity (clamped case): no `a=d` in either capture.
+        assert!(!s.contains("a=d"));
+        assert!(!s2.contains("a=d"));
     }
 }
