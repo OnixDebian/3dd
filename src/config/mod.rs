@@ -26,6 +26,46 @@ use serde::{Deserialize, Serialize};
 /// as wide), so the same world-space unit length would otherwise map to a larger
 /// vertical than horizontal on-screen extent — cubes render as bricks. We fold a
 /// single named factor into the perspective `aspect` term to undo this.
+///
+/// # Braille vs kitty perspective parity (05-06 RV3 known limitation)
+///
+/// The braille tier with `cell_aspect=2.0` produces a projector aspect of
+/// `(W*2)/(H*4)/2.0 = W/(4H)`, while the kitty tier (real square pixels,
+/// `cell_aspect=1.0`) produces `(W*cw_px)/(H*ch_px) = W*cw/(H*ch)` where
+/// `ch_px/cw_px ≈ 2.0` for typical monospace fonts — so kitty's projector
+/// aspect is `≈ W/(2H)`, TWICE the braille aspect. A smaller aspect under
+/// `perspective_rh` means a larger horizontal-FOV per vertical-FOV, which
+/// makes a fixed-size world box project WIDER on screen. Net effect: the
+/// braille tier renders boxes ~50% squatter (wider/flatter) than the kitty
+/// tier renders the same scene.
+///
+/// User feedback recorded in 05-06 RV3 (translated): "braille is better
+/// [than ASCII] but everything is flattened [compared to kitty]". This is
+/// the same projection-aspect asymmetry described above, not a regression.
+/// We deliberately keep `cell_aspect=2.0` because Phase 1 calibrated the
+/// camera framing (FRAME_REF_CELL_ASPECT, FRAME_TARGET_FILL, the entire
+/// `frame_scene` distance solver, and ~40 dependent tests) around it.
+/// Lowering it ON THE PROJECTOR ONLY (leaving the framing alone) was tried
+/// at 1.5 and 1.0 during RV3 diagnosis: both narrowed boxes horizontally
+/// inside the SAME framed window without actually adding vertical extent
+/// (the vertical FOV is fixed at `DEFAULT_FOV`), so visible "flatness"
+/// changed shape but not magnitude. A correct fix would need to also
+/// re-frame the camera against the new projector cell_aspect — a Phase-1
+/// invariant-touching change deferred to v2.
+///
+/// **For now, this is documented as an intrinsic property of the braille
+/// tier under the current camera-framing calibration.** The kitty tier is
+/// the reference visual; the braille tier is a fallback and accepts a
+/// modest aspect-ratio drift in exchange for working on every Unicode-
+/// Braille-capable terminal without pixel-protocol support. ASCII tier
+/// (RV2: `HalfBlock`) inherits the same braille framing path and therefore
+/// the same drift — no additional concern.
+///
+/// **Future fix sketch (v2):** thread the actual terminal cell pixel size
+/// (already available via `crossterm::terminal::window_size`) into a
+/// dynamic `RenderConfig.cell_aspect = ch_px / cw_px * 0.5` for braille,
+/// AND have the camera re-frame against this dynamic aspect on resize /
+/// startup. Touches Phase 1's framing constants — out of scope for 05-06.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub struct RenderConfig {
