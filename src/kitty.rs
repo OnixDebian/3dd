@@ -10,19 +10,25 @@
 //! to a raw RGBA file, for offline inspection). The camera holds a fixed 3/4
 //! framing angle; the motion is each box spinning in place about its own +Y axis.
 
+use std::collections::HashSet;
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use color_eyre::Result;
-use crossterm::event::{self, Event};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::event::{
+    self, Event, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
+};
 use crossterm::{cursor, execute};
 use glam::Vec3;
 use ratatui::style::Color;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::action::{apply_input_action, coalesce_actions, Action, Effect};
+use crate::action::{apply_input_action, coalesce_actions, Action, Effect, HeldAction};
 use crate::camera::{Camera, DEFAULT_FOV, SPIN_RATE};
 use crate::config::RenderConfig;
 use crate::docker::Docker;
@@ -1463,6 +1469,41 @@ pub fn run_kitty(
     write!(stdout, "\x1b[2J")?; // clear screen
     stdout.flush()?;
 
+    // 05-05-RV7: enable the kitty keyboard protocol (KKP) so the loop
+    // receives `KeyEventKind::Press` AND `KeyEventKind::Release` (not
+    // just Press as on most pre-KKP terminals). Without Release we
+    // can't tell when the user lifts a movement key, which is what
+    // the held-set approach requires to bypass the OS auto-repeat
+    // initial delay (~250-500 ms) the user complained about ("first
+    // tick fires immediately but second has a delay").
+    //
+    // Symmetric with `Tui::enter` in the braille backend: best-effort
+    // push, falls back to OS-repeat path if the terminal doesn't
+    // support it. The `crate::tui::mark_kkp_active(true)` call hooks
+    // the kitty path into the same panic-hook `restore()` that pops
+    // KKP on crash — otherwise a panic inside run_kitty would leave
+    // KKP active across process exit and the host shell would render
+    // arrow keys as escape sequences.
+    let kkp_active = if supports_keyboard_enhancement().unwrap_or(false) {
+        let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
+        if execute!(stdout, PushKeyboardEnhancementFlags(flags)).is_ok() {
+            crate::tui::mark_kkp_active(true);
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    // Held-key set, populated only when `kkp_active`. On non-KKP
+    // terminals this stays empty forever and the loop falls back to
+    // the OS-repeat → Action::Nudge* path (Action::from_key still
+    // produces a Nudge for KeyEventKind::Repeat on movement keys, so
+    // the user gets the pre-RV7 OS-repeat behavior — including the
+    // initial delay, which we can't fix without KKP).
+    let mut held_keys: HashSet<HeldAction> = HashSet::new();
+
     // Resolve initial palette from config.palette. Unknown name falls back
     // to notion-soft AND rewrites palette_name so the cycle's .position()
     // lookup can find the current slot (mirrors App::with_docker; see that
@@ -1598,10 +1639,53 @@ pub fn run_kitty(
             // coalesce identical kinds into one (matches App::run in braille).
             // Hold-to-glide still works (each frame pulls the next batch and
             // applies one nudge); release stops motion on the next frame.
+            //
+            // 05-05-RV7: when `kkp_active`, route movement-key Press into
+            // the held set (and dispatch one nudge for the first tick),
+            // movement-key Release out, and IGNORE movement-key Repeat
+            // (held_keys drives the cadence instead). Non-movement keys
+            // and non-KKP terminals: unchanged path through
+            // `Action::from_key`, which drops Repeat for discrete keys
+            // (so holding P / L / Tab cycles ONCE per Press).
             let mut pending_actions: Vec<Action> = Vec::new();
             while event::poll(Duration::from_millis(0))? {
                 if let Event::Key(k) = event::read()? {
+                    if kkp_active {
+                        if let Some(held) = HeldAction::from_key_code(k.code) {
+                            match k.kind {
+                                KeyEventKind::Press => {
+                                    held_keys.insert(held);
+                                    // First-tick: dispatch one nudge
+                                    // immediately so the user sees motion
+                                    // the moment they press a key.
+                                    pending_actions.push(held.to_action());
+                                }
+                                KeyEventKind::Release => {
+                                    held_keys.remove(&held);
+                                }
+                                KeyEventKind::Repeat => {
+                                    // No-op: per-frame held loop drives
+                                    // the cadence below.
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                    // Non-movement keys (or non-KKP terminal): route
+                    // through from_key. Discrete-key Repeat is dropped
+                    // there (so holding P doesn't auto-cycle).
                     pending_actions.push(Action::from_key(k));
+                }
+            }
+            // 05-05-RV7: per-frame held-set dispatch. Emit one nudge per
+            // held movement key on every render frame. This bypasses the
+            // OS auto-repeat initial delay: the moment a key enters the
+            // set, every subsequent frame fires a nudge until the
+            // matching Release removes it. On non-KKP terminals
+            // `held_keys` stays empty and this loop is a noop.
+            if !held_keys.is_empty() {
+                for held in held_keys.iter() {
+                    pending_actions.push(held.to_action());
                 }
             }
             let mut quit_requested = false;
@@ -2074,6 +2158,17 @@ pub fn run_kitty(
 
     // Restore.
     let _ = delete_all(&mut stdout);
+    // 05-05-RV7: pop KKP before disabling raw mode so the pop escape is
+    // parsed under raw mode (where the terminal handles it cleanly)
+    // rather than echoed on the cooked-mode shell prompt after exit.
+    // Pair with the push above; idempotent if not active. Also clears
+    // the global KKP_ACTIVE flag the panic hook checks, so a clean
+    // shutdown doesn't leave the flag set for some hypothetical future
+    // panic.
+    if kkp_active {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+        crate::tui::mark_kkp_active(false);
+    }
     let _ = execute!(stdout, cursor::Show);
     let _ = write!(stdout, "\x1b[2J\x1b[H");
     let _ = stdout.flush();

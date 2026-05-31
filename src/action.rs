@@ -41,8 +41,46 @@
 //! AZERTY/Dvorak users still get layout-independent input via arrows.
 //!
 //! Pitfall E: `KeyEventKind::Press` AND `KeyEventKind::Repeat` are treated
-//! identically; `Release` is ignored. Holding a key produces a smooth glide
-//! on terminals that surface Repeat events.
+//! identically for CONTINUOUS Nudge axes (the OS-repeat fallback path on
+//! terminals without the kitty keyboard protocol). For DISCRETE actions
+//! (CyclePalette / ToggleLegend / SelectNext / SelectPrev / OpenDetail /
+//! CloseDetail / Quit) only `Press` produces an Action — `Repeat` and
+//! `Release` map to `Action::None`. This is the 05-05-RV7 "kill the
+//! OS-repeat delay" fix: holding `P` MUST cycle the palette once (not
+//! N times), and holding an arrow drives continuous nudges (via either
+//! KKP held-set tracking — see [`HeldAction`] — or OS Repeat fallback
+//! depending on terminal capability).
+//!
+//! ## 05-05-RV7: KKP-driven held-key tracking ([`HeldAction`])
+//!
+//! User feedback after 05-05-RV6: "когда зажмию стрелки первый тик
+//! срабатывает сразу, а второй с задержкой, можно её убрать (при
+//! повороте камеры или смене темы)". Translated: holding an arrow key
+//! fires the first tick immediately, then waits the OS auto-repeat
+//! delay (~250-500 ms) before the second tick — the user perceives
+//! input lag.
+//!
+//! Root cause: terminals deliver key-repeat events at the OS-configured
+//! cadence with the OS-configured initial delay. With ONLY Press events
+//! available (most terminals' default), we can't track "is the key still
+//! held" — we are stuck with the OS-repeat rhythm including its initial
+//! pause.
+//!
+//! Fix: enable the kitty keyboard protocol (KKP) at `Tui::enter` /
+//! `run_kitty` startup; KKP delivers `KeyEventKind::Press` AND
+//! `KeyEventKind::Release` AND `KeyEventKind::Repeat`. The render loop
+//! maintains a `HashSet<HeldAction>`: insert on Press, remove on
+//! Release. Each render tick, if any held action is present, dispatch
+//! ONE nudge per held action — bypassing the OS initial-delay entirely.
+//! Discrete actions are NOT auto-fired on Repeat (they fire once per
+//! Press), so holding `P` cycles the palette exactly once.
+//!
+//! On terminals without KKP support, `kkp_active` stays false and the
+//! held-set stays empty; the OS-repeat → Action::Nudge* fallback path
+//! (Press + Repeat both produce Nudge Actions, coalesced once per
+//! frame) preserves the pre-RV7 behavior. So the worst case is "no
+//! regression"; the best case (kitty / ghostty / WezTerm) is the lag
+//! is gone.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -50,6 +88,85 @@ use crate::camera::{self, Camera};
 use crate::world::live::LiveWorld;
 use crate::world::selection::Selection;
 use crate::world::World;
+
+/// A continuous movement intent that can be HELD across multiple render
+/// ticks (05-05-RV7). When the kitty keyboard protocol (KKP) is active,
+/// the render loop tracks a `HashSet<HeldAction>` — insert on Press,
+/// remove on Release — and emits one nudge per held action per tick.
+/// This sidesteps the OS auto-repeat initial-delay (~250-500 ms) that
+/// caused the user-reported "first tick fires immediately but second
+/// has a delay" perception.
+///
+/// Discrete actions (Quit, CyclePalette, ToggleLegend, Tab/BackTab,
+/// Enter, Esc) are NOT held — they fire once per Press and ignore
+/// Repeat/Release. Holding `P` cycles the palette ONCE; holding an
+/// arrow continuously orbits the camera. The two intent classes are
+/// kept separate by this enum (continuous → HeldAction) vs the rest
+/// of [`Action`] (discrete → Press-only).
+// The shared `Nudge` prefix on the variants below is intentional —
+// these are the held-continuous-nudge intents, and the prefix makes
+// the call sites read naturally (e.g.
+// `HeldAction::NudgeYawLeft.to_action()` returns `Action::NudgeYaw(...)`,
+// pinning the parallelism between held intents and dispatched Actions).
+// Removing the prefix would just move the `Nudge` into the call site
+// path without improving anything.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HeldAction {
+    /// Left arrow / 'a' — orbit yaw left.
+    NudgeYawLeft,
+    /// Right arrow / 'd' — orbit yaw right.
+    NudgeYawRight,
+    /// Up arrow / 'w' — orbit pitch up.
+    NudgePitchUp,
+    /// Down arrow / 's' — orbit pitch down.
+    NudgePitchDown,
+    /// '+' / '=' / PageUp — zoom in (closer).
+    NudgeZoomIn,
+    /// '-' / '_' / PageDown — zoom out (farther).
+    NudgeZoomOut,
+}
+
+impl HeldAction {
+    /// Map a raw [`KeyCode`] to a held continuous-movement action, if any.
+    /// `None` for discrete keys (P, L, Tab, Enter, q, Esc, …) — those are
+    /// NOT held; they fire once per Press via [`Action::from_key`].
+    ///
+    /// The set of mapped key codes mirrors the continuous arms of
+    /// [`Action::from_key`] exactly. Layout-independent arrows + WASD
+    /// coexist for Pitfall D coverage.
+    pub fn from_key_code(code: KeyCode) -> Option<HeldAction> {
+        match code {
+            KeyCode::Left | KeyCode::Char('a') => Some(HeldAction::NudgeYawLeft),
+            KeyCode::Right | KeyCode::Char('d') => Some(HeldAction::NudgeYawRight),
+            KeyCode::Up | KeyCode::Char('w') => Some(HeldAction::NudgePitchUp),
+            KeyCode::Down | KeyCode::Char('s') => Some(HeldAction::NudgePitchDown),
+            KeyCode::Char('+') | KeyCode::Char('=') | KeyCode::PageUp => {
+                Some(HeldAction::NudgeZoomIn)
+            }
+            KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::PageDown => {
+                Some(HeldAction::NudgeZoomOut)
+            }
+            _ => None,
+        }
+    }
+
+    /// The [`Action`] this held intent dispatches one of per render tick.
+    /// Reads the same step constants the OS-repeat fallback uses, so
+    /// hold-cadence under KKP matches hold-cadence on non-KKP terminals
+    /// to within the difference between (OS repeat rate) and (render
+    /// rate). Both ~30 Hz on a typical Linux setup.
+    pub fn to_action(self) -> Action {
+        match self {
+            HeldAction::NudgeYawLeft => Action::NudgeYaw(-camera::manual::YAW_STEP),
+            HeldAction::NudgeYawRight => Action::NudgeYaw(camera::manual::YAW_STEP),
+            HeldAction::NudgePitchUp => Action::NudgePitch(camera::manual::PITCH_STEP),
+            HeldAction::NudgePitchDown => Action::NudgePitch(-camera::manual::PITCH_STEP),
+            HeldAction::NudgeZoomIn => Action::NudgeZoom(-camera::manual::ZOOM_STEP),
+            HeldAction::NudgeZoomOut => Action::NudgeZoom(camera::manual::ZOOM_STEP),
+        }
+    }
+}
 
 /// A high-level input intent produced from a raw key event.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -108,20 +225,99 @@ pub enum Effect {
 impl Action {
     /// Map a raw [`KeyEvent`] to an [`Action`].
     ///
-    /// `Press` AND `Repeat` are treated identically (Pitfall E); `Release` is
-    /// ignored. Layout-independent arrow keys coexist with WASD chars
-    /// (Pitfall D). Ctrl-C is hard-coded to Quit regardless of key code.
+    /// For CONTINUOUS Nudge* axes: `Press` AND `Repeat` are treated
+    /// identically (Pitfall E) — this preserves the OS-repeat fallback
+    /// path for terminals without KKP (Press once → first nudge; OS
+    /// auto-repeats → subsequent nudges at the OS cadence).
+    ///
+    /// For DISCRETE actions (Quit, CloseDetail, SelectNext/Prev,
+    /// OpenDetail, CyclePalette, ToggleLegend): ONLY `Press` is honored.
+    /// `Repeat` and `Release` map to `Action::None`. This is the
+    /// 05-05-RV7 contract: holding `P` cycles the palette ONCE (not
+    /// N times at the OS-repeat rate), holding `Tab` advances selection
+    /// ONCE per press, etc. Discrete intents are "edge-triggered" — they
+    /// don't auto-fire while held.
+    ///
+    /// `Release` is also dropped for continuous keys at this layer; the
+    /// KKP-aware render loop consumes Release events via
+    /// [`HeldAction::from_key_code`] BEFORE calling `from_key`, so by
+    /// the time a Release would reach this function it has already
+    /// been processed into the held-set removal.
+    ///
+    /// Layout-independent arrow keys coexist with WASD chars
+    /// (Pitfall D). Ctrl-C is hard-coded to Quit regardless of key code
+    /// (and only on Press, same rule).
     pub fn from_key(key: KeyEvent) -> Action {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Action::None;
         }
-        // Ctrl-C always quits.
+        let is_repeat = matches!(key.kind, KeyEventKind::Repeat);
+        // Ctrl-C always quits — Press only (no auto-quit on hold).
         if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if is_repeat {
+                return Action::None;
+            }
             return Action::Quit;
         }
         match key.code {
-            KeyCode::Char('q') => Action::Quit,
-            KeyCode::Esc => Action::CloseDetail, // dispatch resolves quit vs close
+            // ---- DISCRETE: Press-only; Repeat → None so holding doesn't fire N times ----
+            KeyCode::Char('q') => {
+                if is_repeat {
+                    Action::None
+                } else {
+                    Action::Quit
+                }
+            }
+            KeyCode::Esc => {
+                if is_repeat {
+                    Action::None
+                } else {
+                    Action::CloseDetail
+                }
+            }
+            KeyCode::Tab => {
+                if is_repeat {
+                    Action::None
+                } else {
+                    Action::SelectNext
+                }
+            }
+            KeyCode::BackTab => {
+                if is_repeat {
+                    Action::None
+                } else {
+                    Action::SelectPrev
+                }
+            }
+            KeyCode::Enter => {
+                if is_repeat {
+                    Action::None
+                } else {
+                    Action::OpenDetail
+                }
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                if is_repeat {
+                    Action::None
+                } else {
+                    Action::CyclePalette
+                }
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                if is_repeat {
+                    Action::None
+                } else {
+                    Action::ToggleLegend
+                }
+            }
+            // ---- CONTINUOUS: Press AND Repeat both produce a Nudge (Pitfall E) ----
+            // These remain the OS-repeat fallback path for non-KKP terminals.
+            // On KKP-active terminals the render loop ALSO uses these via
+            // `HeldAction::to_action()` to drive nudges every tick a key is in
+            // the held set — but the KKP loop ignores incoming Repeat events
+            // for movement keys (it tracks Press/Release into the held-set
+            // instead). The map below stays unchanged so the legacy
+            // OS-repeat path is preserved byte-for-byte.
             KeyCode::Left | KeyCode::Char('a') => Action::NudgeYaw(-camera::manual::YAW_STEP),
             KeyCode::Right | KeyCode::Char('d') => Action::NudgeYaw(camera::manual::YAW_STEP),
             KeyCode::Up | KeyCode::Char('w') => Action::NudgePitch(camera::manual::PITCH_STEP),
@@ -132,11 +328,6 @@ impl Action {
             KeyCode::Char('-') | KeyCode::Char('_') | KeyCode::PageDown => {
                 Action::NudgeZoom(camera::manual::ZOOM_STEP)
             }
-            KeyCode::Tab => Action::SelectNext,
-            KeyCode::BackTab => Action::SelectPrev,
-            KeyCode::Enter => Action::OpenDetail,
-            KeyCode::Char('p') | KeyCode::Char('P') => Action::CyclePalette,
-            KeyCode::Char('l') | KeyCode::Char('L') => Action::ToggleLegend,
             _ => Action::None,
         }
     }
@@ -441,15 +632,78 @@ mod tests {
         );
     }
 
-    /// Repeat events route the same as Press (Pitfall E).
+    /// Repeat events route the same as Press for CONTINUOUS Nudge axes
+    /// (Pitfall E — preserves OS-repeat fallback on non-KKP terminals).
+    /// But for DISCRETE actions (Tab, q, Esc, P, L, Enter), Repeat maps to
+    /// `Action::None` (05-05-RV7 — holding `P` must cycle ONCE, not N
+    /// times). The held-set tracking in the KKP-aware render loop drives
+    /// continuous nudges directly from Press/Release, bypassing this
+    /// Repeat path entirely on supported terminals.
     #[test]
-    fn repeat_kind_maps_same_as_press() {
+    fn repeat_kind_maps_same_as_press_for_continuous_nudges() {
         assert_eq!(
             Action::from_key(key_repeat(KeyCode::Left)),
-            Action::NudgeYaw(-YAW_STEP)
+            Action::NudgeYaw(-YAW_STEP),
+            "Left arrow Repeat must still produce NudgeYaw — OS-repeat fallback"
         );
-        assert_eq!(Action::from_key(key_repeat(KeyCode::Tab)), Action::SelectNext);
-        assert_eq!(Action::from_key(key_repeat(KeyCode::Char('q'))), Action::Quit);
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::Char('w'))),
+            Action::NudgePitch(PITCH_STEP),
+            "W key Repeat must still produce NudgePitch — OS-repeat fallback"
+        );
+    }
+
+    /// 05-05-RV7: holding a DISCRETE key (Tab / q / Esc / Enter / P / L)
+    /// must NOT auto-fire on OS-repeat. The render loop fires the
+    /// discrete intent once per Press; Repeat is dropped at this layer.
+    #[test]
+    fn repeat_kind_drops_discrete_actions() {
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::Tab)),
+            Action::None,
+            "holding Tab must NOT advance selection N times — discrete"
+        );
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::BackTab)),
+            Action::None,
+            "holding Shift-Tab must NOT step selection N times — discrete"
+        );
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::Char('q'))),
+            Action::None,
+            "holding q must NOT spam Quit — discrete (one-shot quit)"
+        );
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::Esc)),
+            Action::None,
+            "holding Esc must NOT spam CloseDetail/Quit — discrete"
+        );
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::Enter)),
+            Action::None,
+            "holding Enter must NOT auto-open detail N times — discrete"
+        );
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::Char('p'))),
+            Action::None,
+            "holding P must NOT auto-cycle palette N times — discrete (RV7 fix)"
+        );
+        assert_eq!(
+            Action::from_key(key_repeat(KeyCode::Char('l'))),
+            Action::None,
+            "holding L must NOT auto-toggle HUD N times — discrete (RV7 fix)"
+        );
+    }
+
+    /// 05-05-RV7: Ctrl-C only quits on Press, not Repeat (no spam on hold).
+    #[test]
+    fn ctrl_c_repeat_drops_to_none() {
+        let ctrl_c_repeat = KeyEvent::new_with_kind(
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Repeat,
+        );
+        assert_eq!(Action::from_key(ctrl_c_repeat), Action::None);
     }
 
     /// Release events are dropped — manual mode is triggered by Press/Repeat.
@@ -866,5 +1120,198 @@ mod tests {
             vec![Action::ToggleLegend],
             "30 queued L repeats must collapse to exactly one ToggleLegend"
         );
+    }
+
+    // ---- 05-05-RV7: HeldAction tracking for KKP-driven continuous nudges ----
+
+    /// All six movement keys (Left/Right/Up/Down/+/-) map to held actions.
+    /// Layout-independent arrows and WASD coexist (same Pitfall D contract
+    /// as `Action::from_key`).
+    #[test]
+    fn held_action_covers_all_movement_keys() {
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Left),
+            Some(HeldAction::NudgeYawLeft)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('a')),
+            Some(HeldAction::NudgeYawLeft)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Right),
+            Some(HeldAction::NudgeYawRight)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('d')),
+            Some(HeldAction::NudgeYawRight)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Up),
+            Some(HeldAction::NudgePitchUp)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('w')),
+            Some(HeldAction::NudgePitchUp)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Down),
+            Some(HeldAction::NudgePitchDown)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('s')),
+            Some(HeldAction::NudgePitchDown)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('+')),
+            Some(HeldAction::NudgeZoomIn)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('=')),
+            Some(HeldAction::NudgeZoomIn)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::PageUp),
+            Some(HeldAction::NudgeZoomIn)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('-')),
+            Some(HeldAction::NudgeZoomOut)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::Char('_')),
+            Some(HeldAction::NudgeZoomOut)
+        );
+        assert_eq!(
+            HeldAction::from_key_code(KeyCode::PageDown),
+            Some(HeldAction::NudgeZoomOut)
+        );
+    }
+
+    /// Discrete keys (P, L, Tab, Enter, q, Esc) MUST return None — they
+    /// are not held, they fire once per Press. Pinning this guarantees a
+    /// future refactor can't accidentally start auto-cycling the palette
+    /// while P is held.
+    #[test]
+    fn held_action_skips_discrete_keys() {
+        for code in [
+            KeyCode::Char('p'),
+            KeyCode::Char('P'),
+            KeyCode::Char('l'),
+            KeyCode::Char('L'),
+            KeyCode::Char('q'),
+            KeyCode::Tab,
+            KeyCode::BackTab,
+            KeyCode::Enter,
+            KeyCode::Esc,
+        ] {
+            assert_eq!(
+                HeldAction::from_key_code(code),
+                None,
+                "discrete key {code:?} must NOT map to HeldAction — discrete actions fire once per Press, not continuously"
+            );
+        }
+    }
+
+    /// Each HeldAction dispatches to the SAME `Action` shape the OS-repeat
+    /// fallback path produces from the corresponding key. Pins parity:
+    /// hold-cadence under KKP must match hold-cadence on non-KKP terminals
+    /// (to within the OS-repeat-rate vs render-rate difference).
+    #[test]
+    fn held_action_to_action_matches_from_key() {
+        // Left arrow: HeldAction::NudgeYawLeft.to_action() must equal
+        // Action::from_key(Left Press).
+        assert_eq!(
+            HeldAction::NudgeYawLeft.to_action(),
+            Action::from_key(key_press(KeyCode::Left))
+        );
+        assert_eq!(
+            HeldAction::NudgeYawRight.to_action(),
+            Action::from_key(key_press(KeyCode::Right))
+        );
+        assert_eq!(
+            HeldAction::NudgePitchUp.to_action(),
+            Action::from_key(key_press(KeyCode::Up))
+        );
+        assert_eq!(
+            HeldAction::NudgePitchDown.to_action(),
+            Action::from_key(key_press(KeyCode::Down))
+        );
+        assert_eq!(
+            HeldAction::NudgeZoomIn.to_action(),
+            Action::from_key(key_press(KeyCode::Char('+')))
+        );
+        assert_eq!(
+            HeldAction::NudgeZoomOut.to_action(),
+            Action::from_key(key_press(KeyCode::Char('-')))
+        );
+    }
+
+    /// 05-05-RV7 simulation: 5 render ticks with Left arrow held drives
+    /// EXACTLY 5 nudges (no OS-delay gap). This is the held-set model:
+    /// the render loop emits one `to_action()` dispatch per held entry
+    /// per tick, bypassing the OS auto-repeat initial delay that caused
+    /// the user-reported lag.
+    #[test]
+    fn held_action_drives_one_nudge_per_render_tick() {
+        use std::collections::HashSet;
+        let mut held: HashSet<HeldAction> = HashSet::new();
+        // User presses Left — KKP delivers Press; loop inserts into set.
+        held.insert(HeldAction::NudgeYawLeft);
+        // 5 render ticks: each emits one Action::NudgeYaw(-YAW_STEP).
+        let nudges_per_tick: Vec<Action> = (0..5)
+            .flat_map(|_| {
+                // The render loop drains the held set into actions:
+                held.iter().map(|h| h.to_action()).collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(
+            nudges_per_tick.len(),
+            5,
+            "5 render ticks with Left held must emit exactly 5 nudges, not 1+OS-delayed-4"
+        );
+        for n in &nudges_per_tick {
+            assert_eq!(*n, Action::NudgeYaw(-YAW_STEP));
+        }
+
+        // User releases Left — KKP delivers Release; loop removes from set.
+        held.remove(&HeldAction::NudgeYawLeft);
+        // Next 5 ticks: no nudges, motion stops within ONE tick of release.
+        let post_release: Vec<Action> = (0..5)
+            .flat_map(|_| held.iter().map(|h| h.to_action()).collect::<Vec<_>>())
+            .collect();
+        assert_eq!(
+            post_release.len(),
+            0,
+            "after Release, motion must stop within 1 tick (held set is empty)"
+        );
+    }
+
+    /// Multiple held keys (e.g. Left + Up = diagonal orbit) drive ALL of
+    /// their nudges every tick — pitch and yaw advance simultaneously.
+    /// This is the "natural" KKP UX: diagonal arrows do what they say.
+    #[test]
+    fn held_action_supports_multiple_simultaneous_keys() {
+        use std::collections::HashSet;
+        let mut held: HashSet<HeldAction> = HashSet::new();
+        held.insert(HeldAction::NudgeYawLeft);
+        held.insert(HeldAction::NudgePitchUp);
+        let one_tick: Vec<Action> = held.iter().map(|h| h.to_action()).collect();
+        assert_eq!(one_tick.len(), 2, "two held keys must produce two nudges per tick");
+        assert!(one_tick.contains(&Action::NudgeYaw(-YAW_STEP)));
+        assert!(one_tick.contains(&Action::NudgePitch(PITCH_STEP)));
+    }
+
+    /// Inserting the same key twice (a stuck Press-without-Release race)
+    /// is idempotent — HashSet semantics naturally cap at one per
+    /// HeldAction kind. Pin this so future refactors can't accidentally
+    /// switch to a Vec<HeldAction> that would double-fire.
+    #[test]
+    fn held_action_set_is_idempotent_on_duplicate_press() {
+        use std::collections::HashSet;
+        let mut held: HashSet<HeldAction> = HashSet::new();
+        held.insert(HeldAction::NudgeYawLeft);
+        held.insert(HeldAction::NudgeYawLeft);
+        held.insert(HeldAction::NudgeYawLeft);
+        assert_eq!(held.len(), 1, "duplicate Press must not duplicate the held entry");
     }
 }

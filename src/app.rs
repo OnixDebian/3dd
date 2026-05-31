@@ -19,12 +19,14 @@
 //! created/destroyed). Pure stats updates that just resize an existing box
 //! never re-frame — that would jitter the view every second as samples land.
 
+use std::collections::HashSet;
 use std::time::Instant;
 
 use color_eyre::Result;
+use crossterm::event::KeyEventKind;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 
-use crate::action::{apply_input_action, coalesce_actions, Action, Effect};
+use crate::action::{apply_input_action, coalesce_actions, Action, Effect, HeldAction};
 /// How many consecutive logic ticks the World must stay empty AFTER having
 /// previously been non-empty before the empty-state banner re-appears. At
 /// `crate::tui::TICK_HZ = 60` this is ~5000 ms of stable emptiness — the
@@ -578,6 +580,20 @@ impl App {
         let area = tui.terminal.size()?;
         self.size = (area.width, area.height);
 
+        // 05-05-RV7: KKP-driven held-key tracking. Maintained ONLY when
+        // `tui.kkp_active()` returned true at startup (i.e. the host
+        // terminal honored the keyboard-enhancement push). On non-KKP
+        // terminals this stays empty forever and the OS-repeat fallback
+        // path drives motion exactly as it did pre-RV7.
+        //
+        // Insert on KKP `KeyEventKind::Press` of a movement key; remove
+        // on `KeyEventKind::Release`. On every Render event we emit one
+        // `held_action.to_action()` per held key — that's the cadence
+        // that bypasses the OS auto-repeat initial delay (~250-500 ms)
+        // the user complained about.
+        let kkp_active = tui.kkp_active();
+        let mut held_keys: HashSet<HeldAction> = HashSet::new();
+
         while let Some(event) = tui.next().await {
             // Drain everything already queued in one pass. Input/resize/tick are
             // applied immediately; Render is COALESCED to a single draw at the end.
@@ -594,12 +610,64 @@ impl App {
             // hold-to-glide still works (the next outer iteration sees the
             // next batch and applies one more), but release stops the motion
             // on the NEXT drain pass (no events arrive → no actions dispatched).
+            //
+            // 05-05-RV7: KKP-aware key handling. When `kkp_active`:
+            // - Movement-key Press → insert into `held_keys`, ALSO dispatch
+            //   immediately so the FIRST tick fires without waiting one
+            //   render frame (matches the OS-repeat-fallback first-tick
+            //   timing exactly).
+            // - Movement-key Release → remove from `held_keys`. Motion
+            //   stops on the next Render tick.
+            // - Movement-key Repeat → IGNORED (held_keys drives the
+            //   continuous motion; we don't double-emit on every Repeat).
+            // - Non-movement keys → unchanged: route through
+            //   `Action::from_key` which already drops Repeat for discrete
+            //   keys (so holding `P` cycles once).
+            //
+            // When `kkp_active == false`: same behavior as pre-RV7 — all
+            // key events route to `Action::from_key`. The discrete-keys
+            // change (P/L/Tab/etc don't auto-fire on Repeat) is the only
+            // user-visible effect; movement keys still rely on OS-repeat
+            // events to drive nudges past the first one.
             let mut render_requested = false;
             let mut pending_actions: Vec<Action> = Vec::new();
             let mut next = Some(event);
             while let Some(ev) = next {
                 match ev {
-                    Event::Key(key) => pending_actions.push(Action::from_key(key)),
+                    Event::Key(key) => {
+                        if kkp_active {
+                            if let Some(held) = HeldAction::from_key_code(key.code) {
+                                match key.kind {
+                                    KeyEventKind::Press => {
+                                        held_keys.insert(held);
+                                        // First-tick: dispatch one nudge
+                                        // immediately on Press so the user
+                                        // sees motion the instant they tap
+                                        // (matches OS-repeat first-tick).
+                                        pending_actions.push(held.to_action());
+                                    }
+                                    KeyEventKind::Release => {
+                                        held_keys.remove(&held);
+                                    }
+                                    KeyEventKind::Repeat => {
+                                        // No-op: held_keys + render-tick
+                                        // dispatch drives motion. Ignoring
+                                        // Repeat avoids double-counting.
+                                    }
+                                }
+                                // Movement key consumed by held-set path;
+                                // don't also route to from_key.
+                                next = tui.try_next();
+                                continue;
+                            }
+                        }
+                        // Non-movement keys (KKP or not), and ALL keys on
+                        // non-KKP terminals, route to from_key as before.
+                        // `from_key` drops Repeat for discrete keys (so
+                        // holding `P` cycles once) and drops Release for
+                        // everything.
+                        pending_actions.push(Action::from_key(key));
+                    }
                     Event::Resize(w, h) => self.on_resize(w, h),
                     Event::Tick => {
                         let now = Instant::now();
@@ -610,6 +678,25 @@ impl App {
                     Event::Render => render_requested = true,
                 }
                 next = tui.try_next();
+            }
+
+            // 05-05-RV7: emit one nudge per HELD movement key per RENDER
+            // tick. This is what closes the OS auto-repeat initial-delay
+            // gap. The held-set is populated only on KKP-active terminals;
+            // on non-KKP it's always empty and this loop is a noop.
+            //
+            // Placed BEFORE coalesce_actions so the held-set nudges get
+            // coalesced WITH any Press-triggered first-tick nudges — a
+            // user tapping Left briefly produces (Press → 1 nudge);
+            // a user holding Left for 3 frames produces (Press → 1
+            // nudge) on frame 1 plus 1 held nudge each on frames 2, 3.
+            // Coalescing then sums the deltas inside a single Render
+            // pass so the camera moves once per visible frame with the
+            // correct per-frame velocity.
+            if render_requested && !held_keys.is_empty() {
+                for held in held_keys.iter() {
+                    pending_actions.push(held.to_action());
+                }
             }
 
             // Dispatch the coalesced action set in first-occurrence order. An

@@ -10,14 +10,17 @@
 //! digits (Pitfall #3). The render path never blocks on I/O.
 
 use std::io::{self, Stdout};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use color_eyre::Result;
 use crossterm::cursor;
 use crossterm::event::{
-    Event as CrosstermEvent, EventStream, KeyEvent, KeyEventKind,
+    Event as CrosstermEvent, EventStream, KeyEvent, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement,
+    EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
@@ -25,6 +28,33 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// Global flag set when the kitty keyboard protocol (KKP) was successfully
+/// pushed at terminal-enter time. The free-standing [`restore`] function
+/// consults this so the panic-hook restore path pops KKP back off — without
+/// it, a crash inside the render loop would leave the host terminal in
+/// "KKP-on" mode after process exit, affecting subsequent shell input
+/// rendering (e.g. arrow keys printing as escape sequences in some
+/// configurations).
+///
+/// `AtomicBool` rather than a `Mutex<bool>` because the panic-hook path
+/// must be allocation-free and lock-free — `Ordering::SeqCst` is fine here;
+/// the flag is touched once at startup and once at shutdown.
+///
+/// Pub(crate) read access via [`mark_kkp_active`] so the kitty backend
+/// (which uses its OWN raw-mode setup, not `Tui::enter`) can also mark
+/// the flag and benefit from the same panic-hook pop on crash.
+static KKP_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Crate-visible setter for `KKP_ACTIVE`. Used by the kitty backend
+/// (`kitty::run_kitty`) which has its own raw-mode lifecycle and pushes
+/// KKP outside `Tui::enter`. Calling with `true` ensures the panic-hook
+/// `restore()` path pops KKP for both backends. Calling with `false`
+/// (after the cleanup-pop completes inside `run_kitty`) keeps `restore`
+/// from issuing a duplicate pop.
+pub(crate) fn mark_kkp_active(active: bool) {
+    KKP_ACTIVE.store(active, Ordering::SeqCst);
+}
 
 /// Render cadence cap. 30 FPS is smooth in a terminal and CPU-cheap, honoring
 /// the "must not peg a core" constraint (Pitfall #3).
@@ -114,10 +144,19 @@ impl Tui {
                     maybe_event = crossterm_event => {
                         match maybe_event {
                             Some(Ok(CrosstermEvent::Key(key))) => {
-                                // Ignore key-release events (Windows emits them).
-                                if key.kind == KeyEventKind::Press
-                                    && tx.send(Event::Key(key)).is_err()
-                                {
+                                // 05-05-RV7: forward ALL KeyEventKinds —
+                                // Press, Repeat, AND Release. The held-set
+                                // tracker in `App::run` flips inserts/removes
+                                // on Press/Release; `Action::from_key`
+                                // filters Repeat for discrete keys
+                                // (so holding `P` cycles palette once) while
+                                // keeping Repeat for continuous Nudge axes
+                                // (the OS-repeat fallback on terminals
+                                // without KKP). Forwarding Release here is
+                                // the load-bearing change vs pre-RV7, which
+                                // silently dropped Release at this layer
+                                // and made held-set tracking impossible.
+                                if tx.send(Event::Key(key)).is_err() {
                                     break;
                                 }
                             }
@@ -152,13 +191,65 @@ impl Tui {
     }
 
     /// Enter raw mode + alternate screen and hide the cursor.
+    ///
+    /// 05-05-RV7: also attempts to push the kitty keyboard protocol (KKP)
+    /// enhancement flags. KKP delivers `KeyEventKind::Press`,
+    /// `KeyEventKind::Repeat`, AND `KeyEventKind::Release` (pre-KKP
+    /// terminals deliver only Press for most keys), which is the
+    /// load-bearing capability for held-set-driven continuous nudges:
+    /// without Release we can't tell when the user lifts the key, so the
+    /// held set would accumulate stuck entries.
+    ///
+    /// Behavior on terminals WITHOUT KKP (alacritty, xterm, most ssh
+    /// sessions): the push is a noop (the terminal ignores the
+    /// `CSI > 1 u` push) and `supports_keyboard_enhancement()` returns
+    /// false — we leave `KKP_ACTIVE` as false and the render loop falls
+    /// back to the OS-repeat path (Press + Repeat both route to
+    /// `Action::Nudge*`, coalesced once per frame). Worst case: same
+    /// behavior as pre-RV7 (the user's original lag complaint stays,
+    /// but ONLY on terminals without KKP).
+    ///
+    /// Behavior on terminals WITH KKP (kitty, ghostty, WezTerm):
+    /// `KKP_ACTIVE` flips true; the render loop uses
+    /// `HeldAction::from_key_code` on every Press/Release to drive the
+    /// held set; the OS-repeat initial delay is bypassed entirely.
+    ///
+    /// The flag combination is `DISAMBIGUATE_ESCAPE_CODES |
+    /// REPORT_EVENT_TYPES`. `REPORT_EVENT_TYPES` is the one that
+    /// surfaces Release events — that's the only flag we strictly
+    /// need. `DISAMBIGUATE_ESCAPE_CODES` is added because it improves
+    /// the handling of Esc / Shift+Tab / function keys in many
+    /// terminals (no behavior regression in our key map) and is widely
+    /// supported alongside event-types.
     pub fn enter(&mut self) -> Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         stdout.execute(EnterAlternateScreen)?;
         stdout.execute(cursor::Hide)?;
+        // KKP: best-effort push. Detect first so we don't push to a
+        // terminal that won't honor pop on shutdown — the
+        // supports_keyboard_enhancement() roundtrip is the canonical
+        // detection (sends `CSI ? u`, waits for `CSI ? <flags> u`
+        // response). Failure to detect (e.g. dumb pipe, ssh without
+        // tty) silently leaves KKP off.
+        if supports_keyboard_enhancement().unwrap_or(false) {
+            let flags = KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
+            if stdout.execute(PushKeyboardEnhancementFlags(flags)).is_ok() {
+                KKP_ACTIVE.store(true, Ordering::SeqCst);
+            }
+        }
         self.terminal.clear()?;
         Ok(())
+    }
+
+    /// Returns true iff `enter()` successfully pushed the kitty keyboard
+    /// protocol (and the host terminal honored it). Consumed by the
+    /// render loop to decide whether to drive nudges from the held-set
+    /// (KKP path) or to fall back to the OS-repeat → Action::Nudge*
+    /// dispatch path.
+    pub fn kkp_active(&self) -> bool {
+        KKP_ACTIVE.load(Ordering::SeqCst)
     }
 
     /// Leave the alternate screen, disable raw mode and restore the cursor.
@@ -181,13 +272,38 @@ impl Drop for Tui {
 
 /// Free-standing terminal restore used by BOTH `Tui::exit` and the panic hook.
 /// Must be idempotent and must never panic.
+///
+/// 05-05-RV7: also pops kitty keyboard protocol (KKP) flags if they were
+/// pushed at `Tui::enter`. Pairing is REQUIRED — leaving KKP active after
+/// process exit makes the host shell render arrow keys as escape sequences
+/// in some terminal configurations. The `KKP_ACTIVE` global is the single
+/// source of truth for "did we push, do we need to pop"; flipping it
+/// false here makes restore idempotent (subsequent calls noop the pop).
 pub fn restore() -> io::Result<()> {
     // Only act if we are actually in raw mode to avoid spurious escape writes.
     if crossterm::terminal::is_raw_mode_enabled().unwrap_or(false) {
+        // Pop KKP FIRST so the pop escape is consumed under raw mode
+        // (where the terminal can parse it cleanly) rather than ending
+        // up echoed on the cooked-mode shell prompt after `disable_raw`.
+        if KKP_ACTIVE.swap(false, Ordering::SeqCst) {
+            let mut stdout = io::stdout();
+            // PopKeyboardEnhancementFlags is the only safe way to undo a
+            // matched push; sending raw `CSI < u` would skip crossterm's
+            // internal state-tracking.
+            let _ = stdout.execute(PopKeyboardEnhancementFlags);
+        }
         disable_raw_mode()?;
         let mut stdout = io::stdout();
         stdout.execute(LeaveAlternateScreen)?;
         stdout.execute(cursor::Show)?;
+    } else {
+        // Even if raw mode is somehow already disabled (panic mid-shutdown),
+        // we must still clear the KKP flag and pop if necessary — the host
+        // terminal otherwise retains the enhanced kbd state across our exit.
+        if KKP_ACTIVE.swap(false, Ordering::SeqCst) {
+            let mut stdout = io::stdout();
+            let _ = stdout.execute(PopKeyboardEnhancementFlags);
+        }
     }
     Ok(())
 }
