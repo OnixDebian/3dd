@@ -861,6 +861,42 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
+/// Persistent kitty image ID used for atomic frame-to-frame replace.
+///
+/// ## 05-05-RV5: persistent image ID closes the delete-then-emit race window
+///
+/// **The bug RV5 fixes:** the user reported "the 3D environment itself
+/// disappears, especially often starts flickering when the window is not
+/// in focus." Status bar + legend stay solid; only the kitty pixel image
+/// flickers / vanishes intermittently. FPS drops to ~13 (from ~30) when
+/// unfocused, widening the gap.
+///
+/// **Root cause:** pre-RV5 every LiveWorld / CachedWorld frame did
+/// `delete_all` → `\x1b[H` → `emit_kitty`. `emit_kitty` transmits tens of
+/// KB of base64-encoded zlib-compressed RGBA in chunks of ≤4096 bytes per
+/// `\x1b_G...\x1b\\` segment, often spanning many segments. Between
+/// kitty receiving `delete_all` (image is gone) and finishing parsing the
+/// last `emit_kitty` segment (image is restored), the kitty compositor
+/// can render the intermediate "no image" state. When the window is
+/// UNFOCUSED, kitty (as a wayland/X compositor optimization) throttles
+/// its own rendering — making that gap window much larger than the
+/// 33 ms render budget. The user sees the image vanish for several
+/// frames at a time.
+///
+/// **Fix:** use a persistent kitty image ID (`i=<N>`) and DROP the
+/// per-frame `delete_all`. Per the kitty graphics protocol, transmitting
+/// a new image with `a=T` and the same `i=N` ATOMICALLY replaces the
+/// prior image with that ID — no visible gap, no separate delete step.
+/// Kitty processes the new image transmission to completion, THEN swaps
+/// it in as a single operation.
+///
+/// `KITTY_IMAGE_ID = 1` is the constant ID used by `emit_kitty` and the
+/// targeted `delete_image_by_id` helper. `delete_all` is retained but
+/// now only called on (a) explicit empty-state transitions (Banner /
+/// ChromeOnly with `last_was_empty=false`) and (b) shutdown — both
+/// genuine cases where the image must actually go away.
+const KITTY_IMAGE_ID: u32 = 1;
+
 /// Transmit + display an RGBA image at the cursor via the kitty graphics protocol,
 /// chunked into ≤4096-byte base64 payloads. `q=2` suppresses terminal replies so
 /// they don't pollute our input stream.
@@ -875,7 +911,7 @@ fn base64(data: &[u8]) -> String {
 /// when the cell carries a non-default background (the image fills the
 /// cell pixel area underneath the glyph, BG covers it).
 ///
-/// User-observed symptom: the legend appeared for ONE frame
+/// User-observed symptom (RV4): the legend appeared for ONE frame
 /// (`KittyRenderDecision::ChromeOnly` cold-start, where no image is
 /// emitted at all) then disappeared on `LiveWorld` frame 2+ when the
 /// first image placed at default `z=0` started covering the cell layer.
@@ -891,6 +927,14 @@ fn base64(data: &[u8]) -> String {
 /// for visual clarity (the legend reads as a panel, not transparent
 /// text floating over a busy scene), but it is no longer the only
 /// guard against the image covering the legend.
+///
+/// ## 05-05-RV5: `i=1` enables atomic frame-to-frame replace
+///
+/// See `KITTY_IMAGE_ID` rustdoc above. The header now carries `i=1` so
+/// each `emit_kitty` call atomically replaces the previous frame's
+/// image instead of relying on a separate `delete_all` step that
+/// created an observable gap (especially when the window is unfocused
+/// and kitty throttles its compositor rendering).
 fn emit_kitty(out: &mut impl Write, rgba: &[u8], w: usize, h: usize) -> io::Result<()> {
     // zlib-compress the pixels (o=z): a flat-shaded cube on a solid background
     // compresses ~20-50×, cutting the per-frame payload from MBs to tens of KB —
@@ -900,14 +944,18 @@ fn emit_kitty(out: &mut impl Write, rgba: &[u8], w: usize, h: usize) -> io::Resu
     let bytes = payload.as_bytes();
     let mut chunks = bytes.chunks(4096).peekable();
     let mut first = true;
+    let id = KITTY_IMAGE_ID;
     while let Some(chunk) = chunks.next() {
         let more = if chunks.peek().is_some() { 1 } else { 0 };
         if first {
             // z=-1: image is rendered UNDER terminal cell text. Load-
             // bearing for the legend HUD (see fn rustdoc above).
+            // i=<KITTY_IMAGE_ID>: persistent image ID — re-transmitting
+            // with the same id atomically replaces the prior frame's
+            // image (no delete-then-emit race; see RV5 rustdoc).
             write!(
                 out,
-                "\x1b_Gf=32,s={w},v={h},a=T,t=d,o=z,q=2,z=-1,m={more};"
+                "\x1b_Gf=32,s={w},v={h},a=T,t=d,o=z,q=2,z=-1,i={id},m={more};"
             )?;
             first = false;
         } else {
@@ -919,7 +967,9 @@ fn emit_kitty(out: &mut impl Write, rgba: &[u8], w: usize, h: usize) -> io::Resu
     Ok(())
 }
 
-/// Delete all displayed images (used to clear the previous frame).
+/// Delete all displayed images (used at shutdown and on explicit empty-state
+/// transitions; NOT called per-frame any more — see `KITTY_IMAGE_ID` rustdoc
+/// and `emit_kitty`).
 fn delete_all(out: &mut impl Write) -> io::Result<()> {
     write!(out, "\x1b_Ga=d,q=2\x1b\\")
 }
@@ -1658,7 +1708,21 @@ pub fn run_kitty(
                     selection.pulse_phase,
                     &extras,
                 );
-                delete_all(&mut stdout)?;
+                // 05-05-RV5: NO per-frame `delete_all`. The pre-RV5 sequence
+                // `delete_all -> \x1b[H -> emit_kitty` created an observable
+                // gap between kitty receiving the delete (image gone) and
+                // finishing the multi-segment image transmission (~tens of
+                // KB of base64 in 4 KB chunks per `\x1b_G...\x1b\\`
+                // segment). Especially visible when the window was UNFOCUSED
+                // and kitty throttled its compositor rendering — the user
+                // reported the 3D image "disappears, often flickers when
+                // window not in focus" while the legend + status bar stayed
+                // solid. Fix: `emit_kitty` now carries `i=KITTY_IMAGE_ID`
+                // so the new image atomically REPLACES the prior frame's
+                // placement at the same ID; kitty parses the full
+                // transmission, then swaps it in as a single operation
+                // with no intermediate "no image" state. See
+                // `KITTY_IMAGE_ID` rustdoc for the full reasoning.
                 write!(stdout, "\x1b[H")?; // cursor home — image anchored top-left
                 emit_kitty(&mut stdout, &rgba, w, h)?;
                 last_was_empty = false;
@@ -2885,5 +2949,152 @@ mod tests {
                 | KittyRenderDecision::ChromeOnly => {}
             }
         }
+    }
+
+    // ===== 05-05-RV5: persistent image ID + no per-frame delete_all =====
+    //
+    // The user reported after RV4 landed: "the 3D environment itself
+    // disappears, especially often starts flickering when the window is
+    // not in focus" (legend + status bar stay solid, only the kitty
+    // pixel image vanishes intermittently; FPS drops to ~13 when
+    // unfocused, widening the gap).
+    //
+    // Root cause: every LiveWorld/CachedWorld frame did
+    // `delete_all -> \x1b[H -> emit_kitty`. The `emit_kitty` payload is
+    // tens of KB of base64-encoded zlib-compressed RGBA split into
+    // 4096-byte segments, each wrapped in `\x1b_G...\x1b\\`. Between
+    // kitty processing the `delete_all` (image is gone) and finishing
+    // parse of the last `emit_kitty` segment (image is back), the kitty
+    // compositor can render the "no image" intermediate state. When the
+    // window is unfocused, kitty throttles its own compositor rendering
+    // — the gap window stretches across multiple render budgets and the
+    // user sees the image vanish entirely for several frames.
+    //
+    // Fix: use a persistent kitty image ID (`i=KITTY_IMAGE_ID`) in
+    // `emit_kitty`. Per kitty's graphics protocol, transmitting a new
+    // image with `a=T` and the same `i=N` ATOMICALLY replaces the
+    // prior image — no separate delete step, no gap. The per-frame
+    // `delete_all` was DROPPED from the LiveWorld/CachedWorld paths;
+    // `delete_all` is only invoked now on (a) explicit empty-state
+    // transitions where the image must actually disappear, and (b)
+    // shutdown.
+
+    /// RV5 positive pin: every kitty image emit MUST carry `i=1` so the
+    /// new image atomically replaces the prior frame's placement at
+    /// the same id. Without `i=`, kitty assigns a fresh ID per
+    /// transmission and the prior frame's image lingers (also visible
+    /// flicker, plus unbounded image-table growth on long sessions).
+    #[test]
+    fn rv5_kitty_image_emit_carries_persistent_image_id() {
+        let mut buf: Vec<u8> = Vec::new();
+        let rgba = vec![0u8; 16]; // 2*2 px * 4 bytes
+        emit_kitty(&mut buf, &rgba, 2, 2).expect("emit_kitty must succeed");
+        let s = String::from_utf8_lossy(&buf);
+        // The id we picked is 1 — bound to KITTY_IMAGE_ID. If a future
+        // refactor renames the constant, this test still pins that SOME
+        // `i=<digit>` is present (positional check).
+        assert!(
+            s.contains(&format!("i={}", KITTY_IMAGE_ID)),
+            "emit_kitty must include `i={}` so frame N+1 atomically \
+             replaces frame N's placement (no delete-then-emit race); \
+             header bytes (lossy): {s:?}",
+            KITTY_IMAGE_ID,
+        );
+    }
+
+    /// RV5 negative pin: a single `emit_kitty` call MUST NOT emit the
+    /// `a=d` (delete) escape sequence. Pre-RV5 the per-frame sequence
+    /// in run_kitty was `delete_all -> emit_kitty`, but `delete_all`
+    /// was a separate call; this test now pins that nobody splices a
+    /// delete INTO the emit path (a tempting "atomicity through a
+    /// single write" refactor that would actually re-introduce the
+    /// race because `a=d` and `a=T` are processed sequentially by
+    /// kitty regardless of how they hit the wire).
+    ///
+    /// More importantly this pins the BYTE-LEVEL invariant: the emit
+    /// path produces ONLY image-transmit segments (`a=T,...` initial
+    /// and `m=` continuation), no other kitty graphics actions.
+    #[test]
+    fn rv5_kitty_emit_contains_no_delete_action() {
+        let mut buf: Vec<u8> = Vec::new();
+        // Larger image to exercise multi-segment chunking — pre-RV5
+        // each segment carried a separate header; if a future refactor
+        // accidentally splices `a=d` into a continuation, multi-segment
+        // catches it.
+        let rgba = vec![0u8; 64 * 64 * 4];
+        emit_kitty(&mut buf, &rgba, 64, 64).expect("emit_kitty must succeed");
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            !s.contains("a=d"),
+            "emit_kitty must NOT emit `a=d` (delete action) — that \
+             would re-introduce the delete-then-emit race RV5 fixes; \
+             output (lossy): {s:?}",
+        );
+    }
+
+    /// RV5 byte-level pin on the `delete_all` helper: when invoked it
+    /// MUST emit exactly the documented APC sequence. We pin this so
+    /// the shutdown/transition cleanup paths stay byte-stable (a kitty
+    /// terminal restored after dd3 exits should have no lingering
+    /// image-id-1 placement; the final `delete_all` in run_kitty's
+    /// epilogue is load-bearing for that).
+    #[test]
+    fn rv5_delete_all_emits_documented_apc_sequence() {
+        let mut buf: Vec<u8> = Vec::new();
+        delete_all(&mut buf).expect("delete_all must succeed");
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("a=d"),
+            "delete_all helper must emit `a=d` so kitty actually \
+             removes the image; output (lossy): {s:?}",
+        );
+        assert!(
+            s.starts_with("\u{1b}_G"),
+            "delete_all helper must start with the APC \\x1b_G prefix; \
+             output (lossy): {s:?}",
+        );
+    }
+
+    /// RV5 ANTI-FLICKER end-to-end byte-level invariant: two consecutive
+    /// frames of `emit_kitty` produce a byte stream with EXACTLY zero
+    /// `a=d` substrings. This is the property that closes the user-
+    /// reported flicker: there is no point between frame N and frame
+    /// N+1 where kitty receives a delete-image action.
+    ///
+    /// Pre-RV5 the per-frame sequence in run_kitty was
+    /// `delete_all(stdout) -> emit_kitty(stdout)` so a recorder
+    /// capturing the wire bytes would have shown `a=d,...,a=T,...,a=d,
+    /// ...,a=T,...` — one `a=d` per frame. Post-RV5 the recorder
+    /// shows ONLY `a=T` segments with the same `i=1`, frame after
+    /// frame.
+    ///
+    /// We can't directly invoke `run_kitty` from a unit test (raw
+    /// mode + kitty terminal + tokio runtime), so we simulate the
+    /// new per-frame call sequence by invoking `emit_kitty` twice
+    /// against a recording writer.
+    #[test]
+    fn rv5_consecutive_frames_emit_no_delete_actions() {
+        let mut wire: Vec<u8> = Vec::new();
+        let rgba = vec![0u8; 16];
+        // Simulate two consecutive LiveWorld frames (the post-RV5
+        // call sequence: NO delete_all between them).
+        emit_kitty(&mut wire, &rgba, 2, 2).expect("frame N emit");
+        emit_kitty(&mut wire, &rgba, 2, 2).expect("frame N+1 emit");
+        let s = String::from_utf8_lossy(&wire);
+        let n_delete = s.matches("a=d").count();
+        assert_eq!(
+            n_delete, 0,
+            "two consecutive frames emitted {n_delete} `a=d` action(s); \
+             expected 0 (RV5 invariant: no per-frame delete_all). \
+             Wire bytes (lossy): {s:?}",
+        );
+        // Sanity: both frames carry the persistent image id.
+        let n_id = s.matches(&format!("i={}", KITTY_IMAGE_ID)).count();
+        assert_eq!(
+            n_id, 2,
+            "expected 2 occurrences of `i={}` (one per frame); got {n_id}. \
+             Wire bytes (lossy): {s:?}",
+            KITTY_IMAGE_ID,
+        );
     }
 }
