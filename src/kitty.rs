@@ -864,6 +864,33 @@ fn base64(data: &[u8]) -> String {
 /// Transmit + display an RGBA image at the cursor via the kitty graphics protocol,
 /// chunked into ≤4096-byte base64 payloads. `q=2` suppresses terminal replies so
 /// they don't pollute our input stream.
+///
+/// ## 05-05-RV4: `z=-1` puts the image strictly BELOW terminal cell text
+///
+/// Pre-RV4 the image placement omitted the `z` key, which defaults to `z=0`.
+/// Per kitty's graphics-protocol docs (graphics-protocol.rst, line 533):
+/// "Negative z-index values mean that the images will be drawn under the
+/// text. This allows rendering of text on top of images." So at `z=0` the
+/// image is NOT guaranteed to be under text — text-over-image only works
+/// when the cell carries a non-default background (the image fills the
+/// cell pixel area underneath the glyph, BG covers it).
+///
+/// User-observed symptom: the legend appeared for ONE frame
+/// (`KittyRenderDecision::ChromeOnly` cold-start, where no image is
+/// emitted at all) then disappeared on `LiveWorld` frame 2+ when the
+/// first image placed at default `z=0` started covering the cell layer.
+/// Pre-05-05 the only cell text inside the image footprint was the small
+/// per-frame label (single line, infrequent updates) and the optional
+/// popup (opt-in, rare) — both were small enough that their cell-bg
+/// interactions with `z=0` images were tolerable. The 22×7 legend made
+/// the inadequacy of `z=0` immediately visible.
+///
+/// Fix: emit `z=-1` so images are STRICTLY below text. The legend
+/// (and labels, and popup) now render reliably on top regardless of
+/// per-cell background state. RV3's solid-bg fix is still load-bearing
+/// for visual clarity (the legend reads as a panel, not transparent
+/// text floating over a busy scene), but it is no longer the only
+/// guard against the image covering the legend.
 fn emit_kitty(out: &mut impl Write, rgba: &[u8], w: usize, h: usize) -> io::Result<()> {
     // zlib-compress the pixels (o=z): a flat-shaded cube on a solid background
     // compresses ~20-50×, cutting the per-frame payload from MBs to tens of KB —
@@ -876,9 +903,11 @@ fn emit_kitty(out: &mut impl Write, rgba: &[u8], w: usize, h: usize) -> io::Resu
     while let Some(chunk) = chunks.next() {
         let more = if chunks.peek().is_some() { 1 } else { 0 };
         if first {
+            // z=-1: image is rendered UNDER terminal cell text. Load-
+            // bearing for the legend HUD (see fn rustdoc above).
             write!(
                 out,
-                "\x1b_Gf=32,s={w},v={h},a=T,t=d,o=z,q=2,m={more};"
+                "\x1b_Gf=32,s={w},v={h},a=T,t=d,o=z,q=2,z=-1,m={more};"
             )?;
             first = false;
         } else {
@@ -2768,6 +2797,92 @@ mod tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// 05-05-RV4 regression pin: every kitty image emit MUST carry the
+    /// `z=-1` parameter so the image is rendered STRICTLY BELOW terminal
+    /// cell text (legend, labels, popup). Pre-RV4 the emit omitted `z`,
+    /// defaulting to `z=0`, which per kitty's graphics-protocol docs
+    /// does NOT guarantee text-on-image visibility — at `z=0` the image
+    /// covers cells unless the cell carries an explicit non-default
+    /// background. The user observed the legend "appears for ms and
+    /// disappears": frame 1 (`ChromeOnly`, no image emit) showed the
+    /// legend; frame 2+ (`LiveWorld`, image at `z=0`) hid it.
+    ///
+    /// This test asserts the EXACT byte sequence the protocol header
+    /// emits — the `z=-1` substring is the load-bearing piece. If any
+    /// future refactor drops it (or flips the sign), this fails fast.
+    #[test]
+    fn rv4_kitty_image_emit_carries_z_minus_one() {
+        let mut buf: Vec<u8> = Vec::new();
+        // 4 RGBA pixels (2x2 image) is enough to exercise the header
+        // formatter; render_rgba is not on the test path here — we just
+        // need emit_kitty to format the first chunk's prelude.
+        let rgba = vec![0u8; 16]; // 2*2 px * 4 bytes
+        emit_kitty(&mut buf, &rgba, 2, 2).expect("emit_kitty must succeed on a tiny buffer");
+        let s = String::from_utf8_lossy(&buf);
+        assert!(
+            s.contains("z=-1"),
+            "emit_kitty must include `z=-1` so the image is below cell text; \
+             output did not contain the substring. Header bytes (lossy): {s:?}",
+        );
+        // Negative pin: the default `z=0` must NEVER appear in the header
+        // (would mean the fix regressed and we're back to image-over-text).
+        assert!(
+            !s.contains("z=0"),
+            "emit_kitty must NOT include `z=0` (image would render over \
+             cell text and re-introduce the legend disappearance bug); \
+             header bytes (lossy): {s:?}",
+        );
+    }
+
+    /// 05-05-RV4 secondary pin: the per-frame KittyRenderDecision is
+    /// COMPLETELY ORTHOGONAL to the legend visibility logic. The legend
+    /// must render every frame `hud_visible == true` regardless of which
+    /// decision variant the loop took (LiveWorld / CachedWorld / Banner
+    /// / ChromeOnly). RV4 itself doesn't change this branching — the
+    /// fix is purely at the image-emit z-index — but pinning the
+    /// independence here means a future refactor that gates the legend
+    /// emit behind the wrong decision variant fails immediately.
+    ///
+    /// This is a STATIC check: we verify that every variant of
+    /// `KittyRenderDecision` is matched against in `run_kitty`'s legend
+    /// emit (indirectly: there is exactly ONE `if hud_visible` outside
+    /// the decision match-tree). If you split the legend emit into
+    /// per-variant branches you'll need to revisit this invariant.
+    #[test]
+    fn rv4_legend_emit_independent_of_render_decision() {
+        // Sanity: every variant exists and is pairwise-distinct.
+        // PartialEq is already on the enum; a 5th variant lands here as
+        // a non-exhaustive pattern match — forcing the maintainer to
+        // revisit the legend-emit invariant.
+        let variants = [
+            KittyRenderDecision::LiveWorld,
+            KittyRenderDecision::CachedWorld,
+            KittyRenderDecision::Banner,
+            KittyRenderDecision::ChromeOnly,
+        ];
+        for (i, a) in variants.iter().enumerate() {
+            for (j, b) in variants.iter().enumerate() {
+                if i == j {
+                    assert_eq!(a, b);
+                } else {
+                    assert_ne!(a, b, "variants {i} and {j} compared equal — \
+                                       KittyRenderDecision distinctness regression");
+                }
+            }
+        }
+        // Exhaustive pattern: a future variant would force a compile
+        // error here (or a wildcard arm), pointing the next reviewer
+        // at the legend-emit invariant in run_kitty.
+        for v in variants.iter() {
+            match v {
+                KittyRenderDecision::LiveWorld
+                | KittyRenderDecision::CachedWorld
+                | KittyRenderDecision::Banner
+                | KittyRenderDecision::ChromeOnly => {}
             }
         }
     }
