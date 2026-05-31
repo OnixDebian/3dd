@@ -156,12 +156,13 @@ mod tests {
 
     #[test]
     fn unit_cube_footprint_is_cubic() {
-        // Cubic, not squashed. A braille dot is ~1:2 (twice as tall as wide), so
-        // a cube that READS as cubic on screen must occupy `cell_aspect` times
-        // as many dots horizontally as vertically. With a SQUARE pixel viewport
-        // the only source of asymmetry is the aspect-correction term, so we
-        // assert `bbox_w ≈ cell_aspect * bbox_h`. (At cell_aspect=1.0 — perfectly
-        // square dots — this collapses to the literal width==height case.)
+        // Cubic, not squashed. With a SQUARE pixel viewport the only source
+        // of horizontal-vs-vertical asymmetry is the `cell_aspect` term in
+        // the projector, so the unit cube's screen-space bounding box must
+        // satisfy `bbox_w ≈ cell_aspect * bbox_h`. RV4 (05-06): default
+        // `cell_aspect = 1.0` (typical-2:1-cell parity), so this collapses
+        // to the literal `bbox_w ≈ bbox_h` case. Pre-RV4 the default was
+        // 2.0 (the assertion expected a 2:1 horizontal stretch).
         let cfg = RenderConfig::default();
         let p = projector(&cfg);
 
@@ -237,62 +238,112 @@ mod tests {
         );
     }
 
-    /// RV3 (05-06) calibration pin: braille-tier vs kitty-tier projector
-    /// aspect ratio is intentionally asymmetric and is the root cause of
-    /// the user-reported "braille is flattened compared to kitty" feedback
-    /// in 05-06 visual verify. This test pins the asymmetry as a known
-    /// design property of Phase 1's `cell_aspect=2.0` calibration — if a
-    /// future refactor accidentally aligns the two tiers (e.g. by changing
-    /// `cell_aspect` default or dynamically computing it from real cell
-    /// pixel dims), this test fails and forces an explicit re-evaluation
-    /// of the camera-framing constants in `camera::FRAME_REF_*` together.
+    /// RV4 (05-06) PARITY PIN — replaces the RV3 "asymmetric by design"
+    /// tripwire test. The braille tier's `cell_aspect` is now derived from
+    /// the LIVE terminal cell pixel size via
+    /// [`RenderConfig::braille_cell_aspect_for_cell`]; the central
+    /// invariant is that, at typical monospace cells (~2:1 height:width),
+    /// the braille projector's perspective aspect equals the kitty
+    /// projector's. Pre-RV4 they differed by 2x (root cause of the user's
+    /// "braille is flattened compared to kitty" feedback).
     ///
-    /// See `config::RenderConfig` rustdoc "Braille vs kitty perspective
-    /// parity (05-06 RV3 known limitation)" for the full math + v2 fix
-    /// sketch.
+    /// We exercise BOTH tier formulas on the same logical viewport and
+    /// assert their resulting `Mat4::perspective_rh` aspect values agree
+    /// within a tight tolerance. If a future refactor accidentally
+    /// reintroduces the asymmetry (e.g. re-pinning `cell_aspect` to a
+    /// static constant), this test FAILS and the per-cell rustdoc in
+    /// `config::RenderConfig` points to the math.
     #[test]
-    fn rv3_braille_projector_aspect_is_half_of_kitty_for_typical_cell() {
+    fn rv4_braille_and_kitty_projector_aspects_match_at_typical_cell() {
         use glam::Mat4;
         // Same logical viewport for both tiers: 80 cells wide × 30 rows.
-        // Braille uses (cells_w*2, cells_h*4) = (160, 120) at cell_aspect=2.0.
-        // Kitty uses (W*cw_px, H*ch_px) with cw_px=10, ch_px=20 (typical
-        // mono font cell aspect ratio = 2.0:1) at cell_aspect=1.0.
         let cells = (80u32, 30u32);
+        // Typical monospace cell: 10×20 (height:width = 2:1).
+        let cell_px = (10u16, 20u16);
 
-        // Braille tier projector aspect.
-        let braille_cfg = RenderConfig::default(); // cell_aspect = 2.0
+        // Braille tier projector aspect — derives cell_aspect from the
+        // LIVE cell size (RV4 helper). At 2:1 cells this yields 1.0.
+        let dyn_aspect = RenderConfig::braille_cell_aspect_for_cell(cell_px);
+        let braille_cfg = RenderConfig { cell_aspect: dyn_aspect, ..RenderConfig::default() };
         let braille_px = (cells.0 * 2, cells.1 * 4);
         let braille_aspect =
             (braille_px.0 as f32 / braille_px.1 as f32) / braille_cfg.cell_aspect;
 
-        // Kitty tier projector aspect (real square pixels, cell ratio 2:1).
+        // Kitty tier projector aspect — real square pixels, cell_aspect=1.0.
         let kitty_cfg = RenderConfig { cell_aspect: 1.0, ..RenderConfig::default() };
-        let kitty_px = (cells.0 * 10, cells.1 * 20);
+        let kitty_px = (cells.0 * cell_px.0 as u32, cells.1 * cell_px.1 as u32);
         let kitty_aspect =
             (kitty_px.0 as f32 / kitty_px.1 as f32) / kitty_cfg.cell_aspect;
 
-        // Braille aspect is HALF kitty aspect. With perspective_rh's
-        // `fovy + aspect` parameterization, this means braille's horizontal
-        // FOV is wider per vertical FOV — boxes project ~50% squatter on
-        // braille than on kitty for the same world scene. Documented as a
-        // known property; the v2 fix would re-frame braille against the
-        // real cell pixel ratio.
-        let ratio = kitty_aspect / braille_aspect;
+        // RV4: braille MUST match kitty within float epsilon at typical
+        // cells. Both reduce to W/(2H) by the math in the rustdoc.
+        let delta = (braille_aspect - kitty_aspect).abs();
         assert!(
-            (ratio - 2.0).abs() < 0.01,
-            "RV3 known limitation: kitty/braille projector aspect ratio must \
-             stay ~2.0 for typical (2:1) terminal cells; got kitty={kitty_aspect}, \
-             braille={braille_aspect}, ratio={ratio}. If this changed, see the \
-             v2 fix sketch in config::RenderConfig rustdoc and re-evaluate the \
-             camera::FRAME_REF_* constants together."
+            delta < 1e-5,
+            "RV4 parity broken: braille_aspect={braille_aspect}, kitty_aspect={kitty_aspect}, \
+             delta={delta}. See `config::RenderConfig` rustdoc 'Braille vs kitty perspective \
+             parity (05-06 RV4)' for the derivation; if you intentionally re-introduced the \
+             asymmetry, also update `Camera::frame_scene_with_aspect` callers."
         );
 
-        // Sanity: building both projection matrices succeeds and produces
-        // distinct projections (no NaN/Inf in either aspect computation).
-        let _braille_proj =
+        // Sanity: building both projection matrices succeeds (no NaN/Inf
+        // in either aspect computation) and they agree element-wise within
+        // a tight tolerance (downstream consumers may rely on this).
+        let braille_proj =
             Mat4::perspective_rh(braille_cfg.fov, braille_aspect, braille_cfg.near, braille_cfg.far);
-        let _kitty_proj =
+        let kitty_proj =
             Mat4::perspective_rh(kitty_cfg.fov, kitty_aspect, kitty_cfg.near, kitty_cfg.far);
+        for r in 0..4 {
+            for c in 0..4 {
+                let bp = braille_proj.col(c)[r];
+                let kp = kitty_proj.col(c)[r];
+                assert!(
+                    (bp - kp).abs() < 1e-4,
+                    "projection matrices diverge at ({r}, {c}): braille={bp}, kitty={kp}"
+                );
+            }
+        }
+    }
+
+    /// RV4 follow-up: a unit cube at the origin projects to the SAME
+    /// screen bounding-box width/height ratio under both tiers when their
+    /// pixel viewports have the SAME physical aspect ratio (i.e. the same
+    /// `(cells, cell_px)` product). This is the user-facing observable —
+    /// boxes "look the same shape" across kitty + braille.
+    #[test]
+    fn rv4_unit_cube_projects_to_same_bbox_ratio_across_tiers() {
+        // Same logical 80×30 cell viewport, typical 2:1 cells.
+        let cells = (80u32, 30u32);
+        let cell_px = (10u16, 20u16);
+        let (eye, target, up) = camera();
+
+        // Braille tier projector: (2W, 4H) dot viewport, dynamic cell_aspect.
+        let braille_cfg = RenderConfig {
+            cell_aspect: RenderConfig::braille_cell_aspect_for_cell(cell_px),
+            ..RenderConfig::default()
+        };
+        let braille_vp = (cells.0 * 2, cells.1 * 4);
+        let braille_p = Projector::new(eye, target, up, braille_vp, &braille_cfg);
+
+        // Kitty tier projector: real (W*cw, H*ch) pixel viewport, cell_aspect=1.0.
+        let kitty_cfg = RenderConfig { cell_aspect: 1.0, ..RenderConfig::default() };
+        let kitty_vp = (cells.0 * cell_px.0 as u32, cells.1 * cell_px.1 as u32);
+        let kitty_p = Projector::new(eye, target, up, kitty_vp, &kitty_cfg);
+
+        let corners = unit_cube_corners(Vec3::ZERO);
+        let (bw, bh) = projected_bbox(&braille_p, &corners);
+        let (kw, kh) = projected_bbox(&kitty_p, &corners);
+
+        // The bounding-box ratio is the user-facing "shape" of the box.
+        // RV4 requires the SAME ratio on both tiers.
+        let br = bw / bh;
+        let kr = kw / kh;
+        let rel = (br - kr).abs() / kr;
+        assert!(
+            rel < 1e-3,
+            "RV4 visual parity: unit cube bbox ratio must match across tiers. \
+             braille w/h = {br}, kitty w/h = {kr}, rel_err = {rel}"
+        );
     }
 
     // --- helpers ---

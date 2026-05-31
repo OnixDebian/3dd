@@ -44,10 +44,14 @@ pub const MAX_LABEL_LEN: usize = 24;
 ///
 /// `viewport` is the screen-resolution viewport — `(dot_w, dot_h)` for the
 /// braille path (= `2 * cells_w`, `4 * cells_h`) and `(px_w, px_h)` for the
-/// kitty path. `cell_aspect` is the projector's correction factor (2.0 for
-/// braille, 1.0 for the square-pixel kitty path) so a unit cube reads as
-/// cubic AT THIS resolution — matches the renderer's projector exactly so
-/// the label tracks the rasterized box.
+/// kitty path. `cell_aspect` is the projector's correction factor — for
+/// the kitty path it is 1.0 (square pixels), for the braille path it is
+/// derived from the LIVE terminal cell pixel size via
+/// [`crate::config::RenderConfig::braille_cell_aspect_for_cell`] (05-06
+/// RV4: at typical 2:1 cells this is also 1.0 so a unit cube reads as
+/// cubic at the SAME shape on both tiers). The caller must use the value
+/// that matches the renderer's projector exactly so the label tracks the
+/// rasterized box.
 pub fn project_label_anchor(
     camera: &Camera,
     entity: &Entity,
@@ -219,7 +223,8 @@ mod tests {
             group: 0,
         };
         let viewport = (160u32, 120u32);
-        let anchor = project_label_anchor(&cam, &entity, viewport, 2.0)
+        // RV4: typical-cell braille `cell_aspect = 1.0` (parity with kitty).
+        let anchor = project_label_anchor(&cam, &entity, viewport, 1.0)
             .expect("entity at target must project");
         let (cx, cy) = (viewport.0 as f32 / 2.0, viewport.1 as f32 / 2.0);
         // Top of a box at target is above center; X stays near center.
@@ -241,6 +246,7 @@ mod tests {
             status: crate::theme::Status::Running,
             group: 0,
         };
-        assert!(project_label_anchor(&cam, &entity, (160, 120), 2.0).is_none());
+        // RV4: typical-cell braille `cell_aspect = 1.0` (parity with kitty).
+        assert!(project_label_anchor(&cam, &entity, (160, 120), 1.0).is_none());
     }
 }

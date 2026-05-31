@@ -138,25 +138,44 @@ mod tests {
     // ---- 05-04-RV3: zoom symmetry — frame_scene lifts radius_max ----------
 
     /// **THE LOAD-BEARING REGRESSION PIN for RV3.** Walk N zoom-in steps then
-    /// N zoom-out steps from a `frame_scene`-framed starting radius (the
-    /// synthetic 30-box rack frames at ~36, well above the static MAX=24).
-    /// After the round-trip the radius MUST return to within one ZOOM_STEP of
-    /// the original framing distance.
+    /// N zoom-out steps from a `frame_scene`-framed starting radius. After
+    /// the round-trip the radius MUST return to within one ZOOM_STEP of the
+    /// original framing distance.
     ///
-    /// Pre-RV3: the first -ZOOM_STEP click snapped from 36→24 (the static
-    /// MAX_RADIUS ceiling), and zoom-out clamped at 24 forever — round-trip
-    /// would end at 24, not 36, breaking symmetry. With the per-camera lift,
-    /// `radius_max = max(24, 36*1.25) = 45`, so the round-trip stays
-    /// symmetric across the full [1.2, 36*1.25] range.
+    /// Pre-RV3: the first -ZOOM_STEP click snapped from the framed distance
+    /// down to MAX_RADIUS=24 (the static ceiling), and zoom-out clamped at
+    /// 24 forever — round-trip would end at 24, not the framed value,
+    /// breaking symmetry. With the per-camera lift,
+    /// `radius_max = max(24, framed*1.25)`, so the round-trip stays
+    /// symmetric across the full `[MIN_RADIUS, framed*1.25]` range.
+    ///
+    /// **RV4 update (05-06):** the synthetic scene now frames at ~21
+    /// (below the static MAX_RADIUS=24) because braille's `cell_aspect`
+    /// dropped from 2.0 to 1.0 for kitty parity — see
+    /// `config::RenderConfig` rustdoc. To still exercise the LIFT branch
+    /// of the symmetry property, we scale the scene's entity positions /
+    /// half-extents 3× so the framed radius rises above MAX_RADIUS again.
+    /// The lift code path is the load-bearing invariant; the synthetic
+    /// scene is just convenient geometry.
     #[test]
     fn zoom_round_trip_returns_to_framed_radius() {
-        let world = crate::world::scene::synthetic_scene();
+        let mut world = crate::world::scene::synthetic_scene();
+        // RV4: scale up so the framed radius exceeds the static MAX_RADIUS
+        // (the lift-exercise precondition the original RV3 test relied on
+        // when braille was at cell_aspect=2.0).
+        const LIFT_EXERCISE_SCALE: f32 = 3.0;
+        for e in &mut world.entities {
+            e.position *= LIFT_EXERCISE_SCALE;
+            e.half_extents *= LIFT_EXERCISE_SCALE;
+        }
+        world.bounds = crate::world::scene::SceneBounds::from_entities(&world.entities);
+
         let mut cam = Camera::new();
         cam.frame_scene(&world);
         let framed = cam.radius;
         assert!(
             framed > MAX_RADIUS,
-            "test precondition: synthetic scene must frame at radius > MAX_RADIUS \
+            "test precondition: scaled scene must frame at radius > MAX_RADIUS \
              so we exercise the lift (got framed={framed}, MAX_RADIUS={MAX_RADIUS})"
         );
 
@@ -248,7 +267,7 @@ mod tests {
             f,
             "RV3 zoom symmetry verify\n\
              ============================\n\
-             initial framed radius (braille cell_aspect=2.0): {framed:.6}\n\
+             initial framed radius (FRAME_REF_CELL_ASPECT=1.0)  : {framed:.6}\n\
              radius_max (lifted)                            : {max:.6}\n\
              radius_min                                     : {min:.6}\n\
              static MAX_RADIUS                              : {MAX_RADIUS}\n\

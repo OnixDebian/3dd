@@ -608,6 +608,28 @@ impl App {
         let area = tui.terminal.size()?;
         self.size = (area.width, area.height);
 
+        // 05-06 RV4: re-frame the camera against the LIVE terminal cell
+        // pixel aspect now that we have a TTY. `App::new` / `with_docker_rx`
+        // framed against the reference value (`FRAME_REF_CELL_ASPECT = 1.0`)
+        // because they have no TTY to poll; here we override with the real
+        // cell ratio so the rack fills `FRAME_TARGET_FILL` of the binding
+        // axis on this specific terminal. The per-loop refresh below
+        // continues to track resizes / live cell changes; this is just the
+        // first-frame seed.
+        //
+        // Skips re-framing if the world is empty (construction-time tests
+        // and the empty-banner pre-Docker path) or the user has already
+        // taken manual camera control (04-03 CAM-03) — though the latter
+        // is impossible at this point (we haven't entered the event loop).
+        if !self.world.entities.is_empty() && self.camera.autopilot_active {
+            let initial_cell_px = crate::term::cell::cell_pixel_size();
+            let initial_cell_aspect =
+                crate::config::RenderConfig::braille_cell_aspect_for_cell(initial_cell_px);
+            self.render_config.cell_aspect = initial_cell_aspect;
+            self.camera
+                .frame_scene_with_aspect(&self.world, initial_cell_aspect);
+        }
+
         // 05-05-RV7: KKP-driven held-key tracking. Maintained ONLY when
         // `tui.kkp_active()` returned true at startup (i.e. the host
         // terminal honored the keyboard-enhancement push). On non-KKP
@@ -738,6 +760,34 @@ impl App {
                 }
             }
 
+            // 05-06 RV4: resolve the dynamic braille/HalfBlock `cell_aspect`
+            // from the LIVE terminal cell pixel size. At a typical 2:1
+            // monospace cell this is 1.0 — IDENTICAL to the kitty path's
+            // projector aspect, closing the "braille is flattened compared
+            // to kitty" perspective drift the user reported in 05-06 RV3.
+            //
+            // Polled here (after the input drain, before the re-frame +
+            // render) so:
+            //   - One ioctl-equivalent syscall per outer loop iteration —
+            //     cheap, and the value is stable across milliseconds.
+            //   - `frame_scene_with_aspect` below uses the SAME value the
+            //     renderer will project against, so the rack fills
+            //     `FRAME_TARGET_FILL` of the actual binding axis (not the
+            //     reference one).
+            //   - `render_config.cell_aspect` is updated in place so
+            //     `ui::view → scene::render_scene` picks it up for both the
+            //     projector AND the label-anchor path (which uses the
+            //     same value via `project_label_anchor(..., cell_aspect)`).
+            //
+            // The kitty backend (`kitty.rs`) is unaffected: it keeps
+            // `cell_aspect=1.0` and passes real `(W*cw, H*ch)` pixels — so
+            // its projector aspect already matched the new braille parity
+            // value before this change.
+            let cell_px = crate::term::cell::cell_pixel_size();
+            let dynamic_cell_aspect =
+                crate::config::RenderConfig::braille_cell_aspect_for_cell(cell_px);
+            self.render_config.cell_aspect = dynamic_cell_aspect;
+
             // Reconcile any pending Docker messages BEFORE rendering. This runs
             // once per outer loop iteration, never on a tight inner loop. If
             // the entity COUNT changed, re-frame the camera so the new rack
@@ -750,7 +800,13 @@ impl App {
                 // Manual-mode driver must NOT be yanked back by every container
                 // add/remove — only auto-reframe while the user hasn't taken
                 // over yet (04-03 CAM-03).
-                self.camera.frame_scene(&self.world);
+                //
+                // 05-06 RV4: frame against the LIVE cell aspect so the rack
+                // fills the SAME binding-axis fraction the live projector
+                // will render against — keeps perspective parity with kitty
+                // at any terminal cell ratio.
+                self.camera
+                    .frame_scene_with_aspect(&self.world, dynamic_cell_aspect);
             }
 
             if render_requested {

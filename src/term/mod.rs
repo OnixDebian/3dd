@@ -4,3 +4,4 @@
 //! rendered scene.
 
 pub mod capability;
+pub mod cell;

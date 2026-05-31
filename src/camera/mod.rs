@@ -89,17 +89,25 @@ pub(crate) const PITCH_LIMIT: f32 = std::f32::consts::FRAC_PI_2 - 0.15;
 /// against. The live braille/kitty viewports vary with terminal size, but the
 /// camera is framed ONCE (at app construction, before any viewport is known), so
 /// the fit must be backend-independent. We frame against this canonical ~4:3
-/// braille grid at [`DEFAULT_FOV`] with `cell_aspect` 2.0 — the BINDING case: the
-/// cell-aspect-2 horizontal axis is narrower than every other backend/aspect the
-/// rack is shown in, so framing tight here is automatically frustum-safe on the
-/// wider kitty path (square pixels, cell_aspect 1.0) and on taller terminals.
+/// braille grid at [`DEFAULT_FOV`] with the typical-cell [`FRAME_REF_CELL_ASPECT`].
+///
+/// **RV4 update (05-06):** the reference cell-aspect is now 1.0, matching the
+/// kitty path at typical 2:1 monospace cells. Production braille re-frames per
+/// frame against the LIVE cell aspect (`Camera::frame_scene_with_aspect`) so
+/// non-2:1 terminals still fill `FRAME_TARGET_FILL` of the binding axis.
 const FRAME_REF_VIEWPORT: (u32, u32) = (160, 120);
 
-/// Cell-aspect of the reference braille framing viewport (the braille default).
-/// The projector folds this into the perspective aspect, narrowing the HORIZONTAL
-/// field below the vertical one — which is exactly why the horizontal NDC extent
-/// is the binding axis the [`Camera::frame_scene`] fit drives to [`FRAME_TARGET_FILL`].
-const FRAME_REF_CELL_ASPECT: f32 = 2.0;
+/// Cell-aspect of the reference framing viewport.
+///
+/// **RV4 (05-06):** pinned at `1.0` — the parity value at a typical 2:1 mono
+/// cell, IDENTICAL to the kitty path. The braille tier now derives a dynamic
+/// `cell_aspect` from the live terminal cell pixel size (see
+/// [`crate::config::RenderConfig::braille_cell_aspect_for_cell`]) and feeds it
+/// to [`Camera::frame_scene_with_aspect`] so the rack always fills
+/// [`FRAME_TARGET_FILL`] of the binding axis at any cell ratio. Construction-
+/// time framing (before any TTY query) falls back to this reference value;
+/// production paths override it within microseconds of entering the main loop.
+const FRAME_REF_CELL_ASPECT: f32 = 1.0;
 
 /// Target fraction of the binding (horizontal) NDC half-axis the scene's projected
 /// bounding box should fill (~0.92 → the rack spans ~92% of the half-width, i.e.
@@ -144,12 +152,18 @@ pub struct Camera {
     /// **Why this is per-camera (RV3 fix).** [`crate::camera::manual::MAX_RADIUS`]
     /// is the static safety ceiling (DEFAULT_RADIUS * 4 = 24.0). But
     /// [`Camera::frame_scene`] solves a binary search against the scene's
-    /// projected AABB and can converge to a radius WELL ABOVE the static
-    /// MAX_RADIUS — the synthetic 30-box scene frames at ~36.3 on the braille
-    /// (cell_aspect=2.0) path. With a static clamp, the FIRST zoom-in click
-    /// immediately drops the radius from 36.3 to 24.0, and zoom-out can never
-    /// recover the original full-frame view. The user reports this as
-    /// "zoom-in then zoom-out doesn't return to the original distance".
+    /// projected AABB and can converge to a radius ABOVE the static
+    /// MAX_RADIUS for large scenes. With a static clamp, the FIRST zoom-in
+    /// click would immediately drop the radius down to MAX_RADIUS=24.0, and
+    /// zoom-out could never recover the original full-frame view. The user
+    /// reported this as "zoom-in then zoom-out doesn't return to the
+    /// original distance".
+    ///
+    /// (Pre-RV4 the synthetic 30-box rack framed at ~36 on the
+    /// braille cell_aspect=2.0 path; post-RV4 it frames smaller because the
+    /// cell_aspect dropped to 1.0 — see `config::RenderConfig` rustdoc. The
+    /// lift code below stays correct either way; large CUSTOM scenes still
+    /// trigger it.)
     ///
     /// Fix: each call to `frame_scene` / `frame_scene_with_aspect` lifts this
     /// ceiling to `max(MAX_RADIUS, framed_radius * 1.25)` so the user can
@@ -263,23 +277,29 @@ impl Camera {
     /// moves the eye along it, and the projected NDC extent shrinks monotonically
     /// as `radius` grows. So we binary-search `radius`: at each candidate we build
     /// a reference projector ([`FRAME_REF_VIEWPORT`] / [`FRAME_REF_CELL_ASPECT`] /
-    /// [`DEFAULT_FOV`] — the canonical BINDING braille frustum), project EVERY
+    /// [`DEFAULT_FOV`] — the canonical typical-cell frustum), project EVERY
     /// entity's 8 AABB corners SWEPT through a turn of per-box Y-spin (the corners
     /// poke widest mid-rotation, exactly as the renderers spin them), and measure
     /// the max horizontal NDC half-extent. We tighten `radius` until that extent
-    /// reaches [`FRAME_TARGET_FILL`]. The horizontal axis is the binding one
-    /// (cell_aspect 2 narrows it below vertical), so driving X to <1 keeps Y
-    /// comfortably inside too; and the kitty path (square pixels, wider horizontal
-    /// field) is automatically safer than this reference braille fit. The eye
-    /// stays exactly `radius` from `center`, so the framing holds for the single
-    /// static pose the human sees (the orbit is disabled).
+    /// reaches [`FRAME_TARGET_FILL`].
+    ///
+    /// **RV4 note:** at `FRAME_REF_CELL_ASPECT = 1.0` (kitty/braille parity at
+    /// 2:1 cells), the horizontal NDC is the binding axis ONLY when the
+    /// viewport's pixel-aspect is below 1.0 (e.g. the canonical 160×120 frame
+    /// → 1.33 horizontal — actually slightly WIDER than vertical). For
+    /// taller terminals or non-2:1 cells, `frame_scene_with_aspect` is called
+    /// with the live cell aspect so the rack fills the SAME `FRAME_TARGET_FILL`
+    /// fraction of whichever axis ends up tighter. The eye stays exactly
+    /// `radius` from `center`, so the framing holds for the single static
+    /// pose the human sees (the orbit is disabled).
     ///
     /// Uses [`DEFAULT_FOV`] for the lens (the camera owns the lens); an empty
     /// scene or a degenerate projected extent falls back to [`DEFAULT_RADIUS`].
     pub fn frame_scene(&mut self, world: &crate::world::World) {
-        // Default to the braille/tighter case (`cell_aspect = 2.0`) — that is
-        // the backend that originally drove this method and is also the
-        // worst-case for fit (narrowest horizontal NDC at the same eye distance).
+        // Default to the typical-cell parity value (`FRAME_REF_CELL_ASPECT =
+        // 1.0` after 05-06 RV4). Construction-time / test framing has no TTY
+        // to poll, so this constant is the safe baseline; live braille
+        // re-runs `frame_scene_with_aspect` against the polled cell ratio.
         self.frame_scene_with_aspect(world, FRAME_REF_CELL_ASPECT);
     }
 
@@ -303,10 +323,19 @@ impl Camera {
 
         let proj_cfg = RenderConfig { fov: DEFAULT_FOV, cell_aspect, ..RenderConfig::default() };
 
-        // Max horizontal NDC half-extent of the whole rack at a candidate radius,
-        // swept across per-box spin so a mid-rotation corner can't be missed.
-        // Returns None if any corner clips (radius too small — box off-screen).
-        let max_ndc_x = |radius: f32| -> Option<f32> {
+        // Max NDC half-extent (whichever axis binds) of the whole rack at a
+        // candidate radius, swept across per-box spin so a mid-rotation
+        // corner can't be missed. Returns None if any corner clips behind
+        // the near plane.
+        //
+        // RV4: at the new typical-cell `cell_aspect = 1.0`, the perspective
+        // aspect is no longer guaranteed to make X the binding axis — for
+        // a wide-and-short rack the Y axis can clip first. We therefore
+        // drive the MAX of |ndc.x| and |ndc.y| to `FRAME_TARGET_FILL`
+        // instead of pinning X. The change is conservative (it only ever
+        // PULLS THE CAMERA BACK relative to the pre-RV4 X-only solver),
+        // so spinning corners never poke off the edge.
+        let max_ndc = |radius: f32| -> Option<f32> {
             let (sy, cy) = self.yaw.sin_cos();
             let (sp, cp) = self.pitch.sin_cos();
             let dir = Vec3::new(cp * sy, sp, cp * cy);
@@ -329,7 +358,9 @@ impl Camera {
                                     );
                                 let spun = rotate_y_about(corner, e.position, spin);
                                 match proj.ndc(spun) {
-                                    Some(ndc) => worst = worst.max(ndc.x.abs()),
+                                    Some(ndc) => {
+                                        worst = worst.max(ndc.x.abs()).max(ndc.y.abs());
+                                    }
                                     None => return None, // clips — radius too tight
                                 }
                             }
@@ -345,7 +376,7 @@ impl Camera {
         let mut hi = DEFAULT_RADIUS.max(4.0 * world.bounds.radius + 4.0);
         // Grow hi until the rack provably fits (extent below target) — defensive.
         for _ in 0..40 {
-            match max_ndc_x(hi) {
+            match max_ndc(hi) {
                 Some(x) if x <= FRAME_TARGET_FILL => break,
                 _ => hi *= 1.5,
             }
@@ -354,7 +385,7 @@ impl Camera {
         // 40 iterations → sub-millimetre precision on the radius.
         for _ in 0..40 {
             let mid = 0.5 * (lo + hi);
-            match max_ndc_x(mid) {
+            match max_ndc(mid) {
                 // Fits and still under target → can pull closer (smaller radius).
                 Some(x) if x <= FRAME_TARGET_FILL => hi = mid,
                 // Over target or clipping → must back off (larger radius).
@@ -531,11 +562,17 @@ mod tests {
     }
 
     /// PROJECTED-AABB FILL pin: `frame_scene` must pull the eye in close enough
-    /// that the rack's projected bounding box FILLS the frame — the binding
-    /// (horizontal) NDC half-extent must reach `FRAME_TARGET_FILL` (within a small
-    /// tolerance) WITHOUT exceeding 1.0 on any axis at any spin. This guards the
-    /// "~2x larger" tuning: it would fail (extent far below target) if the fit
-    /// regressed to the old under-filling bounding-sphere model.
+    /// that the rack's projected bounding box FILLS the frame — whichever
+    /// axis BINDS must reach `FRAME_TARGET_FILL` (within a small tolerance)
+    /// WITHOUT exceeding 1.0 on either axis at any spin. This guards the
+    /// "~2x larger" tuning: it would fail (extent far below target) if the
+    /// fit regressed to the old under-filling bounding-sphere model.
+    ///
+    /// **RV4 update (05-06):** the solver now drives `max(|ndc.x|, |ndc.y|)`
+    /// to `FRAME_TARGET_FILL` instead of pinning X — at the new
+    /// `FRAME_REF_CELL_ASPECT = 1.0` the rack's projected bbox can be
+    /// taller-than-wide on the synthetic 30-box scene, so Y binds. This
+    /// test asserts the binding-axis invariant directly without assuming X.
     #[test]
     fn frame_scene_fills_frame_on_binding_axis() {
         use std::f32::consts::TAU;
@@ -576,13 +613,15 @@ mod tests {
             }
         }
 
-        // Binding axis reaches the target fill (the rack is "zoomed in"), and
-        // nothing clips on EITHER axis.
+        // Whichever axis BINDS reaches the target fill (the rack is "zoomed
+        // in"), and nothing clips on EITHER axis.
+        let binding = max_x.max(max_y);
         assert!(
-            (max_x - FRAME_TARGET_FILL).abs() < 0.02,
-            "binding-axis fill {max_x} should be ~{FRAME_TARGET_FILL} (rack not framed ~2x larger)"
+            (binding - FRAME_TARGET_FILL).abs() < 0.02,
+            "binding-axis fill {binding} should be ~{FRAME_TARGET_FILL} \
+             (max_x={max_x}, max_y={max_y}; rack not framed ~2x larger)"
         );
-        assert!(max_x <= 1.0, "binding axis clips: max |ndc.x| = {max_x}");
+        assert!(max_x <= 1.0, "horizontal axis clips: max |ndc.x| = {max_x}");
         assert!(max_y <= 1.0, "vertical axis clips: max |ndc.y| = {max_y}");
     }
 }

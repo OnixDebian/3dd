@@ -21,58 +21,71 @@ use serde::{Deserialize, Serialize};
 
 /// Rendering configuration: the projection knobs.
 ///
-/// `cell_aspect` is the *only* place the terminal-cell squash is corrected. A
-/// braille dot is not square on screen (character cells are ~1:2, twice as tall
-/// as wide), so the same world-space unit length would otherwise map to a larger
-/// vertical than horizontal on-screen extent — cubes render as bricks. We fold a
-/// single named factor into the perspective `aspect` term to undo this.
+/// `cell_aspect` is the *only* place the terminal-cell squash is corrected.
+/// The braille tier rasterizes into a `(2W, 4H)` sub-cell DOT grid: each
+/// dot occupies `cw_px/2 × ch_px/4` real screen pixels — at a typical 2:1
+/// (height:width) cell that is a 5×5 SQUARE dot. The kitty tier rasterizes
+/// into a `(W*cw_px, H*ch_px)` real-pixel grid. The projector's job is to
+/// produce the SAME visual scene at either resolution; `cell_aspect` is the
+/// single factor folded into the perspective `aspect` term that makes this
+/// hold.
 ///
-/// # Braille vs kitty perspective parity (05-06 RV3 known limitation)
+/// # Braille vs kitty perspective parity (05-06 RV4 — resolved)
 ///
-/// The braille tier with `cell_aspect=2.0` produces a projector aspect of
-/// `(W*2)/(H*4)/2.0 = W/(4H)`, while the kitty tier (real square pixels,
-/// `cell_aspect=1.0`) produces `(W*cw_px)/(H*ch_px) = W*cw/(H*ch)` where
-/// `ch_px/cw_px ≈ 2.0` for typical monospace fonts — so kitty's projector
-/// aspect is `≈ W/(2H)`, TWICE the braille aspect. A smaller aspect under
-/// `perspective_rh` means a larger horizontal-FOV per vertical-FOV, which
-/// makes a fixed-size world box project WIDER on screen. Net effect: the
-/// braille tier renders boxes ~50% squatter (wider/flatter) than the kitty
-/// tier renders the same scene.
+/// RV3 documented this as an "intrinsic limitation" and shipped with
+/// `cell_aspect=2.0` for braille, which produced a projector aspect of
+/// `(W*2)/(H*4)/2.0 = W/(4H)`. The kitty tier (square pixels,
+/// `cell_aspect=1.0`) produces `(W*cw_px)/(H*ch_px) ≈ W/(2H)` at typical
+/// 2:1 cells — so braille's projector aspect was HALF of kitty's. A
+/// smaller aspect under `perspective_rh` means a wider horizontal-FOV per
+/// vertical-FOV, which made braille boxes project ~50% squatter (wider,
+/// flatter) than the same scene on kitty. User feedback (translated):
+/// "braille is better than ASCII but everything is flattened compared to
+/// kitty".
 ///
-/// User feedback recorded in 05-06 RV3 (translated): "braille is better
-/// [than ASCII] but everything is flattened [compared to kitty]". This is
-/// the same projection-aspect asymmetry described above, not a regression.
-/// We deliberately keep `cell_aspect=2.0` because Phase 1 calibrated the
-/// camera framing (FRAME_REF_CELL_ASPECT, FRAME_TARGET_FILL, the entire
-/// `frame_scene` distance solver, and ~40 dependent tests) around it.
-/// Lowering it ON THE PROJECTOR ONLY (leaving the framing alone) was tried
-/// at 1.5 and 1.0 during RV3 diagnosis: both narrowed boxes horizontally
-/// inside the SAME framed window without actually adding vertical extent
-/// (the vertical FOV is fixed at `DEFAULT_FOV`), so visible "flatness"
-/// changed shape but not magnitude. A correct fix would need to also
-/// re-frame the camera against the new projector cell_aspect — a Phase-1
-/// invariant-touching change deferred to v2.
+/// **RV4 fix.** The braille `cell_aspect` is now derived from the LIVE
+/// terminal cell pixel size — the same `crossterm::terminal::window_size()`
+/// the kitty path already uses — via [`RenderConfig::braille_cell_aspect_for_cell`]:
 ///
-/// **For now, this is documented as an intrinsic property of the braille
-/// tier under the current camera-framing calibration.** The kitty tier is
-/// the reference visual; the braille tier is a fallback and accepts a
-/// modest aspect-ratio drift in exchange for working on every Unicode-
-/// Braille-capable terminal without pixel-protocol support. ASCII tier
-/// (RV2: `HalfBlock`) inherits the same braille framing path and therefore
-/// the same drift — no additional concern.
+/// ```text
+/// braille projector aspect = (2W / 4H) / cell_aspect
+/// kitty projector aspect   = (W*cw_px) / (H*ch_px)
 ///
-/// **Future fix sketch (v2):** thread the actual terminal cell pixel size
-/// (already available via `crossterm::terminal::window_size`) into a
-/// dynamic `RenderConfig.cell_aspect = ch_px / cw_px * 0.5` for braille,
-/// AND have the camera re-frame against this dynamic aspect on resize /
-/// startup. Touches Phase 1's framing constants — out of scope for 05-06.
+/// solve for parity:
+///   1 / (2 * cell_aspect)  =  cw_px / ch_px
+///   cell_aspect            =  ch_px / (2 * cw_px)
+/// ```
+///
+/// At a typical 2:1 cell (`ch = 2*cw`) → `cell_aspect = 1.0`, IDENTICAL to
+/// the kitty path. At taller cells (e.g. 1:2.4) → `cell_aspect = 1.2`, a
+/// small horizontal narrowing so boxes still read as cubic. The camera
+/// framing solver ([`crate::camera::Camera::frame_scene_with_aspect`]) is
+/// invoked with the SAME dynamic value, so the rack always fills the
+/// `FRAME_TARGET_FILL` fraction of the binding axis at any cell ratio.
+///
+/// **Default `cell_aspect = 1.0`.** The default now matches the typical
+/// terminal cell + kitty parity case. Construction-time consumers (the
+/// `RenderConfig::default()` path in [`App::new`], pure 3D tests against
+/// square viewports) get the parity value automatically; the live
+/// production paths (braille + kitty render loops) override it per frame
+/// with the dynamic value resolved from [`crate::term::cell::cell_pixel_size`].
+///
+/// `FRAME_REF_CELL_ASPECT` in `camera/mod.rs` is pinned to 1.0 to match;
+/// the framing solver's reference projector is now consistent with both
+/// production tiers (within the small variation from non-2:1 terminals,
+/// where the live `frame_scene_with_aspect` call site overrides the
+/// reference value).
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 pub struct RenderConfig {
     /// Terminal cell aspect correction factor (on-screen height/width of a dot).
     ///
-    /// Default ~2.0 (empirical font/terminal constant; shipped as a tunable knob
-    /// because the exact value depends on font and terminal).
+    /// Default `1.0` (typical 2:1 terminal cell — parity with the kitty
+    /// path). Production braille / ASCII renderers override per frame via
+    /// [`RenderConfig::braille_cell_aspect_for_cell`] using the LIVE cell
+    /// pixel size from `crossterm::terminal::window_size()` — see the
+    /// type-level rustdoc "Braille vs kitty perspective parity (05-06 RV4)"
+    /// section for the math.
     pub cell_aspect: f32,
     /// Vertical field of view, in radians.
     pub fov: f32,
@@ -82,10 +95,40 @@ pub struct RenderConfig {
     pub far: f32,
 }
 
+impl RenderConfig {
+    /// Compute the dynamic `cell_aspect` for the BRAILLE / HalfBlock tiers
+    /// from the live terminal cell pixel size (`(cell_w_px, cell_h_px)`).
+    ///
+    /// At the typical 2:1 cell (`ch = 2 * cw`) this returns 1.0 — IDENTICAL
+    /// to the kitty path. Taller cells return >1.0 (slight horizontal
+    /// narrowing); flatter cells return <1.0. The result is clamped to
+    /// `[0.5, 4.0]` to keep the camera-framing solver well-conditioned
+    /// against pathological values (e.g. a misreported 1×1 cell).
+    ///
+    /// See the type-level rustdoc "Braille vs kitty perspective parity
+    /// (05-06 RV4)" for the derivation. Production call sites:
+    /// [`crate::app::App::run`] (braille) and the legacy braille test path.
+    /// Kitty uses `cell_aspect=1.0` unconditionally because its projector
+    /// already consumes real pixel dimensions.
+    pub fn braille_cell_aspect_for_cell(cell_px: (u16, u16)) -> f32 {
+        let (cw, ch) = cell_px;
+        if cw == 0 {
+            return 1.0;
+        }
+        let raw = ch as f32 / (2.0 * cw as f32);
+        raw.clamp(0.5, 4.0)
+    }
+}
+
 impl Default for RenderConfig {
     fn default() -> Self {
         Self {
-            cell_aspect: 2.0,
+            // RV4: default is the typical-cell parity value (1.0). Live
+            // braille production overrides per frame with
+            // `braille_cell_aspect_for_cell` against the polled cell size;
+            // kitty + 3D tests against square viewports pick this up
+            // directly.
+            cell_aspect: 1.0,
             fov: std::f32::consts::FRAC_PI_3, // 60 degrees
             near: 0.1,
             // Far enough to enclose a whole multi-group rack: the Phase 2 scene
@@ -448,5 +491,55 @@ mod tests {
         let p = default_config_path().expect("config_dir resolves");
         let s = p.to_string_lossy();
         assert!(s.ends_with("3dd/config.toml") || s.ends_with("3dd\\config.toml"));
+    }
+
+    // ----- 05-06 RV4: dynamic braille cell_aspect ---------------------
+
+    /// At the typical 2:1 monospace cell, the dynamic braille correction
+    /// returns 1.0 — IDENTICAL to the kitty projector's `cell_aspect`. This
+    /// is the central invariant the RV4 fix relies on for braille/kitty
+    /// perspective parity.
+    #[test]
+    fn rv4_braille_cell_aspect_matches_kitty_at_typical_cell() {
+        // 10×20, 8×16, 7×14 — all 2:1 cells found across kitty/Alacritty/
+        // gnome-terminal defaults. All MUST collapse to 1.0.
+        for cell in [(10u16, 20u16), (8, 16), (7, 14), (12, 24)] {
+            let aspect = RenderConfig::braille_cell_aspect_for_cell(cell);
+            assert!(
+                (aspect - 1.0).abs() < 1e-3,
+                "braille cell_aspect for 2:1 cell {cell:?} must be 1.0, got {aspect}"
+            );
+        }
+    }
+
+    /// Taller cells (1:2.4, 1:3) widen the correction so the horizontal
+    /// projector extent narrows enough to keep boxes cubic. Floor cell
+    /// reports of (1, 1) are clamped to the safe lower bound rather than
+    /// collapsing to 0.5 — the clamp is the safety rail under a degenerate
+    /// pty report.
+    #[test]
+    fn rv4_braille_cell_aspect_scales_with_cell_ratio() {
+        // 1:2.4 cell → ratio = 24/(2*10) = 1.2
+        assert!(
+            (RenderConfig::braille_cell_aspect_for_cell((10, 24)) - 1.2).abs() < 1e-3,
+            "1:2.4 cell must yield 1.2"
+        );
+        // 1:3 cell → ratio = 30/(2*10) = 1.5
+        assert!(
+            (RenderConfig::braille_cell_aspect_for_cell((10, 30)) - 1.5).abs() < 1e-3,
+            "1:3 cell must yield 1.5"
+        );
+        // Degenerate (1, 1) → ratio raw = 0.5, exactly at the clamp.
+        assert_eq!(
+            RenderConfig::braille_cell_aspect_for_cell((1, 1)),
+            0.5,
+            "degenerate cell must clamp to 0.5"
+        );
+        // Zero-width cell short-circuits to 1.0 (no divide-by-zero).
+        assert_eq!(
+            RenderConfig::braille_cell_aspect_for_cell((0, 20)),
+            1.0,
+            "zero-width cell must safely return 1.0"
+        );
     }
 }

@@ -886,12 +886,13 @@ mod tests {
 
     #[test]
     fn footprint_reads_cubic_at_subpixel_level() {
-        // (c) Aspect carried through from plan 03. A braille dot is ~1:2 (twice
-        // as tall as wide), so a cube that READS as cubic on screen must occupy
-        // `cell_aspect` times as many SUB-PIXEL columns as rows. We therefore
-        // assert `bbox_w ≈ cell_aspect * bbox_h` (the same invariant plan 03's
-        // `unit_cube_footprint_is_cubic` pins), confirming the rasterized
-        // footprint isn't squashed/stretched.
+        // (c) Aspect carried through from plan 03. With a SQUARE viewport,
+        // the only source of footprint asymmetry is the projector's
+        // `cell_aspect` term, so the rasterized cube's bounding box must
+        // satisfy `bbox_w ≈ cell_aspect * bbox_h`. RV4 (05-06): the default
+        // `cell_aspect` is 1.0 (typical-cell parity) so this collapses to
+        // `bbox_w ≈ bbox_h`. Pre-RV4 the default was 2.0 (asserted a 2:1
+        // horizontal stretch from a braille-dot 1:2 cell-aspect bias).
         let cube = unit_cube();
         let pal = Palette::default();
         let cfg = RenderConfig::default();
