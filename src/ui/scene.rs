@@ -58,13 +58,14 @@ use crate::world::selection::Selection;
 use crate::world::{Entity, World};
 
 /// Number of framebuffer pixels per terminal cell for a given ratatui
-/// [`Marker`] (05-06 ROB-02).
+/// [`Marker`] (05-06 ROB-02 + RV2).
 ///
 /// ratatui's `Canvas` painter accepts pixel indices whose density depends
 /// on the marker:
 /// - `Marker::Braille` packs 2×4 sub-cell dots per cell.
-/// - `Marker::Block` / `Marker::Dot` / `Marker::HalfBlock` paint 1 pixel
-///   per cell (each pixel is the whole cell or a half-cell character).
+/// - `Marker::HalfBlock` packs 1×2 (`▀`/`▄`) — half a cell vertically
+///   so two distinct "pixels" stack inside one terminal row.
+/// - `Marker::Block` / `Marker::Dot` paint 1 pixel per cell.
 ///
 /// The renderer sizes the framebuffer to `cells * px_per_cell` so every
 /// `painter.paint(x, y, color)` call lands inside the canvas bounds. Pre-
@@ -74,12 +75,28 @@ use crate::world::{Entity, World};
 /// scene-block with no boxes. This helper is the single point of truth
 /// for the multiplier and is tested directly so the regression can never
 /// reintroduce silently.
+///
+/// RV2 (rule-1 fix for "ASCII tier completely unreadable"): user
+/// feedback after the original RV1 landing reported the Block tier was
+/// solid silhouettes with no depth/wireframe info because each rendered
+/// "pixel" filled the entire terminal cell. HalfBlock doubles the
+/// vertical density (each row holds two distinct colored pixels via
+/// `▀`/`▄`) while staying ASCII-safe — no Unicode-Braille dependency,
+/// no truecolor requirement. The braille tier (1×) gets the
+/// braille-resolution rendering; the new ASCII tier picks HalfBlock and
+/// gets (1, 2). Block is still callable for very-weak terminals via the
+/// `Marker::Block` default-arm fall-through but is not the production
+/// pick after RV2.
 pub(crate) fn marker_pixel_ratio(marker: Marker) -> (usize, usize) {
     match marker {
         Marker::Braille => (2, 4),
-        // Block / Dot / HalfBlock all paint at 1 pixel per cell. The
-        // default arm covers the Block tier 05-06 needs PLUS any future
-        // ratatui marker addition — safer than panic on unknown variants.
+        // HalfBlock = 1 pixel wide × 2 pixels tall per terminal cell.
+        // RV2 lifts the ASCII tier here so boxes regain vertical
+        // structure (depth shading + wireframe-edge separation) without
+        // requiring Unicode-Braille support.
+        Marker::HalfBlock => (1, 2),
+        // Block / Dot / future markers fall through to 1×1 — coarsest,
+        // last-resort tier. Safer than panic on unknown variants.
         _ => (1, 1),
     }
 }
@@ -522,13 +539,24 @@ mod tests {
         assert_eq!(marker_pixel_ratio(Marker::Block), (1, 1));
     }
 
-    /// Dot and HalfBlock fall through the same 1×1 arm as Block — every
-    /// non-braille marker that ratatui ships uses one pixel per cell.
-    /// Pins the default-arm behavior so a future marker variant doesn't
-    /// silently get treated as braille resolution.
+    /// Dot falls through the same 1×1 default arm as Block — pinned so
+    /// a future marker variant doesn't silently get treated as braille
+    /// resolution.
     #[test]
-    fn marker_pixel_ratio_dot_and_halfblock_are_one_by_one() {
+    fn marker_pixel_ratio_dot_is_one_by_one() {
         assert_eq!(marker_pixel_ratio(Marker::Dot), (1, 1));
-        assert_eq!(marker_pixel_ratio(Marker::HalfBlock), (1, 1));
+    }
+
+    /// HalfBlock packs 1×2 (`▀`/`▄`) — half a cell vertically so two
+    /// distinct pixels stack in one terminal row. RV2 lifts the ASCII
+    /// tier from Block (1×1) to HalfBlock (1×2) so the scene regains
+    /// vertical structure and depth shading without requiring Unicode-
+    /// Braille support. This pin closes the rule-1 regression where the
+    /// ASCII tier rendered as unreadable solid silhouettes — if the
+    /// HalfBlock arm reverts to (1, 1), the visual regression returns
+    /// invisibly at runtime.
+    #[test]
+    fn marker_pixel_ratio_halfblock_is_one_by_two() {
+        assert_eq!(marker_pixel_ratio(Marker::HalfBlock), (1, 2));
     }
 }

@@ -105,15 +105,25 @@ pub fn view(frame: &mut Frame, app: &mut App) {
         // id that no longer exists in the cached world is harmless (the
         // pulse path just skips it).
         // 05-06 ROB-02: select the braille marker based on the resolved
-        // render capability. `Ascii` swaps Braille → Block so the scene
-        // legibly renders over SSH / dumb terminals with no Unicode-
-        // braille dependency (coarser, but visible). `Kitty` only reaches
-        // this code path on the braille-fallback (`--braille` CLI or
-        // capability-pinned-down to Truecolor), so we treat it the same
-        // as Truecolor here — the kitty graphics backend lives in
+        // render capability. `Ascii` swaps Braille → HalfBlock so the
+        // scene legibly renders over SSH / dumb terminals with no
+        // Unicode-braille dependency. `Kitty` only reaches this code
+        // path on the braille-fallback (`--braille` CLI or capability-
+        // pinned-down to Truecolor), so we treat it the same as
+        // Truecolor here — the kitty graphics backend lives in
         // run_kitty and bypasses this branch entirely.
+        //
+        // RV2 (rule-1 fix): the original Task-2 pick was `Marker::Block`,
+        // which user feedback (recorded in 05-06 RV2) called "completely
+        // unreadable" — `█` filled the entire cell with no depth shading
+        // or wireframe edge detail, producing solid silhouettes that
+        // erased the 3D structure. HalfBlock uses `▀`/`▄` to pack TWO
+        // colored pixels into one terminal row, doubling vertical
+        // resolution AND preserving distinct face-vs-edge colors per
+        // half-cell. Works on every modern terminal (no Unicode-Braille
+        // requirement, no truecolor requirement — ANSI colors suffice).
         let marker = match app.render_mode {
-            crate::term::capability::TerminalCapability::Ascii => Marker::Block,
+            crate::term::capability::TerminalCapability::Ascii => Marker::HalfBlock,
             _ => Marker::Braille,
         };
         scene::render_scene(
